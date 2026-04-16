@@ -136,22 +136,35 @@ TOURNAMENT_TO_SPORT_KEY = {
 }
 
 # Bookmaker priority per market type
+# Stale threshold: 120s (2 min) — bookies without recent update are skipped
+# Order: sharpest/exchange first, then broad-coverage bookmakers
+# Pinnacle is EXCLUDED by design
+STALE_MAX = 120
 BOOKMAKER_PRIORITY = {
     "h2h": [
-        ("betfair_ex_eu", 120),
-        ("betfair", 120),
-        ("betfair_ex_uk", 120),
-        ("matchbook", 180),
+        ("betfair_ex_eu",  STALE_MAX),   # EU exchange — sharpest live prices
+        ("betfair_ex_uk",  STALE_MAX),   # UK exchange
+        ("betfair",        STALE_MAX),   # Betfair generic
+        ("matchbook",      STALE_MAX),   # exchange
+        ("coolbet",        STALE_MAX),   # sharp, good SA coverage
+        ("nordicbet",      STALE_MAX),   # covers SA/international
+        ("betsson",        STALE_MAX),
+        ("unibet_eu",      STALE_MAX),
+        ("bet365",         STALE_MAX),   # very broad global coverage
+        ("williamhill",    STALE_MAX),
+        ("sport888",       STALE_MAX),
     ],
     "totals": [
-        ("matchbook", 180),
-        ("coolbet", 240),
-        ("pinnacle", 300),
+        ("betfair_ex_eu",  STALE_MAX),
+        ("matchbook",      STALE_MAX),
+        ("coolbet",        STALE_MAX),
+        ("betsson",        STALE_MAX),
+        ("bet365",         STALE_MAX),
     ],
     "spreads": [
-        ("matchbook", 180),
-        ("coolbet", 240),
-        ("pinnacle", 300),
+        ("betfair_ex_eu",  STALE_MAX),
+        ("matchbook",      STALE_MAX),
+        ("coolbet",        STALE_MAX),
     ],
 }
 
@@ -326,26 +339,30 @@ def _learn_alias(sofascore_name, odds_api_name):
 
 _odds_cache = {}
 _odds_cache_lock = threading.Lock()
-ODDS_CACHE_TTL = 45
+ODDS_CACHE_TTL = 120   # 2 min server-side cache per sport key + api key
 _api_requests_remaining = None
+_api_quotas = {}   # api_key → remaining (tracks quota per key independently)
 
 
-def _get_odds_api(url, params=None):
+def _get_odds_api(url, params=None, api_key=None):
     global _api_requests_remaining
     import requests as req
 
+    effective_key = api_key or ODDS_API_KEY
     if params is None:
         params = {}
-    params["apiKey"] = ODDS_API_KEY
+    params["apiKey"] = effective_key
 
     try:
         resp = req.get(url, params=params, timeout=15)
 
         remaining = resp.headers.get("x-requests-remaining")
         used = resp.headers.get("x-requests-used")
-        if remaining:
-            _api_requests_remaining = int(remaining)
-            log.info(f"Odds API quota — remaining: {remaining}, used: {used}")
+        if remaining is not None:
+            r = int(remaining)
+            _api_requests_remaining = r
+            _api_quotas[effective_key] = r
+            log.info(f"Odds API quota [{effective_key[:8]}…] — remaining: {r}, used: {used}")
 
         if resp.status_code == 200:
             return resp.json()
@@ -363,54 +380,74 @@ def _get_odds_api(url, params=None):
         return None
 
 
-def get_odds_for_sport(sport_key, force=False):
+def get_odds_for_sport(sport_key, force=False, api_key=None):
     now = time.time()
+    cache_key = f"{sport_key}:{api_key or 'default'}"
 
     with _odds_cache_lock:
-        cached = _odds_cache.get(sport_key)
+        cached = _odds_cache.get(cache_key)
         if cached and not force and (now - cached["ts"]) < ODDS_CACHE_TTL:
+            log.info(f"Odds cache HIT for {cache_key} ({now - cached['ts']:.0f}s old)")
             return cached["data"]
 
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
     data = _get_odds_api(url, {
-        "regions": "uk,eu",
+        "regions": "eu,us,uk,au",   # all regions — needed for SA, MLS, Asian leagues
         "markets": "h2h,totals,spreads",
         "oddsFormat": "decimal",
         "dateFormat": "iso",
-    })
+    }, api_key=api_key)
 
     if data is None:
+        with _odds_cache_lock:
+            cached = _odds_cache.get(cache_key)
         if cached:
-            log.info(f"Using stale cache for {sport_key}")
+            log.info(f"Using stale cache for {cache_key}")
             return cached["data"]
-        return []
+        log.warning(f"Odds API returned None for {sport_key} (API error or quota exceeded)")
+        return None   # distinguish from empty []
 
     with _odds_cache_lock:
-        _odds_cache[sport_key] = {"data": data, "ts": now}
+        _odds_cache[cache_key] = {"data": data, "ts": now}
 
-    log.info(f"Fetched {len(data)} events for {sport_key}")
+    log.info(f"Fetched {len(data)} events for {sport_key} (regions: eu,us,uk,au)")
     return data
+
+
+def _normalize_tournament(name):
+    """Strip Sofascore suffixes like ', Group A', ', Phase 1', ', Round 2', etc."""
+    import re
+    # Remove trailing group/round/phase/stage/pool qualifiers (with or without comma)
+    cleaned = re.sub(
+        r'[,\s]+(group|grp|round|phase|stage|pool|matchday|md|jornada|giornata|journée|spieltag)\b.*$',
+        '', name, flags=re.IGNORECASE
+    ).strip()
+    # Also remove trailing parenthetical qualifiers: "Premier League (Women)"
+    cleaned = re.sub(r'\s*\(.*\)\s*$', '', cleaned).strip()
+    return cleaned.lower()
 
 
 def _resolve_sport_key(tournament_name, country=None):
     if not tournament_name:
         return None
 
-    t = tournament_name.lower().strip()
+    # Try with original name first, then with suffixes stripped
+    for candidate in [tournament_name, _normalize_tournament(tournament_name)]:
+        t = candidate.lower().strip()
 
-    if t in TOURNAMENT_TO_SPORT_KEY:
-        return TOURNAMENT_TO_SPORT_KEY[t]
+        if t in TOURNAMENT_TO_SPORT_KEY:
+            return TOURNAMENT_TO_SPORT_KEY[t]
 
-    for keyword, sport_key in TOURNAMENT_TO_SPORT_KEY.items():
-        if keyword in t:
-            return sport_key
-
-    if country:
-        c = country.lower()
-        combined = f"{c} {t}"
         for keyword, sport_key in TOURNAMENT_TO_SPORT_KEY.items():
-            if keyword in combined:
+            if keyword in t:
                 return sport_key
+
+        if country:
+            c = country.lower()
+            combined = f"{c} {t}"
+            for keyword, sport_key in TOURNAMENT_TO_SPORT_KEY.items():
+                if keyword in combined:
+                    return sport_key
 
     return None
 
@@ -592,7 +629,7 @@ def calculate_benter_value(model_probs, bookie_novig, bookie_odds, minute):
     }
 
 
-def get_full_odds_analysis(match, shots):
+def get_full_odds_analysis(match, shots, api_key=None):
     """Full pipeline: fetch odds, compute xG model probs, apply Benter, return value analysis."""
     tournament = match.get("tournament", "")
     country = match.get("country", "")
@@ -605,12 +642,19 @@ def get_full_odds_analysis(match, shots):
             "sportKey": None,
         }
 
-    odds_events = get_odds_for_sport(sport_key)
+    odds_events = get_odds_for_sport(sport_key, api_key=api_key)
+
+    if odds_events is None:
+        return {
+            "available": False,
+            "reason": "Odds API error — quota esgotada ou chave inválida. Verifica a tua API key.",
+            "sportKey": sport_key,
+        }
 
     if not odds_events:
         return {
             "available": False,
-            "reason": f"No odds data for {sport_key}",
+            "reason": f"Sem eventos disponíveis em {sport_key} neste momento",
             "sportKey": sport_key,
         }
 
@@ -1083,13 +1127,13 @@ def get_event(eid):
     return _parse_event(data["event"])
 
 
-def get_track(eid):
+def get_track(eid, api_key=None):
     det = get_event(eid)
     if not det:
         return {"error": f"Event {eid} not found"}
     shots = get_shotmap(eid)
     incidents = get_incidents(eid)
-    odds = get_full_odds_analysis(det, shots)
+    odds = get_full_odds_analysis(det, shots, api_key=api_key)
     return {
         "match": det,
         "shots": shots,
@@ -1174,7 +1218,8 @@ def r_inc(eid):
 def r_track(eid):
     """Full tracking with odds & Benter value (used by dashboard auto-refresh)."""
     try:
-        d = get_track(eid)
+        api_key = flask_request.args.get("apiKey", "").strip() or None
+        d = get_track(eid, api_key=api_key)
         if "error" in d: return jsonify(d), 404
         return jsonify(d)
     except Exception as e: return jsonify({"error": str(e)}), 500
@@ -1186,10 +1231,11 @@ def r_track(eid):
 def r_odds(eid):
     """Get just the odds & value analysis for a match."""
     try:
+        api_key = flask_request.args.get("apiKey", "").strip() or None
         d = get_event(eid)
         if not d: return jsonify({"error": "Not found"}), 404
         shots = get_shotmap(eid)
-        odds = get_full_odds_analysis(d, shots)
+        odds = get_full_odds_analysis(d, shots, api_key=api_key)
         return jsonify(odds)
     except Exception as e:
         log.exception(f"Error in /api/odds/{eid}")
@@ -1200,15 +1246,19 @@ def r_odds(eid):
 def r_odds_sport(sport_key):
     """Get raw odds for a sport key (for debugging/exploration)."""
     try:
-        data = get_odds_for_sport(sport_key)
+        api_key = flask_request.args.get("apiKey", "").strip() or None
+        data = get_odds_for_sport(sport_key, api_key=api_key)
         return jsonify({"sportKey": sport_key, "count": len(data), "events": data})
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/odds/quota")
 def r_odds_quota():
-    """Check remaining Odds API quota."""
-    return jsonify({"remaining": _api_requests_remaining})
+    """Check remaining Odds API quota — per key if ?apiKey= provided."""
+    api_key = flask_request.args.get("apiKey", "").strip() or None
+    effective_key = api_key or ODDS_API_KEY
+    rem = _api_quotas.get(effective_key, _api_requests_remaining)
+    return jsonify({"remaining": rem, "key": effective_key[:8] + "…" if effective_key else None})
 
 
 @app.route("/api/odds/cache")
