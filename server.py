@@ -163,8 +163,8 @@ BOOKMAKER_PRIORITY = {
     ],
     "spreads": [
         ("betfair_ex_eu",  STALE_MAX),
-        ("coolbet",      STALE_MAX),
-        ("matchbook",        STALE_MAX),
+        ("matchbook",      STALE_MAX),
+        ("coolbet",        STALE_MAX),
     ],
 }
 
@@ -193,6 +193,39 @@ def get_benter_weights(minute):
         if from_m <= minute < to_m:
             return (mw, bw)
     return (0.90, 0.10)
+
+
+# ════════════════════════════════════════════════════════════
+#  INTERVAL ADJUSTS — Goal-rate momentum by time segment
+#  Source: Premier League historical distribution
+#  Formula per row: segment_% / average(all_segments_up_to_now)
+#  Applied to remaining xG projection to correct for late-game momentum
+# ════════════════════════════════════════════════════════════
+
+INTERVAL_ADJUSTS = [
+    #  from  to    goals%   adjust
+    (  0,   15,  11.50,   1.00),
+    ( 16,   30,  14.10,   1.10),
+    ( 31,   45,  15.90,   1.15),
+    ( 46,   60,  15.70,   1.10),
+    ( 61,   75,  18.20,   1.21),
+    ( 76,  100,  24.60,   1.48),
+]
+
+
+def get_interval_adjust(minute):
+    """Return momentum adjustment factor for remaining xG based on current minute.
+
+    The factor reflects that goal rates increase as matches progress —
+    e.g. at minute 65 the remaining time has 1.21× the average goal rate,
+    so projected remaining xG is scaled up accordingly.
+    """
+    if minute is None or minute <= 0:
+        return 1.0
+    for from_m, to_m, _pct, adjust in INTERVAL_ADJUSTS:
+        if from_m <= minute <= to_m:
+            return adjust
+    return INTERVAL_ADJUSTS[-1][3]  # extra time → use last factor (1.48)
 
 
 # ════════════════════════════════════════════════════════════
@@ -542,8 +575,10 @@ def xg_to_probabilities(home_xg, away_xg, home_goals, away_goals, minute,
     home_rate = home_xg / elapsed if elapsed > 0 else 0
     away_rate = away_xg / elapsed if elapsed > 0 else 0
 
-    remaining_home_xg = home_rate * remaining
-    remaining_away_xg = away_rate * remaining
+    # Apply momentum adjustment: goals cluster increasingly in later intervals
+    interval_adj = get_interval_adjust(minute)
+    remaining_home_xg = home_rate * remaining * interval_adj
+    remaining_away_xg = away_rate * remaining * interval_adj
 
     remaining_home_xg = max(remaining_home_xg, 0.01)
     remaining_away_xg = max(remaining_away_xg, 0.01)
@@ -590,6 +625,7 @@ def xg_to_probabilities(home_xg, away_xg, home_goals, away_goals, minute,
             "awayRemaining": round(remaining_away_xg, 4),
             "homeTotal": round(home_xg + remaining_home_xg, 4),
             "awayTotal": round(away_xg + remaining_away_xg, 4),
+            "intervalAdjust": round(interval_adj, 2),
         },
     }
 
@@ -1294,6 +1330,24 @@ def r_benter_table():
             "modelWeight": mw, "bookieWeight": bw,
         })
     return jsonify({"table": table})
+
+
+@app.route("/api/intervals")
+def r_intervals():
+    """Return the interval adjustment table and the current factor for a given minute."""
+    minute = flask_request.args.get("minute", type=int)
+    table = []
+    for from_m, to_m, pct, adjust in INTERVAL_ADJUSTS:
+        table.append({
+            "fromMin": from_m, "toMin": to_m,
+            "goalsPercent": pct, "adjust": adjust,
+            "isCurrent": (minute is not None and from_m <= minute <= to_m),
+        })
+    return jsonify({
+        "table": table,
+        "currentAdjust": get_interval_adjust(minute) if minute is not None else None,
+        "note": "Adjust multiplied into remaining xG projection. Source: Premier League goals by 15-min segment.",
+    })
 
 
 @app.route("/api/odds/sports")
