@@ -163,8 +163,8 @@ BOOKMAKER_PRIORITY = {
     ],
     "spreads": [
         ("betfair_ex_eu",  STALE_MAX),
-        ("coolbet",      STALE_MAX),
-        ("matchbook",        STALE_MAX),
+        ("matchbook",      STALE_MAX),
+        ("coolbet",        STALE_MAX),
     ],
 }
 
@@ -1582,3 +1582,7 @@ if __name__ == "__main__":
         print(f"  Odds API: enabled")
         print(f"  Team aliases: {len(_team_aliases)} loaded\n")
         app.run(host="0.0.0.0", port=5050, debug=True)
+else:
+    # Running under gunicorn — __main__ block is skipped, so initialize here
+    _load_aliases()
+    threading.Thread(target=_init_client, daemon=True).start()
