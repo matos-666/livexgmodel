@@ -163,8 +163,8 @@ BOOKMAKER_PRIORITY = {
     ],
     "spreads": [
         ("betfair_ex_eu",  STALE_MAX),
-        ("matchbook",      STALE_MAX),
-        ("coolbet",        STALE_MAX),
+        ("coolbet",      STALE_MAX),
+        ("matchbook",        STALE_MAX),
     ],
 }
 
