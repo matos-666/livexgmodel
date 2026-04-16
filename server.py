@@ -1181,13 +1181,6 @@ def get_track(eid, api_key=None):
 
 # ── Routes ──
 
-@app.after_request
-def cors(r):
-    r.headers["Access-Control-Allow-Origin"] = "*"
-    r.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    r.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    return r
-
 @app.route("/")
 def index():
     return jsonify({
@@ -1370,8 +1363,6 @@ def r_odds_sports():
 #   • Expõe: GET /proxy/odds/sports/<sport>/odds?...
 #             GET /proxy/odds/sports            (lista de desportos)
 # ─────────────────────────────────────────────────────────────────────────────
-
-ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 def _odds_get(path, params):
     """Fetch from The Odds API server-side and return (data, status_code, quota_headers)."""
