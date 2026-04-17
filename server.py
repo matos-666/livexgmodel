@@ -163,8 +163,8 @@ BOOKMAKER_PRIORITY = {
     ],
     "spreads": [
         ("betfair_ex_eu",  STALE_MAX),
-        ("coolbet",      STALE_MAX),
-        ("matchbook",        STALE_MAX),
+        ("matchbook",      STALE_MAX),
+        ("coolbet",        STALE_MAX),
     ],
 }
 
@@ -425,7 +425,7 @@ def get_odds_for_sport(sport_key, force=False, api_key=None):
 
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
     data = _get_odds_api(url, {
-        "regions": "eu,us,uk,au",   # all regions — needed for SA, MLS, Asian leagues
+        "regions": "eu",   # all regions — needed for SA, MLS, Asian leagues
         "markets": "h2h,totals,spreads",
         "oddsFormat": "decimal",
         "dateFormat": "iso",
@@ -443,7 +443,7 @@ def get_odds_for_sport(sport_key, force=False, api_key=None):
     with _odds_cache_lock:
         _odds_cache[cache_key] = {"data": data, "ts": now}
 
-    log.info(f"Fetched {len(data)} events for {sport_key} (regions: eu,us,uk,au)")
+    log.info(f"Fetched {len(data)} events for {sport_key} (regions: eu)")
     return data
 
 
