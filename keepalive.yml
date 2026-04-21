@@ -1,0 +1,17 @@
+name: Keepalive — Ping Railway
+
+on:
+  schedule:
+    # Every 10 minutes — prevents Railway free tier from sleeping
+    - cron: '*/10 * * * *'
+  workflow_dispatch:  # allow manual trigger
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Railway server
+        run: |
+          curl -sf --max-time 15 \
+            "https://${{ secrets.RAILWAY_URL }}/api/state" \
+            -o /dev/null && echo "✓ Server alive" || echo "⚠ Server unreachable"

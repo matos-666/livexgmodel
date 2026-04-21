@@ -50,7 +50,7 @@ _session = None
 #  THE ODDS API — Configuration
 # ════════════════════════════════════════════════════════════
 
-ODDS_API_KEY = "85e4f12b9d76a7bb0464eeb802f6f388"
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "85e4f12b9d76a7bb0464eeb802f6f388")
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 # Sofascore tournament name → The Odds API sport key mapping
@@ -132,6 +132,30 @@ TOURNAMENT_TO_SPORT_KEY = {
     "ekstraklasa": "soccer_poland_ekstraklasa",
     "czech first league": "soccer_czech_republic_league",
     "greek super league": "soccer_greece_super_league",
+    # Belgium — "Jupiler" often absent in Sofascore tournament name
+    "pro league": "soccer_belgium_first_div",
+    "first division a": "soccer_belgium_first_div",
+    # Austria
+    "austrian bundesliga": "soccer_austria_bundesliga",
+    "admiral bundesliga": "soccer_austria_bundesliga",
+    "osterreichische bundesliga": "soccer_austria_bundesliga",
+    "2. liga austria": "soccer_austria_bundesliga2",
+    # Scotland
+    "scottish premiership": "soccer_scotland_premiership",
+    "scottish championship": "soccer_scotland_championship",
+    # Norway / Finland
+    "veikkausliiga": "soccer_finland_veikkausliiga",
+    # Romania / Hungary / Serbia / Croatia
+    "liga 1": "soccer_romania_1_liga",
+    "otp bank liga": "soccer_hungary_otp_bank_liga",
+    "nemzeti bajnokság": "soccer_hungary_otp_bank_liga",
+    "super liga": "soccer_serbia_superliga",
+    "hnl": "soccer_croatia_hnl",
+    # Czech / Slovakia
+    "fortuna liga": "soccer_czech_republic_league",
+    "nike liga": "soccer_slovakia_superliga",
+    # Israel
+    "ligat ha\'al": "soccer_israel_premier_league",
     "liga mx": "soccer_mexico_ligamx",
 }
 
@@ -163,8 +187,8 @@ BOOKMAKER_PRIORITY = {
     ],
     "spreads": [
         ("betfair_ex_eu",  STALE_MAX),
+        ("coolbet",        STALE_MAX),   # sharp, boa cobertura europeia
         ("matchbook",      STALE_MAX),
-        ("coolbet",        STALE_MAX),
     ],
 }
 
@@ -425,7 +449,7 @@ def get_odds_for_sport(sport_key, force=False, api_key=None):
 
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
     data = _get_odds_api(url, {
-        "regions": "eu",   # all regions — needed for SA, MLS, Asian leagues
+        "regions": "eu",      # Apenas região europeia — Betfair EU, bet365, Matchbook, Coolbet, Unibet
         "markets": "h2h,totals,spreads",
         "oddsFormat": "decimal",
         "dateFormat": "iso",
@@ -448,14 +472,21 @@ def get_odds_for_sport(sport_key, force=False, api_key=None):
 
 
 def _normalize_tournament(name):
-    """Strip Sofascore suffixes like ', Group A', ', Phase 1', ', Round 2', etc."""
+    """Strip Sofascore suffixes like ', Group A', ', Conference League Playoffs', etc."""
     import re
-    # Remove trailing group/round/phase/stage/pool qualifiers (with or without comma)
+    # Remove anything after a comma that looks like a sub-tournament qualifier
+    # e.g. "Pro League, Conference League Playoffs" → "Pro League"
+    #      "Austrian Bundesliga, Relegation Round" → "Austrian Bundesliga"
+    #      "Copa Libertadores, Group G" → "Copa Libertadores"
     cleaned = re.sub(
-        r'[,\s]+(group|grp|round|phase|stage|pool|matchday|md|jornada|giornata|journée|spieltag)\b.*$',
+        r'\s*,\s+(group|grp|round|phase|stage|pool|matchday|md|jornada|giornata|journée|'
+        r'spieltag|playoff|play-off|play off|qualification|qualifying|relegation|promotion|'
+        r'conference|champions|europa|cup|shield|super|final|semi|quarter)\b.*$',
         '', name, flags=re.IGNORECASE
     ).strip()
-    # Also remove trailing parenthetical qualifiers: "Premier League (Women)"
+    # Also strip any remaining trailing ", Anything" (catch-all for unknown qualifiers)
+    cleaned = re.sub(r'\s*,.*$', '', cleaned).strip()
+    # Remove trailing parenthetical qualifiers: "Premier League (Women)"
     cleaned = re.sub(r'\s*\(.*\)\s*$', '', cleaned).strip()
     return cleaned.lower()
 
@@ -471,14 +502,16 @@ def _resolve_sport_key(tournament_name, country=None):
         if t in TOURNAMENT_TO_SPORT_KEY:
             return TOURNAMENT_TO_SPORT_KEY[t]
 
-        for keyword, sport_key in TOURNAMENT_TO_SPORT_KEY.items():
+        # Sort by keyword length descending: more specific keys (e.g. "austrian bundesliga")
+        # must be checked before shorter generic ones (e.g. "bundesliga")
+        for keyword, sport_key in sorted(TOURNAMENT_TO_SPORT_KEY.items(), key=lambda x: -len(x[0])):
             if keyword in t:
                 return sport_key
 
         if country:
-            c = country.lower()
-            combined = f"{c} {t}"
-            for keyword, sport_key in TOURNAMENT_TO_SPORT_KEY.items():
+            cc = country.lower()
+            combined = f"{cc} {t}"
+            for keyword, sport_key in sorted(TOURNAMENT_TO_SPORT_KEY.items(), key=lambda x: -len(x[0])):
                 if keyword in combined:
                     return sport_key
 
@@ -566,14 +599,32 @@ def _poisson_pmf(k, lam):
 
 def xg_to_probabilities(home_xg, away_xg, home_goals, away_goals, minute,
                         max_goals=8):
+    # Normalizar minuto — nunca usar None ou 0 como elapsed (causaria divisão por 0
+    # ou projeções astronómicas ao tratar todo o xG como ganho em 1 minuto)
     if minute is None or minute <= 0:
-        minute = 1
+        minute = 45   # fallback seguro: assume que estamos a meio do jogo
 
-    remaining = max(90 - minute, 1)
-    elapsed = min(minute, 90)
+    # Duração efetiva: 90 min (tempo regulamentar) ou 120 (prolongamento)
+    # Para minutos > 90 (prolongamento) usamos a duração total real
+    full_duration = 120 if minute > 90 else 90
+    elapsed = min(minute, full_duration)
+    remaining = max(full_duration - elapsed, 1)
 
     home_rate = home_xg / elapsed if elapsed > 0 else 0
     away_rate = away_xg / elapsed if elapsed > 0 else 0
+
+    # Sanity cap: no team can generate > 0.08 xG/min legitimately (= 7.2 xG/90).
+    # If we get higher it means elapsed is unrealistically small (transition glitch).
+    # Cap the rate and log a warning so we can diagnose if needed.
+    MAX_XG_RATE = 0.08
+    if home_rate > MAX_XG_RATE or away_rate > MAX_XG_RATE:
+        log.warning(
+            f"xG rate sanity cap triggered: home={home_rate:.4f} away={away_rate:.4f} "
+            f"xG/min (elapsed={elapsed}min). Capping at {MAX_XG_RATE}. "
+            f"Raw xG: home={home_xg:.3f} away={away_xg:.3f}"
+        )
+        home_rate = min(home_rate, MAX_XG_RATE)
+        away_rate = min(away_rate, MAX_XG_RATE)
 
     # Apply momentum adjustment: goals cluster increasingly in later intervals
     interval_adj = get_interval_adjust(minute)
@@ -871,9 +922,70 @@ def get_full_odds_analysis(match, shots, api_key=None):
                     benter_totals["market"] = f"O/U {line}"
                     benter_totals["line"] = float(line)
 
+            # ── Benter value for spreads/handicaps ──
+            benter_spreads = None
+            if spreads_data and spreads_data.get("rawOdds"):
+                home_pt = spreads_data.get("homePoint", 0) or 0
+                away_pt = spreads_data.get("awayPoint", 0) or 0
+                raw_sp = spreads_data.get("rawOdds", {})
+                novig_sp = spreads_data.get("noVig", {})
+
+                # Model probabilities for spreads: adjust goals by handicap line
+                # Apply the handicap line to the projected final score distribution
+                # and recompute win/lose probability using the same Poisson dist
+                model_home_remaining = model["projectedXg"]["homeRemaining"]
+                model_away_remaining = model["projectedXg"]["awayRemaining"]
+
+                def hcp_probs(home_pt_val, away_pt_val, max_g=8):
+                    """Compute P(home covers) and P(away covers) for Asian handicap line."""
+                    h_probs = [_poisson_pmf(k, max(model_home_remaining, 0.01)) for k in range(max_g+1)]
+                    a_probs = [_poisson_pmf(k, max(model_away_remaining, 0.01)) for k in range(max_g+1)]
+                    p_home = 0.0
+                    p_away = 0.0
+                    for h in range(max_g+1):
+                        for a in range(max_g+1):
+                            p = h_probs[h] * a_probs[a]
+                            final_h = home_goals + h + home_pt_val  # adjusted by handicap
+                            final_a = away_goals + a
+                            if final_h > final_a:
+                                p_home += p
+                            elif final_h < final_a:
+                                p_away += p
+                            # exact tie: half-win / push — split probability
+                            else:
+                                p_home += p * 0.5
+                                p_away += p * 0.5
+                    return p_home, p_away
+
+                h_pt_val = float(home_pt) if home_pt is not None else 0.0
+                a_pt_val = float(away_pt) if away_pt is not None else 0.0
+                p_home_cov, p_away_cov = hcp_probs(h_pt_val, a_pt_val)
+
+                model_sp = {"home": round(p_home_cov, 6), "away": round(p_away_cov, 6)}
+                # noVig already keyed as home/away from the processing block above
+                novig_home = novig_sp.get("home")
+                novig_away = novig_sp.get("away")
+                # Fallback: if keys are None (shouldn't happen), try first two values
+                if novig_home is None or novig_away is None:
+                    vals = list(novig_sp.values())
+                    if len(vals) >= 2:
+                        novig_home, novig_away = vals[0], vals[1]
+                novig_mapped_sp = {"home": novig_home or 0.0, "away": novig_away or 0.0}
+
+                benter_spreads = calculate_benter_value(
+                    model_sp, novig_mapped_sp,
+                    {"home": raw_sp.get("home", 0), "away": raw_sp.get("away", 0)},
+                    minute
+                )
+                benter_spreads["market"] = "HCP"
+                benter_spreads["homePoint"] = home_pt
+                benter_spreads["awayPoint"] = away_pt
+                benter_spreads["bookmaker"] = spreads_data.get("bookmakerTitle", "")
+
             odds_result["benter"] = {
                 "h2h": benter_1x2,
                 "totals": benter_totals,
+                "spreads": benter_spreads,
             }
 
     # ── API quota info ──
@@ -1027,11 +1139,18 @@ def _parse_event(ev):
 
     if period_ts and code in (6, 7):
         now = int(time.time())
-        elapsed = max(0, now - period_ts) // 60
-        if code == 6:
-            minute = 1 + elapsed   # 1ª parte começa em 1'
-        else:
-            minute = 46 + elapsed  # 2ª parte começa em 46'
+        elapsed_secs = max(0, now - period_ts)
+        elapsed = elapsed_secs // 60
+
+        # Guard: if period_ts was set < 90 seconds ago the timestamp was just reset
+        # (Sofascore updates it when transitioning between periods).
+        # With elapsed=0 the rate calculation explodes — discard and use fallback.
+        if elapsed_secs >= 90:
+            if code == 6:
+                minute = 1 + elapsed   # 1ª parte começa em 1'
+            else:
+                minute = 46 + elapsed  # 2ª parte começa em 46'
+        # else: leave minute=None, fall through to startTimestamp fallback below
 
     # Fallback: startTimestamp (para ligas menores sem currentPeriodStartTimestamp)
     if minute is None and code in (6, 7):
@@ -1044,6 +1163,19 @@ def _parse_event(ev):
             else:
                 # ~64 min = 1ª parte (~47 min) + intervalo (~17 min)
                 minute = min(45 + max(0, total_elapsed - 64), 95)
+
+    # Estados fixos — sem timestamp de período, atribuir minuto convencional
+    # code 31 = Intervalo          → considerar 45 min decorridos
+    # code 41 = Prolongamento 1ªP  → considerar 105 min (ET começa no 90')
+    # code 42 = Prolongamento 2ªP  → considerar 120 min (mas calcular igual)
+    # code 80 = Penáltis            → jogo decidido, não há projeção útil
+    if minute is None:
+        if code == 31:
+            minute = 45   # Intervalo: 45' decorridos, 45' restantes
+        elif code == 41:
+            minute = 105  # Prolongamento 1ª parte
+        elif code == 42:
+            minute = 120  # Prolongamento 2ª parte
 
     return {
         "id": ev.get("id"),
@@ -1558,6 +1690,427 @@ def cli_test():
     print(f"{'='*60}")
 
 
+# ════════════════════════════════════════════════════════════
+#  BACKGROUND ENGINE — Pre-computes analysis every 2 minutes
+#  Only runs for monitored leagues with live games
+#  Budget: ~2 requests/sport_key/cycle (h2h + totals)
+#  Spreads fetched on the same cycle (3 req total)
+# ════════════════════════════════════════════════════════════
+
+# The set of sport keys we actively monitor.
+# Only games in these leagues trigger odds fetches.
+MONITORED_SPORT_KEYS = {
+    "soccer_epl", "soccer_efl_champ",
+    "soccer_spain_la_liga", "soccer_italy_serie_a",
+    "soccer_germany_bundesliga", "soccer_france_ligue_one",
+    "soccer_portugal_primeira_liga", "soccer_netherlands_eredivisie",
+    "soccer_belgium_first_div", "soccer_turkey_super_league",
+    "soccer_austria_bundesliga", "soccer_scotland_premiership",
+    "soccer_uefa_champs_league", "soccer_uefa_europa_league",
+    "soccer_uefa_europa_conference_league",
+    "soccer_usa_mls", "soccer_brazil_campeonato",
+    "soccer_argentina_primera_division",
+    "soccer_conmebol_copa_libertadores", "soccer_conmebol_copa_sudamericana",
+    "soccer_japan_j_league", "soccer_korea_kleague1", "soccer_australia_aleague",
+    "soccer_sweden_allsvenskan", "soccer_norway_eliteserien", "soccer_denmark_superliga",
+    "soccer_switzerland_superleague", "soccer_poland_ekstraklasa",
+    "soccer_czech_republic_league", "soccer_greece_super_league",
+}
+
+BG_INTERVAL   = 120   # seconds between cycles (2 minutes)
+ODDS_MIN_PICK = 1.40  # minimum odds to flag as value pick
+ODDS_MAX_PICK = 4.00  # maximum odds to flag as value pick
+
+# ── In-memory live state (rebuilt every cycle) ──
+_live_state: dict = {}      # match_id → {match, shots, incidents, odds, tips, ts}
+_state_lock = threading.Lock()
+_last_cycle_ts = 0.0
+_last_cycle_req = 0
+
+# ── SQLite persistence ──
+import sqlite3, pathlib
+
+DB_PATH = pathlib.Path(os.path.dirname(os.path.abspath(__file__))) / "tips.db"
+
+def _db():
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _init_db():
+    with _db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS games (
+            id          INTEGER PRIMARY KEY,
+            home_team   TEXT NOT NULL,
+            away_team   TEXT NOT NULL,
+            home_goals  INTEGER DEFAULT 0,
+            away_goals  INTEGER DEFAULT 0,
+            tournament  TEXT,
+            country     TEXT,
+            is_finished INTEGER DEFAULT 0,
+            archived_at INTEGER,
+            start_ts    INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS tips (
+            tip_key      TEXT PRIMARY KEY,
+            match_id     INTEGER NOT NULL,
+            market       TEXT NOT NULL,
+            label        TEXT NOT NULL,
+            odd_entry    REAL,
+            odd_now      REAL,
+            minute_entry INTEGER,
+            wall_ts      INTEGER NOT NULL,
+            result       TEXT DEFAULT NULL,
+            FOREIGN KEY (match_id) REFERENCES games(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id);
+        CREATE INDEX IF NOT EXISTS idx_games_finished ON games(is_finished);
+        """)
+    log.info(f"DB ready: {DB_PATH}")
+
+def _upsert_game(match: dict):
+    """Insert or update a game record."""
+    with _db() as conn:
+        conn.execute("""
+            INSERT INTO games (id, home_team, away_team, home_goals, away_goals,
+                               tournament, country, is_finished, start_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                home_goals  = excluded.home_goals,
+                away_goals  = excluded.away_goals,
+                is_finished = excluded.is_finished
+        """, (
+            match["id"], match["homeTeam"], match["awayTeam"],
+            match["homeGoals"], match["awayGoals"],
+            match.get("tournament"), match.get("country"),
+            1 if match.get("isFinished") else 0,
+            match.get("startTimestamp"),
+        ))
+        if match.get("isFinished"):
+            conn.execute(
+                "UPDATE games SET archived_at = ? WHERE id = ? AND archived_at IS NULL",
+                (int(time.time()), match["id"])
+            )
+
+def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict) -> list:
+    """
+    Sync server-computed picks into the DB.
+    Returns the full tip list for this match (including historical).
+    """
+    now_ts = int(time.time())
+    with _db() as conn:
+        for p in picks:
+            key = f"{p['market']}|{p['label']}"
+            existing = conn.execute(
+                "SELECT * FROM tips WHERE tip_key = ? AND match_id = ?",
+                (key, match_id)
+            ).fetchone()
+            if not existing:
+                conn.execute("""
+                    INSERT INTO tips (tip_key, match_id, market, label,
+                                      odd_entry, odd_now, minute_entry, wall_ts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (key, match_id, p["market"], p["label"],
+                      p["odds"], p["odds"], minute, now_ts))
+            else:
+                # Update current odd if still open
+                if existing["result"] is None:
+                    conn.execute(
+                        "UPDATE tips SET odd_now = ? WHERE tip_key = ? AND match_id = ?",
+                        (p["odds"], key, match_id)
+                    )
+
+        # Auto-resolve based on current state
+        all_tips = conn.execute(
+            "SELECT * FROM tips WHERE match_id = ?", (match_id,)
+        ).fetchall()
+        return [dict(t) for t in all_tips]
+
+
+def _auto_resolve_db(match_id: int, match: dict, inc: dict):
+    """Auto-resolve tips in DB based on current score/status."""
+    hg = match.get("homeGoals", 0)
+    ag = match.get("awayGoals", 0)
+    total = hg + ag
+    finished = match.get("isFinished", False)
+
+    with _db() as conn:
+        tips = conn.execute(
+            "SELECT * FROM tips WHERE match_id = ? AND result IS NULL", (match_id,)
+        ).fetchall()
+        for t in tips:
+            lbl = t["label"]; mkt = t["market"]
+            new_result = None
+
+            # O/U totals
+            import re as _re
+            om = _re.match(r'^Over\s+([\d.]+)$', lbl, _re.IGNORECASE)
+            um = _re.match(r'^Under\s+([\d.]+)$', lbl, _re.IGNORECASE)
+            if om:
+                line = float(om.group(1))
+                if total > line:          new_result = "green"
+                elif finished:            new_result = "red"
+            elif um:
+                line = float(um.group(1))
+                if total > line:          new_result = "red"
+                elif finished:            new_result = "green"
+
+            # 1X2 — only at FT
+            if mkt == "1X2" and finished:
+                ft = "home" if hg > ag else ("draw" if hg == ag else "away")
+                out_map = {"home": match.get("homeTeam",""), "draw": "Empate", "away": match.get("awayTeam","")}
+                for side, name in out_map.items():
+                    if lbl.lower() in name.lower() or (len(lbl) > 3 and name.lower().startswith(lbl[:4].lower())):
+                        new_result = "green" if side == ft else "red"
+                        break
+
+            if new_result:
+                conn.execute(
+                    "UPDATE tips SET result = ? WHERE tip_key = ? AND match_id = ?",
+                    (new_result, t["tip_key"], match_id)
+                )
+
+def _extract_picks_from_odds(odds: dict, match: dict) -> list:
+    """Extract value picks from pre-computed odds dict (mirrors frontend logic)."""
+    picks = []
+    if not odds or not odds.get("available"):
+        return picks
+
+    def valid_odds(o):
+        od = o.get("bookieOdds", 0) or 0
+        return ODDS_MIN_PICK <= od <= ODDS_MAX_PICK
+
+    benter = odds.get("benter") or {}
+
+    # 1X2
+    bh = benter.get("h2h")
+    if bh and bh.get("outcomes"):
+        out_lbls = {
+            "home": match.get("homeTeam", "Casa"),
+            "draw": "Empate",
+            "away": match.get("awayTeam", "Fora"),
+        }
+        h2x = [(k, o) for k, o in bh["outcomes"].items() if o.get("isValue") and valid_odds(o)]
+        has_away = any(k == "away" for k, _ in h2x)
+        has_draw = any(k == "draw" for k, _ in h2x)
+        has_home = any(k == "home" for k, _ in h2x)
+        if has_away and has_draw and not has_home:
+            pass  # anti-double: skip both, let HCP handle
+        else:
+            for k, o in h2x:
+                picks.append({
+                    "market": "1X2", "label": out_lbls.get(k, k),
+                    "odds": o.get("bookieOdds"), "edge": o.get("edge", 0),
+                    "blend": o.get("blendedProb", 0), "model": o.get("modelProb", 0),
+                })
+
+    # Totals
+    bt = benter.get("totals")
+    if bt and bt.get("outcomes"):
+        ou_lbl = {"over": f"Over {bt.get('line','')}", "under": f"Under {bt.get('line','')}"}
+        for k, o in bt["outcomes"].items():
+            if o.get("isValue") and valid_odds(o):
+                picks.append({
+                    "market": f"O/U {bt.get('line','')}",
+                    "label": ou_lbl.get(k, k),
+                    "odds": o.get("bookieOdds"), "edge": o.get("edge", 0),
+                    "blend": o.get("blendedProb", 0), "model": o.get("modelProb", 0),
+                })
+
+    # Spreads
+    bs = benter.get("spreads")
+    if bs and bs.get("outcomes"):
+        hpt_h = (("+" if (bs.get("homePoint") or 0) >= 0 else "") + str(bs.get("homePoint", ""))) if bs.get("homePoint") is not None else ""
+        hpt_a = (("+" if (bs.get("awayPoint") or 0) >= 0 else "") + str(bs.get("awayPoint", ""))) if bs.get("awayPoint") is not None else ""
+        sp_lbl = {
+            "home": f"{match.get('homeTeam','Casa')} {hpt_h}".strip(),
+            "away": f"{match.get('awayTeam','Fora')} {hpt_a}".strip(),
+        }
+        for k, o in bs["outcomes"].items():
+            if o.get("isValue") and valid_odds(o):
+                picks.append({
+                    "market": "HCP", "label": sp_lbl.get(k, k),
+                    "odds": o.get("bookieOdds"), "edge": o.get("edge", 0),
+                    "blend": o.get("blendedProb", 0), "model": o.get("modelProb", 0),
+                })
+
+    return picks
+
+
+def _run_background_cycle():
+    """
+    Single background cycle:
+    1. Fetch Sofascore live list
+    2. Filter to monitored leagues
+    3. Prime odds cache (1 fetch per sport key = 3 req)
+    4. Compute full analysis per game
+    5. Sync tips to DB
+    6. Update _live_state
+    """
+    global _last_cycle_ts, _last_cycle_req
+
+    t0 = time.time()
+    req_before = _api_requests_remaining or 0
+
+    try:
+        live = get_live()
+    except Exception as e:
+        log.error(f"BG: get_live() failed: {e}")
+        return
+
+    # Filter to monitored leagues only
+    monitored = []
+    for m in live:
+        sk = _resolve_sport_key(m.get("tournament", ""), m.get("country", ""))
+        if sk in MONITORED_SPORT_KEYS:
+            m["_sport_key"] = sk
+            monitored.append(m)
+
+    log.info(f"BG cycle: {len(live)} live total, {len(monitored)} in monitored leagues")
+
+    if not monitored:
+        with _state_lock:
+            _live_state.clear()
+        _last_cycle_ts = time.time()
+        return
+
+    # Group by sport key → 1 odds fetch per sport key
+    sport_keys = {m["_sport_key"] for m in monitored}
+    for sk in sport_keys:
+        try:
+            get_odds_for_sport(sk)  # populates cache, 3 req
+        except Exception as e:
+            log.error(f"BG: odds fetch failed for {sk}: {e}")
+
+    # Compute full analysis per game
+    new_state = {}
+    for m in monitored:
+        mid = m["id"]
+        try:
+            shots     = get_shotmap(mid)
+            incidents = get_incidents(mid)
+            odds      = get_full_odds_analysis(m, shots)
+
+            # Upsert game in DB
+            _upsert_game(m)
+
+            # Extract picks + sync to DB
+            minute = m.get("minute") or 0
+            picks  = _extract_picks_from_odds(odds, m) if odds else []
+            tips   = _sync_tips_db(mid, picks, minute, odds or {})
+            _auto_resolve_db(mid, m, incidents)
+
+            # Re-read tips after resolution
+            with _db() as conn:
+                tips = [dict(t) for t in conn.execute(
+                    "SELECT * FROM tips WHERE match_id = ? ORDER BY wall_ts", (mid,)
+                ).fetchall()]
+
+            new_state[mid] = {
+                "match":     m,
+                "shots":     shots,
+                "incidents": incidents,
+                "odds":      odds,
+                "tips":      tips,
+                "ts":        datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception as e:
+            log.error(f"BG: failed to process game {mid}: {e}")
+
+    with _state_lock:
+        _live_state.clear()
+        _live_state.update(new_state)
+
+    req_after = _api_requests_remaining or 0
+    _last_cycle_ts = time.time()
+    _last_cycle_req = req_before - req_after
+    log.info(
+        f"BG cycle done in {time.time()-t0:.1f}s — "
+        f"{len(new_state)} games processed, {_last_cycle_req} API req used"
+    )
+
+
+def _background_loop():
+    """Runs forever, sleeping BG_INTERVAL seconds between cycles."""
+    # Stagger first cycle by 5s to let Gunicorn/Flask finish starting
+    time.sleep(5)
+    while True:
+        try:
+            _run_background_cycle()
+        except Exception as e:
+            log.error(f"BG loop unhandled error: {e}")
+        time.sleep(BG_INTERVAL)
+
+
+# ── New API endpoints ──
+
+@app.route("/api/state")
+def r_state():
+    """
+    Returns the full pre-computed live state for all monitored games.
+    This is what the dashboard polls — zero Odds API requests from the browser.
+    """
+    with _state_lock:
+        state_copy = dict(_live_state)
+    return jsonify({
+        "games":    list(state_copy.values()),
+        "count":    len(state_copy),
+        "cycleTsIso": datetime.fromtimestamp(_last_cycle_ts, tz=timezone.utc).isoformat() if _last_cycle_ts else None,
+        "cycleReq": _last_cycle_req,
+        "quotaRemaining": _api_requests_remaining,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.route("/api/state/tips")
+def r_state_tips():
+    """Returns tip history (all games, including finished) from the DB."""
+    limit = flask_request.args.get("limit", 100, type=int)
+    with _db() as conn:
+        games = conn.execute("""
+            SELECT g.*, COUNT(t.tip_key) as tip_count
+            FROM games g
+            LEFT JOIN tips t ON t.match_id = g.id
+            GROUP BY g.id
+            ORDER BY g.archived_at DESC, g.id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        result = []
+        for g in games:
+            gd = dict(g)
+            tips_rows = conn.execute(
+                "SELECT * FROM tips WHERE match_id = ? ORDER BY wall_ts", (g["id"],)
+            ).fetchall()
+            gd["tips"] = [dict(t) for t in tips_rows]
+            result.append(gd)
+    return jsonify({"games": result, "count": len(result)})
+
+
+@app.route("/api/state/tips/<int:match_id>", methods=["PATCH"])
+def r_update_tip_result(match_id):
+    """
+    Manual result override for a tip.
+    Body: {"tip_key": "...", "result": "green"|"red"|"void"|null}
+    """
+    body = flask_request.get_json(silent=True) or {}
+    tip_key = body.get("tip_key")
+    result  = body.get("result")  # null clears it
+
+    if not tip_key:
+        return jsonify({"error": "tip_key required"}), 400
+    if result not in (None, "green", "red", "void"):
+        return jsonify({"error": "result must be green|red|void|null"}), 400
+
+    with _db() as conn:
+        conn.execute(
+            "UPDATE tips SET result = ? WHERE tip_key = ? AND match_id = ?",
+            (result, tip_key, match_id)
+        )
+    return jsonify({"ok": True, "tip_key": tip_key, "result": result})
+
+
+
 if __name__ == "__main__":
     _load_aliases()
 
@@ -1569,11 +2122,16 @@ if __name__ == "__main__":
         print("  + Live Odds & Benter Value Engine")
         print("=" * 60)
         _init_client()
+        _init_db()
+        threading.Thread(target=_background_loop, daemon=True).start()
         print(f"  Client: {_client_type}")
         print(f"  Odds API: enabled")
+        print(f"  Background engine: every {BG_INTERVAL}s")
         print(f"  Team aliases: {len(_team_aliases)} loaded\n")
         app.run(host="0.0.0.0", port=5050, debug=True)
 else:
     # Running under gunicorn — __main__ block is skipped, so initialize here
     _load_aliases()
+    _init_db()
     threading.Thread(target=_init_client, daemon=True).start()
+    threading.Thread(target=_background_loop, daemon=True).start()
