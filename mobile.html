@@ -109,6 +109,10 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
 .xg-seg-h{height:100%;background:var(--green);transition:width .5s}
 .xg-seg-a{height:100%;background:var(--amber);transition:width .5s}
 .mcard.has-value{border-right:2px solid rgba(74,222,128,.5)}
+.rc-pip{display:inline-flex;align-items:center;gap:1px;font-size:10px;line-height:1;flex-shrink:0}
+.rc-card{width:7px;height:10px;border-radius:1px;background:var(--red);display:inline-block;margin-left:1px}
+.mc-t-wrap{display:flex;align-items:center;gap:4px;min-width:0}
+.mc-t-wrap .mc-t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mc-val-badge{font-size:9px;font-weight:800;padding:1px 5px;border-radius:3px;background:var(--green-dim);color:var(--green);letter-spacing:.04em}
 .xg-bar-row.xg-unloaded{opacity:.3}
 .xg-seg-empty{height:100%;background:var(--text3);border-radius:2px}
@@ -246,6 +250,93 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
 .val-badge{font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;background:var(--green-dim);color:var(--green);border:1px solid rgba(74,222,128,.3);flex-shrink:0;white-space:nowrap}
 .no-odds{padding:12px;background:var(--bg3);border-radius:8px;font-size:12px;color:var(--text3);line-height:1.6}
 
+/* ── SETTLEMENT VIEW ── */
+.sett-hdr{padding:10px 14px 0;display:flex;align-items:center;justify-content:space-between}
+.sett-hdr-lbl{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)}
+.sett-filters{display:flex;gap:6px;padding:8px 14px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.sett-filters::-webkit-scrollbar{display:none}
+.sf-btn{font-size:11px;font-family:var(--sans);font-weight:600;padding:5px 12px;border-radius:20px;border:1px solid var(--border);background:transparent;color:var(--text3);white-space:nowrap;cursor:pointer;flex-shrink:0}
+.sf-btn.active{background:var(--bg3);border-color:var(--border2);color:var(--text)}
+.sett-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:0 14px 10px}
+.sett-sum-cell{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;text-align:center}
+.sett-sum-val{font-size:18px;font-weight:800;font-family:var(--mono)}
+.sett-sum-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:var(--text3);margin-top:2px}
+.sett-sum-val.green{color:var(--green)}.sett-sum-val.red{color:var(--red)}.sett-sum-val.blue{color:var(--blue)}
+.sett-game{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);margin:0 10px 10px;overflow:hidden}
+.sett-game-hdr{padding:10px 12px;background:var(--bg3);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;cursor:pointer}
+.sett-game-teams{font-size:13px;font-weight:700;color:var(--text);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sett-game-score{font-size:11px;font-family:var(--mono);color:var(--text3);flex-shrink:0}
+.sett-game-pl{font-size:12px;font-weight:800;font-family:var(--mono);flex-shrink:0;min-width:40px;text-align:right}
+.sett-game-pl.green{color:var(--green)}.sett-game-pl.red{color:var(--red)}.sett-game-pl.neutral{color:var(--text3)}
+.sett-game-date{font-size:10px;color:var(--text3)}
+.sett-tip-row{display:flex;align-items:center;gap:8px;padding:7px 12px;border-top:1px solid var(--border)}
+.sett-tip-min{font-size:10px;font-family:var(--mono);color:var(--text3);min-width:26px;flex-shrink:0}
+.sett-tip-mkt{font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:var(--bg4);color:var(--text3);flex-shrink:0}
+.sett-tip-lbl{font-size:12px;font-weight:600;color:var(--text);flex:1}
+.sett-tip-odd{font-size:12px;font-family:var(--mono);font-weight:700;color:var(--text);flex-shrink:0}
+.sett-tip-res{width:22px;height:22px;border-radius:5px;font-size:11px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-weight:800}
+.sett-tip-res.green{background:rgba(74,222,128,.15);color:var(--green)}
+.sett-tip-res.red{background:rgba(248,113,113,.12);color:var(--red)}
+.sett-tip-res.void{background:rgba(96,165,250,.1);color:var(--blue)}
+.sett-tip-res.pending{background:var(--bg4);color:var(--text3)}
+.sett-empty{padding:48px 24px;text-align:center;color:var(--text3);font-size:13px;line-height:1.7}
+.sett-clr-btn{font-size:11px;color:var(--red);background:transparent;border:none;font-family:var(--sans);cursor:pointer;padding:2px 8px}
+
+/* ── BANDEIRAS ── */
+.flag{font-size:13px;line-height:1;flex-shrink:0;margin-right:1px}
+.mcard .flag{font-size:12px}
+
+/* ── XG MANUAL ── */
+.xg-edit-btn{
+  display:inline-flex;align-items:center;gap:5px;padding:6px 13px;border-radius:8px;
+  background:transparent;border:1px solid var(--border2);
+  color:var(--text3);font-family:var(--sans);font-size:12px;font-weight:500;cursor:pointer;
+  transition:all .15s;
+}
+.xg-edit-btn:active{background:var(--bg4)}
+.xg-edit-btn.has-manual{border-color:rgba(74,222,128,.4);color:var(--green);background:var(--green-bg)}
+.manual-badge{
+  font-size:9px;font-weight:800;padding:1px 5px;border-radius:3px;
+  background:rgba(96,165,250,.12);color:var(--blue);letter-spacing:.04em;flex-shrink:0;
+}
+.xg-row2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+.xg-input-block{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.xg-input-lbl{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);margin-bottom:6px;display:block}
+.xg-input-lbl.h{color:var(--green)}.xg-input-lbl.a{color:var(--amber)}
+.xg-num{
+  width:100%;background:transparent;border:none;border-bottom:1px solid var(--border2);
+  color:var(--text);font-family:var(--mono);font-size:20px;font-weight:700;padding:4px 0 6px;
+  outline:none;-webkit-appearance:none;-moz-appearance:textfield;text-align:center;
+}
+.xg-num:focus{border-bottom-color:rgba(74,222,128,.5)}
+.xg-num-sub{font-size:10px;color:var(--text3);text-align:center;margin-top:4px}
+.del-btn{
+  width:100%;padding:11px;border-radius:8px;background:transparent;
+  border:1px solid rgba(248,113,113,.2);color:var(--red);
+  font-family:var(--sans);font-size:13px;font-weight:500;cursor:pointer;margin-top:6px;
+}
+.del-btn:active{background:rgba(248,113,113,.08)}
+
+
+/* ── TIPS HISTORY ── */
+.tips-block{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;margin-bottom:10px}
+.tips-hdr{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--bg3);border-bottom:1px solid var(--border)}
+.tips-hdr-lbl{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)}
+.tips-hdr-count{font-size:10px;font-family:var(--mono);color:var(--text3)}
+.tip-row{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border)}
+.tip-row:last-child{border-bottom:none}
+.tip-min{font-size:10px;font-family:var(--mono);color:var(--text3);min-width:26px;flex-shrink:0}
+.tip-mkt{font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;background:var(--bg4);color:var(--text3);flex-shrink:0}
+.tip-lbl{font-size:12px;font-weight:600;color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tip-odds{display:flex;flex-direction:column;align-items:flex-end;gap:1px;flex-shrink:0;min-width:52px}
+.tip-odd-entry{font-size:12px;font-family:var(--mono);font-weight:700;color:var(--text)}
+.tip-odd-now{font-size:10px;font-family:var(--mono);color:var(--text3)}
+.tip-odd-now.up{color:var(--green)}.tip-odd-now.down{color:var(--red)}
+.tip-status{width:26px;height:26px;border-radius:6px;border:none;font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;background:var(--bg4);color:var(--text3)}
+.tip-status.green{background:rgba(74,222,128,.15);color:var(--green);border:1px solid rgba(74,222,128,.3)}
+.tip-status.red{background:rgba(248,113,113,.12);color:var(--red);border:1px solid rgba(248,113,113,.25)}
+.tip-status.void{background:rgba(96,165,250,.1);color:var(--blue);border:1px solid rgba(96,165,250,.25)}
+.tip-status.pending{background:var(--bg4);border:1px solid var(--border)}
 /* ── GOALS LIST ── */
 .goals-block{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;margin-bottom:10px}
 .goal-row{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);font-size:12px}
@@ -303,6 +394,12 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
   <button class="ibtn" id="btn-settings" title="Configurações" aria-label="Abrir configurações">⚙</button>
 </div>
 
+<!-- NAV TABS -->
+<div class="nav-tabs" id="nav-tabs" style="display:flex;border-bottom:1px solid var(--border);background:var(--bg2)">
+  <button class="nav-tab active" id="tab-live" onclick="switchTab('live')" style="flex:1;padding:9px 0;font-size:12px;font-weight:600;font-family:var(--sans);background:transparent;border:none;color:var(--text);border-bottom:2px solid var(--green);cursor:pointer">⬡ Live</button>
+  <button class="nav-tab" id="tab-sett" onclick="switchTab('sett')" style="flex:1;padding:9px 0;font-size:12px;font-weight:600;font-family:var(--sans);background:transparent;border:none;color:var(--text3);border-bottom:2px solid transparent;cursor:pointer">📋 Settlement</button>
+</div>
+
 <!-- SUBHEADER (lista) -->
 <div class="subhdr" id="subhdr">
   <div style="display:flex;align-items:center;gap:8px">
@@ -332,6 +429,22 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
   <div class="det-scroll" id="det-scroll">
     <div class="loading-row"><div class="spinner"></div>A recolher dados…</div>
   </div>
+</div>
+
+<!-- SETTLEMENT VIEW -->
+<div class="view hidden" id="view-sett">
+  <div class="sett-hdr">
+    <span class="sett-hdr-lbl">📋 Histórico de Tips</span>
+    <button class="sett-clr-btn" onclick="confirmClearArchive()">Limpar tudo</button>
+  </div>
+  <div class="sett-filters" id="sett-filters">
+    <button class="sf-btn active" data-filter="all" onclick="setSettFilter('all',this)">Todos</button>
+    <button class="sf-btn" data-filter="profit" onclick="setSettFilter('profit',this)">✓ Lucro</button>
+    <button class="sf-btn" data-filter="loss" onclick="setSettFilter('loss',this)">✗ Prejuízo</button>
+    <button class="sf-btn" data-filter="pending" onclick="setSettFilter('pending',this)">· Pendente</button>
+  </div>
+  <div class="sett-summary" id="sett-summary"></div>
+  <div id="sett-list"></div>
 </div>
 
 <!-- MODAL CONFIGURAÇÕES -->
@@ -365,11 +478,49 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
   </div>
 </div>
 
+<!-- MODAL xG MANUAL -->
+<div class="modal-overlay hidden" id="modal-xg">
+  <div class="modal-sheet">
+    <div class="modal-handle"></div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+      <div class="modal-title" style="margin-bottom:0">✏ xG Manual</div>
+      <span class="manual-badge" style="font-size:10px;padding:3px 8px">OVERRIDE</span>
+    </div>
+    <div id="xg-modal-teams" style="font-size:12px;color:var(--text3);margin-bottom:14px"></div>
+    <div class="xg-row2">
+      <div class="xg-input-block">
+        <label class="xg-input-lbl h" id="xg-lbl-home">Casa</label>
+        <input class="xg-num" id="xg-home" type="number" min="0" max="20" step="0.01" placeholder="0.00">
+        <div class="xg-num-sub">xG acumulado</div>
+      </div>
+      <div class="xg-input-block">
+        <label class="xg-input-lbl a" id="xg-lbl-away">Fora</label>
+        <input class="xg-num" id="xg-away" type="number" min="0" max="20" step="0.01" placeholder="0.00">
+        <div class="xg-num-sub">xG acumulado</div>
+      </div>
+    </div>
+    <div class="xg-row2" style="margin-bottom:14px">
+      <div class="xg-input-block">
+        <label class="xg-input-lbl" style="color:var(--text3)">Remates Casa</label>
+        <input class="xg-num" id="xg-shots-home" type="number" min="0" max="50" step="1" placeholder="0" style="font-size:16px">
+        <div class="xg-num-sub">opcional</div>
+      </div>
+      <div class="xg-input-block">
+        <label class="xg-input-lbl" style="color:var(--text3)">Remates Fora</label>
+        <input class="xg-num" id="xg-shots-away" type="number" min="0" max="50" step="1" placeholder="0" style="font-size:16px">
+        <div class="xg-num-sub">opcional</div>
+      </div>
+    </div>
+    <button class="save-btn" id="btn-xg-save">Guardar xG</button>
+    <button class="del-btn hidden" id="btn-xg-clear">Remover override</button>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
 // ─────────────────────── CONFIG ───────────────────────
 function BASE() {
-  let v = (localStorage.getItem('_sf_host') || 'localhost:5050').trim().replace(/\/+$/, '');
+  let v = (localStorage.getItem('_sf_host') || 'web-production-397aa.up.railway.app').trim().replace(/\/+$/, '');
   if (v.startsWith('http://') || v.startsWith('https://')) return v;
   const local = v.startsWith('localhost') || v.startsWith('127.') || /^192\.168\.|^10\./.test(v);
   return (local ? 'http://' : 'https://') + v;
@@ -387,6 +538,63 @@ const S = {
   detTimer: null,
   chart: null,
 };
+
+// ─────────────────────── COUNTRY FLAGS ───────────────────────
+const COUNTRY_FLAGS = {
+  'england':'🏴󠁧󠁢󠁥󠁮󠁧󁿢','scotland':'🏴󠁧󠁢󠁳󠁣󠁴󠁿','wales':'🏴󠁧󠁢󠁷󠁬󠁳󠁿','northern ireland':'🇬🇧',
+  'spain':'🇪🇸','italy':'🇮🇹','germany':'🇩🇪','france':'🇫🇷','portugal':'🇵🇹',
+  'netherlands':'🇳🇱','belgium':'🇧🇪','turkey':'🇹🇷','sweden':'🇸🇪','norway':'🇳🇴',
+  'denmark':'🇩🇰','poland':'🇵🇱','czech republic':'🇨🇿','greece':'🇬🇷','switzerland':'🇨🇭',
+  'austria':'🇦🇹','croatia':'🇭🇷','serbia':'🇷🇸','romania':'🇷🇴','hungary':'🇭🇺',
+  'slovakia':'🇸🇰','slovenia':'🇸🇮','ukraine':'🇺🇦','russia':'🇷🇺','finland':'🇫🇮',
+  'iceland':'🇮🇸','ireland':'🇮🇪','israel':'🇮🇱',
+  'usa':'🇺🇸','united states':'🇺🇸','mexico':'🇲🇽','canada':'🇨🇦',
+  'brazil':'🇧🇷','argentina':'🇦🇷','colombia':'🇨🇴','chile':'🇨🇱','uruguay':'🇺🇾',
+  'ecuador':'🇪🇨','peru':'🇵🇪','venezuela':'🇻🇪','paraguay':'🇵🇾','bolivia':'🇧🇴',
+  'australia':'🇦🇺','japan':'🇯🇵','south korea':'🇰🇷','china':'🇨🇳','india':'🇮🇳',
+  'saudi arabia':'🇸🇦','qatar':'🇶🇦','uae':'🇦🇪','iran':'🇮🇷',
+  'egypt':'🇪🇬','morocco':'🇲🇦','nigeria':'🇳🇬','south africa':'🇿🇦','ghana':'🇬🇭',
+  'international':'🌍','europe':'🇪🇺','africa':'🌍','asia':'🌏',
+  'south america':'🌎','north & central america':'🌎','oceania':'🌏',
+  'conmebol':'🌎','uefa':'🇪🇺',
+};
+function countryFlag(c) {
+  if (!c) return '';
+  return COUNTRY_FLAGS[c.toLowerCase()] || '';
+}
+
+// ─────────────────────── xG MANUAL STORE ───────────────────────
+function getManualXg(id) {
+  try { return JSON.parse(localStorage.getItem('_mxg_' + id) || 'null'); } catch { return null; }
+}
+function setManualXg(id, d) {
+  localStorage.setItem('_mxg_' + id, JSON.stringify(d));
+}
+function clearManualXg(id) {
+  localStorage.removeItem('_mxg_' + id);
+}
+function buildManualShots(manual) {
+  // Build a synthetic shots object from manual xG values
+  const hs = manual.shotsHome || 0, as_ = manual.shotsAway || 0;
+  const hxg = manual.homeXg || 0, axg = manual.awayXg || 0;
+  const mkShots = (n, xg, isHome) => {
+    if (n === 0 && xg > 0) return [{ xg: parseFloat(xg), minute: 1, addedTime: 0, player: '—', situation: 'manual', bodyPart: '—', isGoal: false, isHome }];
+    if (n === 0) return [];
+    const perShot = parseFloat(xg) / n;
+    return Array.from({ length: n }, (_, i) => ({
+      xg: parseFloat((perShot).toFixed(4)), minute: Math.round((i + 1) * 90 / n), addedTime: 0,
+      player: '—', situation: 'manual', bodyPart: '—', isGoal: false, isHome,
+    }));
+  };
+  const homeShots = mkShots(hs, hxg, true);
+  const awayShots = mkShots(as_, axg, false);
+  return {
+    homeShots, awayShots,
+    homeXg: parseFloat(hxg), awayXg: parseFloat(axg),
+    totalShots: homeShots.length + awayShots.length,
+    _manual: true,
+  };
+}
 
 // ─────────────────────── FETCH ───────────────────────
 async function api(path) {
@@ -422,7 +630,7 @@ async function refreshQuota() {
 async function loadMatches() {
   const btn = document.getElementById('btn-refresh');
   btn.classList.add('loading'); btn.innerHTML = '<span class="spin">↻</span>';
-  const { ok, data } = await api('/api/live');
+  const { ok, data } = await api('/api/state');
   btn.classList.remove('loading'); btn.innerHTML = '↻ Refresh';
 
   if (!ok || !data) {
@@ -434,11 +642,53 @@ async function loadMatches() {
     return;
   }
 
-  S.matches = data.matches || [];
-  document.getElementById('live-count').textContent = S.matches.length;
+  // /api/state returns pre-computed analysis for all monitored live games
+  const games = data.games || [];
+  S.matches = games.map(g => g.match).filter(Boolean);
+  document.getElementById('live-count').textContent = S.matches.filter(m => m.isLive).length;
+
+  // Populate caches from pre-computed server data — zero extra API calls
+  for (const g of games) {
+    const mid = g.match?.id;
+    if (!mid) continue;
+    S.trackCache[mid] = { data: g, ts: Date.now() };
+    if (g.shots && (g.shots.homeXg > 0 || g.shots.awayXg > 0)) {
+      S.xgCache[mid] = { homeXg: g.shots.homeXg, awayXg: g.shots.awayXg };
+      updateCardBar(mid, g.shots.homeXg, g.shots.awayXg);
+    }
+    // Merge server-side tips into localStorage for the tip history UI
+    if (g.tips && g.tips.length) mergeServerTips(mid, g.tips);
+  }
+
+  if (data.quotaRemaining != null) setQuota(data.quotaRemaining);
+  if (data.cycleTsIso) {
+    const ago = Math.round((Date.now() - new Date(data.cycleTsIso).getTime()) / 1000);
+    document.getElementById('sub-meta').textContent = `Ciclo há ${ago < 5 ? '<5' : ago}s`;
+  }
+
   renderList();
-  refreshQuota();
-  prefetchXg(S.matches);  // background xG for all visible cards
+}
+
+// Merge server-side tips into localStorage format for the tip history UI
+function mergeServerTips(matchId, serverTips) {
+  const existing = getTips(matchId);
+  let changed = false;
+  for (const st of serverTips) {
+    const found = existing.find(t => t.key === st.tip_key);
+    if (!found) {
+      existing.push({
+        key: st.tip_key, market: st.market, label: st.label,
+        oddEntry: st.odd_entry, oddNow: st.odd_now,
+        minuteEntry: st.minute_entry, ts: (st.wall_ts || 0) * 1000,
+        result: st.result,
+      });
+      changed = true;
+    } else {
+      if (found.result === null && st.result !== null) { found.result = st.result; changed = true; }
+      if (found.oddNow !== st.odd_now) { found.oddNow = st.odd_now; changed = true; }
+    }
+  }
+  if (changed) saveTips(matchId, existing);
 }
 
 // ─────────────────────── XG PREFETCH ───────────────────────
@@ -446,6 +696,14 @@ async function loadMatches() {
 async function prefetchXg(matches) {
   const uncached = matches.filter(m => !S.xgCache[m.id] && m.isLive);
   for (const m of uncached) {
+    // Check manual override first — no server call needed
+    const manual = getManualXg(m.id);
+    if (manual && (manual.homeXg > 0 || manual.awayXg > 0)) {
+      S.xgCache[m.id] = { homeXg: manual.homeXg, awayXg: manual.awayXg };
+      updateCardBar(m.id, manual.homeXg, manual.awayXg);
+      continue;
+    }
+
     if (S.selectedId) return;  // stop if user opened a match
     const { ok, data } = await api(`/api/shots/${m.id}`);
     if (ok && data && data.totalShots > 0) {
@@ -476,6 +734,7 @@ function updateCardBar(id, hxg, axg) {
 }
 
 
+function renderList() {
   const q = (document.getElementById('srch').value || '').toLowerCase().trim();
   let list = S.matches;
   if (q) list = list.filter(m =>
@@ -519,19 +778,35 @@ function updateCardBar(id, hxg, axg) {
     const tc = S.trackCache[m.id]?.data;
     const hasValue = tc?.odds?.benter?.h2h?.outcomes &&
       Object.values(tc.odds.benter.h2h.outcomes).some(o => o.isValue);
+    const hasMxg = !!getManualXg(m.id);
+    const flag = countryFlag(m.country);
+
+    // Red cards from incident cache
+    const cards = tc?.incidents?.cards || [];
+    const rcTypes = new Set(['red','yellowRed']);
+    const rcHome = cards.filter(c => rcTypes.has(c.cardType) &&  c.isHome).length;
+    const rcAway = cards.filter(c => rcTypes.has(c.cardType) && !c.isHome).length;
+    const rcPip = (n) => n > 0
+      ? `<span class="rc-pip">${Array(n).fill('<span class="rc-card"></span>').join('')}</span>`
+      : '';
 
     return `<div class="mcard${hasValue ? ' has-value' : ''}" data-id="${m.id}">
       <div class="mc-top">
-        <span class="mc-tourn">${m.country ? m.country + ' · ' : ''}${m.tournament}</span>
+        <span class="mc-tourn">${flag ? '<span class="flag">'+flag+'</span> ' : ''}${m.country ? m.country + ' · ' : ''}${m.tournament}</span>
         <div style="display:flex;align-items:center;gap:6px">
+          ${hasMxg ? '<span class="manual-badge">✏ xG</span>' : ''}
           ${hasValue ? '<span class="mc-val-badge">VALUE</span>' : ''}
           <span class="mc-min">${min}</span>
         </div>
       </div>
       <div class="mc-teams">
-        <span class="mc-t">${m.homeTeam}</span>
+        <div class="mc-t-wrap" style="flex:1;justify-content:flex-end">
+          ${rcPip(rcHome)}<span class="mc-t">${m.homeTeam}</span>
+        </div>
         <span class="mc-sc">${m.homeGoals}–${m.awayGoals}</span>
-        <span class="mc-t a">${m.awayTeam}</span>
+        <div class="mc-t-wrap a" style="flex:1">
+          <span class="mc-t a">${m.awayTeam}</span>${rcPip(rcAway)}
+        </div>
       </div>
       ${barHtml}
     </div>`;
@@ -549,8 +824,9 @@ async function openMatch(id) {
 
   const m = S.matches.find(x => x.id === id);
   if (m) {
+    const flag = countryFlag(m.country);
     document.getElementById('det-meta').innerHTML =
-      `<div class="det-tourn">${m.tournament}` +
+      `<div class="det-tourn">${flag ? flag + ' ' : ''}${m.tournament}` +
       (m.isLive ? `<span class="det-live-chip"><span style="width:5px;height:5px;border-radius:50%;background:var(--red);display:inline-block;animation:pulse 1.2s infinite"></span>${m.minute ? m.minute + "'" : 'LIVE'}</span>` : '') +
       `</div>`;
   }
@@ -587,11 +863,27 @@ async function fetchDetail(id, forceRefresh = false) {
     return;
   }
 
-  // Update caches
+  // Apply manual xG override whenever one exists for this match
+  // (covers games with no Sofascore data AND games where user wants to override)
+  const manual = getManualXg(id);
+  if (manual) {
+    data.shots = buildManualShots(manual);
+    data._manualXg = true;
+    // Recalculate model odds client-side (server used shots.homeXg=0 before injection)
+    if (data.odds) data.odds = injectManualOdds(data.odds, data.match, data.shots);
+  }
+
+  // Update caches AFTER possible manual injection so bar shows correct values
   S.xgCache[id] = { homeXg: data.shots.homeXg, awayXg: data.shots.awayXg };
   S.trackCache[id] = { data, ts: now };
 
   if (data.odds?.quotaRemaining != null) setQuota(data.odds.quotaRemaining);
+
+  // Archive finished games immediately when detected — before rendering
+  if (data.match?.isFinished) {
+    const tips = getTips(data.match.id);
+    if (tips.length) archiveMatch(data.match, tips);
+  }
 
   renderDetail(data);
 }
@@ -613,6 +905,7 @@ function setQuota(rem) {
 function renderDetail(data) {
   const m = data.match, shots = data.shots, inc = data.incidents, odds = data.odds;
   const hxg = shots.homeXg, axg = shots.awayXg;
+  const isManual = !!(data._manualXg || shots._manual);
 
   if (odds?.quotaRemaining != null) setQuota(odds.quotaRemaining);
 
@@ -624,15 +917,20 @@ function renderDetail(data) {
     <div class="score-row">
       <div class="score-team">
         <div class="s-name">${m.homeTeam}</div>
-        <div class="s-sub" style="color:var(--green)">${hxg.toFixed(2)} xG · ${shots.homeShots.length} rem.</div>
+        <div class="s-sub" style="color:var(--green)">${hxg.toFixed(2)} xG · ${shots.homeShots.length} rem.${isManual ? ' <span class="manual-badge">manual</span>' : ''}</div>
       </div>
       <div class="score-num">${m.homeGoals}–${m.awayGoals}</div>
       <div class="score-team">
         <div class="s-name a">${m.awayTeam}</div>
-        <div class="s-sub a" style="color:var(--amber)">${axg.toFixed(2)} xG · ${shots.awayShots.length} rem.</div>
+        <div class="s-sub a" style="color:var(--amber)">${axg.toFixed(2)} xG · ${shots.awayShots.length} rem.${isManual ? ' <span class="manual-badge">manual</span>' : ''}</div>
       </div>
     </div>
     ${m.minute ? `<div class="score-time">${m.statusDesc ? m.statusDesc + ' · ' : ''}${m.minute}'</div>` : ''}
+    <div style="display:flex;justify-content:center;margin-top:10px">
+      <button class="xg-edit-btn${isManual ? ' has-manual' : ''}" onclick="openXgModal(${m.id})">
+        ✏ ${isManual ? 'Editar xG Manual' : 'Inserir xG Manual'}
+      </button>
+    </div>
   </div>`;
 
   const chartHtml = `
@@ -694,7 +992,141 @@ function renderDetail(data) {
   document.getElementById('det-scroll').innerHTML =
     analysisHtml + scoreHtml + chartHtml + statsHtml + oddsHtml + goalsHtml + shotsHtml;
 
-  if (shots.totalShots > 0) requestAnimationFrame(() => buildChart(shots, inc, m));
+  const tipMarkers = getTips(m.id).filter(t => t.minuteEntry > 0);
+  if (shots.totalShots > 0) requestAnimationFrame(() => buildChart(shots, inc, m, tipMarkers));
+}
+
+// ─────────────────────── TIPS PERSISTENCE ───────────────────────
+function getTips(matchId) {
+  try { return JSON.parse(localStorage.getItem('_tips_' + matchId) || '[]'); } catch { return []; }
+}
+function saveTips(matchId, tips) {
+  localStorage.setItem('_tips_' + matchId, JSON.stringify(tips));
+}
+function clearTips(matchId) {
+  localStorage.removeItem('_tips_' + matchId);
+}
+
+// Called on every renderDetail — detects new tips and updates existing ones
+function syncTips(matchId, picks, minute) {
+  if (!picks || !picks.length) return getTips(matchId);
+  const existing = getTips(matchId);
+  let changed = false;
+
+  for (const p of picks) {
+    const key = p.market + '|' + p.label;
+    const found = existing.find(t => t.key === key);
+    if (!found) {
+      // First time this tip appears — record it
+      existing.push({
+        key,
+        market: p.market,
+        label: p.label,
+        oddEntry: p.odds,          // odd at first suggestion
+        oddNow: p.odds,            // updated each refresh
+        minuteEntry: minute,       // match minute when first detected
+        ts: Date.now(),            // wall-clock timestamp
+        result: null,              // null | 'green' | 'red' | 'void'
+      });
+      changed = true;
+    } else {
+      // Update current odd
+      if (found.result === null && p.odds !== found.oddNow) {
+        found.oddNow = p.odds;
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) saveTips(matchId, existing);
+  return existing;
+}
+
+function autoResolveTips(matchId, tips, match, inc) {
+  const hg = match.homeGoals || 0, ag = match.awayGoals || 0;
+  const totalGoals = hg + ag;
+  const isFinished = match.isFinished;
+  let changed = false;
+
+  for (const t of tips) {
+    if (t.result !== null) continue; // já resolvida (manual ou auto), não tocar
+
+    // ── O/U Totals ──
+    const overM  = t.label.match(/^Over\s+([\d.]+)$/i);
+    const underM = t.label.match(/^Under\s+([\d.]+)$/i);
+
+    if (overM) {
+      const line = parseFloat(overM[1]);
+      if (totalGoals > line) { t.result = 'green'; changed = true; }
+      // Under pode ser marcada red durante o jogo quando já não é possível ganhar?
+      // Não: jogo pode ainda terminar com menos golos; só marcar red no final
+      else if (isFinished)   { t.result = 'red';   changed = true; }
+    }
+
+    if (underM) {
+      const line = parseFloat(underM[1]);
+      if (totalGoals > line) { t.result = 'red';   changed = true; } // já perdeu
+      else if (isFinished)   { t.result = 'green'; changed = true; }
+    }
+
+    // ── HCP — resolve quando o handicap ajustado é claramente ganho/perdido ──
+    if (t.market === 'HCP' && t.key) {
+      // key format: "HCP|Team Name +X.X"  — extract point from label
+      const hcpM = t.label.match(/([-+][\d.]+)\s*$/);
+      const hcpPt = hcpM ? parseFloat(hcpM[1]) : null;
+      if (hcpPt !== null) {
+        // Determine if this is a home or away pick by checking if label contains home team
+        const hn = (match.homeTeam || '').toLowerCase().split(' ')[0];
+        const isHomePick = t.label.toLowerCase().includes(hn);
+        const adjHome = hg + (isHomePick ? hcpPt : 0);
+        const adjAway = ag + (isHomePick ? 0 : hcpPt);
+        const margin = adjHome - adjAway;
+        const remMin = Math.max((match.minute || 90) < 90 ? 90 - (match.minute || 90) : 0, 0);
+
+        // Can settle live if margin > remaining possible goals (conservative: 4 goals/half)
+        const maxRemaining = remMin > 45 ? 4 : remMin > 0 ? 2 : 0;
+        if (margin > maxRemaining)       { t.result = 'green'; changed = true; }
+        else if (-margin > maxRemaining) { t.result = 'red';   changed = true; }
+        else if (isFinished) {
+          if (margin > 0)      { t.result = 'green'; changed = true; }
+          else if (margin < 0) { t.result = 'red';   changed = true; }
+          else                 { t.result = 'void';  changed = true; } // push
+        }
+      }
+    }
+
+    // ── 1X2 — só auto-resolve no fim do jogo ──
+    if (t.market === '1X2' && isFinished) {
+      const result = hg > ag ? 'home' : hg === ag ? 'draw' : 'away';
+      // label é nome da equipa (home/away) ou 'Empate'
+      let tipOutcome = null;
+      if (t.label === 'Empate') {
+        tipOutcome = 'draw';
+      } else {
+        // Comparar label com nome das equipas via shortName
+        const hn = (match.homeTeam||'').toLowerCase();
+        const an = (match.awayTeam||'').toLowerCase();
+        const lbl = t.label.toLowerCase();
+        if (hn.includes(lbl) || lbl.includes(hn.split(' ')[0]))      tipOutcome = 'home';
+        else if (an.includes(lbl) || lbl.includes(an.split(' ')[0])) tipOutcome = 'away';
+      }
+      if (tipOutcome) { t.result = tipOutcome === result ? 'green' : 'red'; changed = true; }
+    }
+  }
+
+  if (changed) saveTips(matchId, tips);
+  return tips;
+}
+
+function setTipResult(matchId, key, result) {
+  const tips = getTips(matchId);
+  const t = tips.find(t => t.key === key);
+  if (t) { t.result = result === t.result ? null : result; saveTips(matchId, tips); }
+}
+
+function fmtTipTs(ts) {
+  const d = new Date(ts);
+  return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
 }
 
 // ─────────────────────── ANALYSIS / PICKS CARD ───────────────────────
@@ -708,6 +1140,8 @@ function buildAnalysisCard(m, shots, inc, odds) {
     warnings.push({ icon: '⏱', text: `Apenas ${minute} min jogados — algoritmo requer pelo menos 30 min para picks fiáveis` });
   if (minute === 0)
     warnings.push({ icon: '⏳', text: 'Jogo ainda não iniciado ou sem dados de tempo' });
+  if (shots._manual)
+    warnings.push({ icon: '✏', text: 'xG inserido manualmente — projeções baseadas nos valores que introduziste' });
   if (redCards > 0)
     warnings.push({ icon: '🟥', text: `${redCards} cartão(ões) vermelho(s) — superioridade numérica invalida o modelo` });
   if (!odds?.available && odds?.reason)
@@ -716,25 +1150,57 @@ function buildAnalysisCard(m, shots, inc, odds) {
       : 'Sem odds disponíveis para este jogo' });
 
   // ── Value picks ──
+  const ODDS_MIN = 1.40, ODDS_MAX = 4.00;
   const picks = [];
   const bh = odds?.benter?.h2h;
   const bt = odds?.benter?.totals;
+  const bs = odds?.benter?.spreads;
   const outLbls = { home: shortName(m.homeTeam), draw: 'Empate', away: shortName(m.awayTeam) };
 
+  // Helper: accept pick only if odds within range
+  const validOdds = (o) => o?.bookieOdds && o.bookieOdds >= ODDS_MIN && o.bookieOdds <= ODDS_MAX;
+
+  // 1X2 — with anti-double rule: if draw + away both value, replace with HCP away
+  const h2xPicks = [];
   if (bh?.outcomes) {
     for (const [k, o] of Object.entries(bh.outcomes)) {
-      if (o.isValue) picks.push({
-        market: '1X2', label: outLbls[k] || k,
+      if (o.isValue && validOdds(o)) h2xPicks.push({ key: k, o });
+    }
+  }
+  const hasAwayVal = h2xPicks.some(p => p.key === 'away');
+  const hasDrawVal = h2xPicks.some(p => p.key === 'draw');
+  const hasHomeVal = h2xPicks.some(p => p.key === 'home');
+
+  if (hasAwayVal && hasDrawVal && !hasHomeVal) {
+    // Anti-double rule: consolidate away + draw → suggest HCP instead (handled below via bs)
+    // Don't push either — the spreads block will pick up the away HCP if it has value
+    picks.push({ _skipReason: 'away+draw→HCP', market: '⚠ 1X2', label: 'Away+Draw value → usar HCP Away', odds: null, edge: 0, blend: 0, model: 0, isWarning: true });
+  } else {
+    for (const { key: k, o } of h2xPicks) {
+      picks.push({ market: '1X2', label: outLbls[k] || k, odds: o.bookieOdds, edge: o.edge, blend: o.blendedProb, model: o.modelProb });
+    }
+  }
+
+  // Totals
+  if (bt?.outcomes) {
+    const ouLbl = k => k === 'over' ? `Over ${bt.line||''}` : `Under ${bt.line||''}`;
+    for (const [k, o] of Object.entries(bt.outcomes)) {
+      if (o.isValue && validOdds(o)) picks.push({
+        market: `O/U ${bt.line||''}`, label: ouLbl(k),
         odds: o.bookieOdds, edge: o.edge,
         blend: o.blendedProb, model: o.modelProb,
       });
     }
   }
-  if (bt?.outcomes) {
-    const ouLbl = k => k === 'over' ? `Over ${bt.line||''}` : `Under ${bt.line||''}`;
-    for (const [k, o] of Object.entries(bt.outcomes)) {
-      if (o.isValue) picks.push({
-        market: `O/U ${bt.line||''}`, label: ouLbl(k),
+
+  // Spreads / Handicap
+  if (bs?.outcomes) {
+    const hptH = bs.homePoint != null ? (bs.homePoint >= 0 ? '+' : '') + bs.homePoint : '';
+    const hptA = bs.awayPoint != null ? (bs.awayPoint >= 0 ? '+' : '') + bs.awayPoint : '';
+    const spLbl = { home: `${shortName(m.homeTeam)} ${hptH}`, away: `${shortName(m.awayTeam)} ${hptA}` };
+    for (const [k, o] of Object.entries(bs.outcomes)) {
+      if (o.isValue && validOdds(o)) picks.push({
+        market: `HCP`, label: spLbl[k] || k,
         odds: o.bookieOdds, edge: o.edge,
         blend: o.blendedProb, model: o.modelProb,
       });
@@ -743,11 +1209,18 @@ function buildAnalysisCard(m, shots, inc, odds) {
 
   const canHavePicks = warnings.filter(w => w.icon !== '◈').length === 0;
 
+  // ── Sync tip history — only real picks, not warnings ──
+  const realPicks = picks.filter(p => !p.isWarning);
+  const activePicks = (canHavePicks && realPicks.length) ? realPicks : [];
+  const allTips = syncTips(m.id, activePicks, minute);
+  autoResolveTips(m.id, allTips, m, inc);
+  maybeArchive(m.id, m, allTips); // archive when game finishes
+
   // ── Render ──
   let html = '<div class="analysis-card">';
 
-  // Header
-  const hasValue = picks.length > 0 && canHavePicks;
+  // Header — VALUE only when there are real (non-warning) picks
+  const hasValue = realPicks.length > 0 && canHavePicks;
   html += `<div class="ac-hdr">
     <span class="ac-title">${hasValue ? '✦ Análise · VALUE' : '◎ Análise'}</span>
     ${minute > 0 ? `<span class="ac-min">${m.statusDesc || ''}${m.statusDesc && minute ? ' · ' : ''}${minute ? minute+"'" : ''}</span>` : ''}
@@ -760,10 +1233,11 @@ function buildAnalysisCard(m, shots, inc, odds) {
     ).join('');
   }
 
-  // Picks
+  // Current picks
   if (hasValue) {
-    html += picks.map(p => `
-      <div class="ac-pick">
+    html += picks.map(p => p.isWarning
+      ? `<div class="ac-warn"><span class="ac-wi">↗</span><span class="ac-wt">${p.label}</span></div>`
+      : `<div class="ac-pick">
         <div class="ac-pick-top">
           <span class="ac-pick-mkt">${p.market}</span>
           <span class="ac-pick-lbl">${p.label}</span>
@@ -780,7 +1254,66 @@ function buildAnalysisCard(m, shots, inc, odds) {
   }
 
   html += '</div>';
+
+  // ── Tips history block (rendered separately, outside analysis-card) ──
+  if (allTips.length) {
+    html += buildTipsHistory(m.id, allTips);
+  }
+
   return html;
+}
+
+function toggleTipResult(matchId, key) {
+  // Cycle: null → green → red → null
+  const tips = getTips(matchId);
+  const t = tips.find(t => t.key === key);
+  if (!t) return;
+  t.result = t.result === null ? 'green' : t.result === 'green' ? 'red' : t.result === 'red' ? 'void' : null;
+  saveTips(matchId, tips);
+  // Re-render detail without a server call
+  const cached = S.trackCache[matchId];
+  if (cached) renderDetail(cached.data);
+}
+
+function buildTipsHistory(matchId, tips) {
+  const rows = tips.map(t => {
+    const oddNow = t.oddNow ? Number(t.oddNow).toFixed(2) : '—';
+    const oddEntry = t.oddEntry ? Number(t.oddEntry).toFixed(2) : '—';
+    const oddDiff = t.oddNow && t.oddEntry ? t.oddNow - t.oddEntry : 0;
+    const diffCls = oddDiff > 0.01 ? 'up' : oddDiff < -0.01 ? 'down' : '';
+    const diffTxt = oddDiff !== 0
+      ? `${oddDiff > 0 ? '▲' : '▼'} ${Math.abs(oddDiff).toFixed(2)}`
+      : 'sem alteração';
+    const resCls = t.result === 'green' ? 'green' : t.result === 'red' ? 'red' : t.result === 'void' ? 'void' : 'pending';
+    const resIcon = t.result === 'green' ? '✓' : t.result === 'red' ? '✗' : t.result === 'void' ? '⊘' : '·';
+    const timeStr = fmtTipTs(t.ts);
+    return `<div class="tip-row">
+      <span class="tip-min">${t.minuteEntry ? t.minuteEntry+"'" : timeStr}</span>
+      <span class="tip-mkt">${t.market}</span>
+      <span class="tip-lbl">${t.label}</span>
+      <div class="tip-odds">
+        <span class="tip-odd-entry">${oddEntry}</span>
+        <span class="tip-odd-now ${diffCls}">${diffTxt}</span>
+      </div>
+      <button class="tip-status ${resCls}" onclick="toggleTipResult('${matchId}','${t.key.replace(/'/g,"\'")}')" title="Marcar resultado">${resIcon}</button>
+    </div>`;
+  }).join('');
+
+  const green = tips.filter(t=>t.result==='green').length;
+  const red   = tips.filter(t=>t.result==='red').length;
+  const voidN = tips.filter(t=>t.result==='void').length;
+  const pl = tips.filter(t=>t.result!=null).length;
+  const summary = pl
+    ? `${green}✓ ${red}✗${voidN ? ' '+voidN+'⊘' : ''}`
+    : `${tips.length} tip${tips.length>1?'s':''}`;
+
+  return `<div class="tips-block">
+    <div class="tips-hdr">
+      <span class="tips-hdr-lbl">📋 Tips deste jogo</span>
+      <span class="tips-hdr-count">${summary}</span>
+    </div>
+    ${rows}
+  </div>`;
 }
 
 // ─────────────────────── ODDS / MODEL / BENTER ───────────────────────
@@ -831,6 +1364,19 @@ function renderOdds(odds, match) {
         <div class="odds-chips">
           <span class="ochip${bt?.outcomes?.over?.isValue?' value':''}">Over ${fmt2(totals.rawOdds?.over)}</span>
           <span class="ochip${bt?.outcomes?.under?.isValue?' value':''}">Under ${fmt2(totals.rawOdds?.under)}</span>
+        </div>
+      </div>`:''}
+      ${odds.spreads?`<div class="odds-row">
+        <span class="odds-row-lbl">HCP <span style="font-size:9px;color:var(--text3)">${odds.spreads.bookmakerTitle||odds.spreads.bookmaker||''}</span></span>
+        <div class="odds-chips">
+          <span class="ochip${benter?.spreads?.outcomes?.home?.isValue?' value':''}">
+            ${shortName(match.homeTeam)} ${(odds.spreads.homePoint>=0?'+':'')+odds.spreads.homePoint}
+            <strong>${fmt2(odds.spreads.rawOdds?.home)}</strong>
+          </span>
+          <span class="ochip${benter?.spreads?.outcomes?.away?.isValue?' value':''}">
+            ${shortName(match.awayTeam)} ${(odds.spreads.awayPoint>=0?'+':'')+odds.spreads.awayPoint}
+            <strong>${fmt2(odds.spreads.rawOdds?.away)}</strong>
+          </span>
         </div>
       </div>`:''}
     </div>`;
@@ -904,6 +1450,22 @@ function renderOdds(odds, match) {
 
   if (bh) benterHtml += benterBlock(bh, 'Benter 1X2');
   if (bt) benterHtml += benterBlock(bt, `Benter O/U ${bt.line||''}`);
+  if (benter?.spreads) {
+    const bs = benter.spreads;
+    const hptH = bs.homePoint != null ? (bs.homePoint >= 0 ? '+' : '') + bs.homePoint : '';
+    const hptA = bs.awayPoint != null ? (bs.awayPoint >= 0 ? '+' : '') + bs.awayPoint : '';
+    // Label outcomes with team name + handicap line
+    const bsLabelled = {
+      ...bs,
+      outcomes: Object.fromEntries(Object.entries(bs.outcomes || {}).map(([k, o]) => [
+        k === 'home'
+          ? `${shortName(match.homeTeam)} ${hptH}`
+          : `${shortName(match.awayTeam)} ${hptA}`,
+        o
+      ]))
+    };
+    benterHtml += benterBlock(bsLabelled, `Benter HCP ${bs.bookmaker||''}`.trim());
+  }
 
   return oddsHtml + modelHtml + benterHtml;
 }
@@ -932,14 +1494,20 @@ function xgAtMinute(pts, min) {
   return v;
 }
 
-function buildChart(shots, inc, match) {
+function buildChart(shots, inc, match, tipMarkers) {
   if (S.chart) { S.chart.destroy(); S.chart = null; }
   const canvas = document.getElementById('xg-canvas');
   if (!canvas) return;
 
-  const maxMin = Math.max(match.minute || 90, 90,
+  const lastShotMin = Math.max(0,
     ...shots.homeShots.map(s=>s.minute),
-    ...shots.awayShots.map(s=>s.minute)) + 3;
+    ...shots.awayShots.map(s=>s.minute));
+  const currentMin = match.minute || 0;
+
+  // Live game: cortar no minuto atual; jogo terminado: mostrar até ao último remate ou 90
+  const maxMin = match.isLive && currentMin > 0
+    ? Math.max(currentMin, lastShotMin) + 2
+    : Math.max(lastShotMin + 3, 90);
 
   const hPts = cumulativePoints(shots.homeShots, maxMin);
   const aPts = cumulativePoints(shots.awayShots, maxMin);
@@ -1002,6 +1570,23 @@ function buildChart(shots, inc, match) {
           borderColor:'rgba(255,255,255,0.1)', borderWidth:1,
           borderDash:[4,4], pointRadius:0, fill:false, order:5,
         }] : []),
+        ...((tipMarkers||[]).length ? [{
+          type:'scatter', label:'Tips',
+          data: (tipMarkers||[]).map(t => {
+            // Posicionar o marcador na altura da curva home ou a metade do maxY
+            const yH = xgAtMinute(hPts, t.minuteEntry);
+            const yA = xgAtMinute(aPts, t.minuteEntry);
+            return { x: t.minuteEntry, y: Math.max(yH, yA, 0.08), _tip: t };
+          }),
+          backgroundColor: (tipMarkers||[]).map(t =>
+            t.result === 'green' ? 'rgba(74,222,128,0.9)'
+            : t.result === 'red' ? 'rgba(248,113,113,0.9)'
+            : 'rgba(255,255,255,0.85)'
+          ),
+          borderColor: '#0a0c0a', borderWidth: 2,
+          pointStyle: 'triangle', rotation: 0,
+          pointRadius: 10, pointHoverRadius: 12, order: 0,
+        }] : []),
       ]
     },
     options: {
@@ -1045,6 +1630,13 @@ function buildChart(shots, inc, match) {
               if (item.datasetIndex === 1) return ' ' + shortName(match.awayTeam) + ': ' + item.parsed.y.toFixed(3) + ' xG';
               if (item.datasetIndex === 2) return ' ⚽ Golo Casa';
               if (item.datasetIndex === 3) return ' ⚽ Golo Fora';
+              // Tips dataset (index 5 se houver htLine, 4 se não)
+              const raw = item.raw;
+              if (raw && raw._tip) {
+                const t = raw._tip;
+                const res = t.result === 'green' ? ' ✓' : t.result === 'red' ? ' ✗' : '';
+                return ` 🔔 ${t.market} ${t.label} @ ${Number(t.oddEntry).toFixed(2)}${res}`;
+              }
               return '';
             }
           }
@@ -1054,10 +1646,319 @@ function buildChart(shots, inc, match) {
   });
 }
 
+// ─────────────────────── CLIENT-SIDE MODEL RECALC ───────────────────────
+// When xG is manual, server computed model probs with homeXg=0.
+// This function rebuilds modelProbabilities + benter values with the correct xG.
+function injectManualOdds(odds, match, shots) {
+  if (!odds) return odds;
+  const hxg = shots.homeXg, axg = shots.awayXg;
+  if (hxg === 0 && axg === 0) return odds;
+
+  // Minuto seguro: nunca usar 0 como elapsed (mesma lógica do servidor)
+  // Se minute é null (ex: intervalo code=31), usar 45 como fallback conservador
+  const rawMin = match.minute;
+  const minute = rawMin != null && rawMin > 0 ? rawMin
+               : (match.statusCode === 31 ? 45    // Intervalo
+               : match.statusCode === 41 ? 105    // Prolongamento 1ªP
+               : match.statusCode === 42 ? 120    // Prolongamento 2ªP
+               : 45);                             // fallback genérico
+  const hGoals = match.homeGoals || 0, aGoals = match.awayGoals || 0;
+
+  // Simple Dixon-Coles Poisson approximation (mirrors server logic)
+  function poisson(lambda, k) {
+    let p = Math.exp(-lambda);
+    for (let i = 1; i <= k; i++) p *= lambda / i;
+    return p;
+  }
+  function matchProbs(mu1, mu2, maxGoals = 6) {
+    let home = 0, draw = 0, away = 0;
+    for (let i = 0; i <= maxGoals; i++) {
+      for (let j = 0; j <= maxGoals; j++) {
+        const p = poisson(mu1, i) * poisson(mu2, j);
+        if (i > j) home += p; else if (i === j) draw += p; else away += p;
+      }
+    }
+    const tot = home + draw + away;
+    return { homeWin: home/tot, draw: draw/tot, awayWin: away/tot };
+  }
+
+  // Remaining xG = total xG + any xG already converted to goals (simple proxy)
+  const intervalAdj = minute > 75 ? 1.48 : minute > 60 ? 1.21 : minute > 45 ? 1.10 : minute > 30 ? 1.15 : minute > 15 ? 1.10 : 1.0;
+  const fullDur = minute > 90 ? 120 : 90;
+  const elapsed = Math.min(minute, fullDur);
+  const remMin = Math.max(fullDur - elapsed, 1);
+  // Taxa por minuto baseada no xG acumulado até agora
+  const MAX_XG_RATE = 0.08; // cap: 7.2 xG/90min — prevents explosion on transition glitch
+  const homeRate = Math.min(hxg / elapsed, MAX_XG_RATE);
+  const awayRate = Math.min(axg / elapsed, MAX_XG_RATE);
+  const projH = hGoals + homeRate * remMin * intervalAdj;
+  const projA = aGoals + awayRate * remMin * intervalAdj;
+
+  const probs = matchProbs(Math.max(0.05, projH), Math.max(0.05, projA));
+
+  // O/U 2.5 approximation
+  const mu = projH + projA;
+  let over25 = 0;
+  for (let total = 3; total <= 12; total++) {
+    for (let i = 0; i <= total; i++) {
+      over25 += poisson(projH, i) * poisson(projA, total - i);
+    }
+  }
+
+  const model = {
+    homeWin: probs.homeWin, draw: probs.draw, awayWin: probs.awayWin,
+    projectedXg: { home: parseFloat(hxg.toFixed(3)), away: parseFloat(axg.toFixed(3)) },
+    overUnder: { "2.5": { over: over25, under: 1 - over25 } },
+  };
+
+  const updated = { ...odds, modelProbabilities: model };
+
+  // Recalculate Benter value if we have odds
+  if (odds.h2h?.rawOdds && odds.h2h?.noVig) {
+    const model1x2 = { home: probs.homeWin, draw: probs.draw, away: probs.awayWin };
+    updated.benter = { ...odds.benter };
+    updated.benter.h2h = calcBenter(model1x2, odds.h2h.noVig, odds.h2h.rawOdds, minute);
+  }
+
+  return updated;
+}
+
+function calcBenter(modelProbs, bookieNovig, bookieRaw, minute) {
+  // Benter ratio table (mirrors server BENTER_TABLE)
+  const table = [[0,10,0.10,0.90],[10,20,0.20,0.80],[20,30,0.30,0.70],[30,40,0.40,0.60],
+    [40,50,0.50,0.50],[50,60,0.60,0.40],[60,70,0.70,0.30],[70,80,0.80,0.20],[80,100,0.90,0.10]];
+  let mw = 0.10, bw = 0.90;
+  for (const [f,t,m_,b_] of table) { if (minute >= f && minute < t) { mw=m_; bw=b_; break; } }
+
+  const outcomes = {};
+  for (const key of ["home","draw","away"]) {
+    const mp = modelProbs[key] || 0;
+    const bp = bookieNovig[key] || 0;
+    const bookieOdds = bookieRaw[key];
+    const tot = mw + bw;
+    const blended = (mp * mw + bp * bw) / tot;
+    const impliedOdds = bookieOdds ? 1 / bookieOdds : null;
+    const edge = impliedOdds != null ? (blended - impliedOdds) / impliedOdds * 100 : null;
+    outcomes[key] = {
+      modelProb: mp, bookieProb: bp, blendedProb: blended,
+      bookieOdds, edge: edge || 0,
+      isValue: edge != null && edge > 5,
+    };
+  }
+  return { outcomes, benterWeights: { model: mw, bookie: bw }, minute };
+}
+
+// ─────────────────────── XG MANUAL MODAL ───────────────────────
+let _xgModalId = null;
+
+function openXgModal(id) {
+  _xgModalId = id;
+  const m = S.matches.find(x => x.id === id) || (S.trackCache[id]?.data?.match);
+  if (m) {
+    document.getElementById('xg-lbl-home').textContent = m.homeTeam;
+    document.getElementById('xg-lbl-away').textContent = m.awayTeam;
+    document.getElementById('xg-modal-teams').textContent = m.homeTeam + ' vs ' + m.awayTeam;
+  }
+  const existing = getManualXg(id);
+  document.getElementById('xg-home').value = existing?.homeXg ?? '';
+  document.getElementById('xg-away').value = existing?.awayXg ?? '';
+  document.getElementById('xg-shots-home').value = existing?.shotsHome ?? '';
+  document.getElementById('xg-shots-away').value = existing?.shotsAway ?? '';
+  document.getElementById('btn-xg-clear').classList.toggle('hidden', !existing);
+  document.getElementById('modal-xg').classList.remove('hidden');
+  setTimeout(() => document.getElementById('xg-home').focus(), 100);
+}
+
+function closeXgModal() {
+  document.getElementById('modal-xg').classList.add('hidden');
+  _xgModalId = null;
+}
+
+// ─────────────────────── ARCHIVE / SETTLEMENT ───────────────────────
+const ARCHIVE_KEY = '_xg_archive';
+const ARCHIVE_MAX = 200; // max games to keep
+
+function getArchive() {
+  try { return JSON.parse(localStorage.getItem(ARCHIVE_KEY) || '[]'); } catch { return []; }
+}
+function saveArchive(arr) {
+  // Keep most recent ARCHIVE_MAX entries
+  if (arr.length > ARCHIVE_MAX) arr = arr.slice(arr.length - ARCHIVE_MAX);
+  localStorage.setItem(ARCHIVE_KEY, JSON.stringify(arr));
+}
+
+// Called when a tracked match is detected as finished
+function archiveMatch(match, tips) {
+  if (!tips || !tips.length) return;
+  const archive = getArchive();
+  // Don't double-archive
+  if (archive.find(g => g.matchId === match.id)) return;
+
+  const entry = {
+    matchId: match.id,
+    homeTeam: match.homeTeam,
+    awayTeam: match.awayTeam,
+    homeGoals: match.homeGoals,
+    awayGoals: match.awayGoals,
+    tournament: match.tournament,
+    country: match.country,
+    archivedAt: Date.now(),
+    tips: tips.map(t => ({ ...t })), // snapshot
+  };
+  archive.push(entry);
+  saveArchive(archive);
+  log_d('Archived', match.homeTeam, 'vs', match.awayTeam, '—', tips.length, 'tips');
+}
+
+function log_d(...args) { /* console.log('[archive]', ...args); */ }
+
+// Hook into autoResolveTips — when game finishes, archive it
+function maybeArchive(matchId, match, tips) {
+  if (match.isFinished && tips.length > 0) {
+    archiveMatch(match, tips);
+  }
+}
+
+// ── Settlement filter state ──
+let S_filter = 'all';
+function setSettFilter(f, btn) {
+  S_filter = f;
+  document.querySelectorAll('.sf-btn').forEach(b => b.classList.toggle('active', b === btn));
+  renderSettlement();
+}
+
+function gamePL(tips) {
+  // Simple P&L: +1 unit per green (profit = bookie odds - 1), -1 unit per red
+  let pl = 0, settled = 0;
+  for (const t of tips) {
+    if (t.result === 'green') { pl += (t.oddEntry || 2) - 1; settled++; }
+    else if (t.result === 'red') { pl -= 1; settled++; }
+    // void: no change
+  }
+  return { pl, settled };
+}
+
+function confirmClearArchive() {
+  if (confirm('Apagar todo o histórico de settlement?')) {
+    localStorage.setItem(ARCHIVE_KEY, '[]');
+    renderSettlement();
+  }
+}
+
+function renderSettlement() {
+  const archive = getArchive();
+  const summaryEl = document.getElementById('sett-summary');
+  const listEl    = document.getElementById('sett-list');
+  if (!summaryEl || !listEl) return;
+
+  // ── Global summary ──
+  let totalGreen = 0, totalRed = 0, totalVoid = 0, totalPl = 0;
+  for (const g of archive) {
+    const {pl, settled} = gamePL(g.tips);
+    totalPl += pl;
+    for (const t of g.tips) {
+      if (t.result === 'green') totalGreen++;
+      else if (t.result === 'red') totalRed++;
+      else if (t.result === 'void') totalVoid++;
+    }
+  }
+  const plSign = totalPl >= 0 ? '+' : '';
+  summaryEl.innerHTML = `
+    <div class="sett-sum-cell">
+      <div class="sett-sum-val green">${totalGreen}</div>
+      <div class="sett-sum-lbl">✓ Ganhas</div>
+    </div>
+    <div class="sett-sum-cell">
+      <div class="sett-sum-val red">${totalRed}</div>
+      <div class="sett-sum-lbl">✗ Perdidas</div>
+    </div>
+    <div class="sett-sum-cell">
+      <div class="sett-sum-val ${totalPl >= 0 ? 'green' : 'red'}">${plSign}${totalPl.toFixed(2)}u</div>
+      <div class="sett-sum-lbl">P&L Total</div>
+    </div>`;
+
+  if (!archive.length) {
+    listEl.innerHTML = '<div class="sett-empty">Nenhum jogo arquivado ainda.<br>Os jogos são guardados automaticamente quando terminam.</div>';
+    return;
+  }
+
+  // ── Filter ──
+  let games = [...archive].reverse(); // most recent first
+  if (S_filter === 'profit')  games = games.filter(g => gamePL(g.tips).pl > 0);
+  if (S_filter === 'loss')    games = games.filter(g => gamePL(g.tips).pl < 0);
+  if (S_filter === 'pending') games = games.filter(g => g.tips.some(t => t.result === null));
+
+  if (!games.length) {
+    listEl.innerHTML = '<div class="sett-empty">Nenhum jogo nesta categoria.</div>';
+    return;
+  }
+
+  listEl.innerHTML = games.map(g => {
+    const {pl, settled} = gamePL(g.tips);
+    const plTxt = pl !== 0 ? (pl > 0 ? '+' : '') + pl.toFixed(2) + 'u' : '—';
+    const plCls = pl > 0.001 ? 'green' : pl < -0.001 ? 'red' : 'neutral';
+    const flag  = countryFlag(g.country);
+    const dateStr = new Date(g.archivedAt).toLocaleDateString('pt-PT', {day:'2-digit',month:'2-digit'});
+    const pending = g.tips.filter(t=>t.result===null).length;
+    const hasPending = pending > 0;
+
+    const tipsHtml = g.tips.map(t => {
+      const resCls = t.result === 'green' ? 'green' : t.result === 'red' ? 'red' : t.result === 'void' ? 'void' : 'pending';
+      const resIcon = t.result === 'green' ? '✓' : t.result === 'red' ? '✗' : t.result === 'void' ? '⊘' : '·';
+      return `<div class="sett-tip-row">
+        <span class="sett-tip-min">${t.minuteEntry ? t.minuteEntry+"'" : '—'}</span>
+        <span class="sett-tip-mkt">${t.market}</span>
+        <span class="sett-tip-lbl">${t.label}</span>
+        <span class="sett-tip-odd">@${t.oddEntry ? Number(t.oddEntry).toFixed(2) : '—'}</span>
+        <button class="sett-tip-res ${resCls}" onclick="toggleArchiveTip('${g.matchId}','${t.key.replace(/'/g,"\'")}',this)">${resIcon}</button>
+      </div>`;
+    }).join('');
+
+    return `<div class="sett-game">
+      <div class="sett-game-hdr" onclick="this.nextElementSibling.classList.toggle('hidden')">
+        <div style="flex:1;min-width:0">
+          <div class="sett-game-teams">${flag ? flag+' ' : ''}${g.homeTeam} ${g.homeGoals}–${g.awayGoals} ${g.awayTeam}</div>
+          <div class="sett-game-date">${g.tournament} · ${dateStr}${hasPending ? ' · <span style="color:var(--amber)">'+pending+' pendente'+(pending>1?'s':'')+'</span>' : ''}</div>
+        </div>
+        <span class="sett-game-pl ${plCls}">${plTxt}</span>
+      </div>
+      <div>${tipsHtml}</div>
+    </div>`;
+  }).join('');
+}
+
+function toggleArchiveTip(matchId, key, btn) {
+  const archive = getArchive();
+  const game = archive.find(g => g.matchId == matchId);
+  if (!game) return;
+  const t = game.tips.find(t => t.key === key);
+  if (!t) return;
+  t.result = t.result === null ? 'green' : t.result === 'green' ? 'red' : t.result === 'red' ? 'void' : null;
+  saveArchive(archive);
+  btn.className = 'sett-tip-res ' + (t.result === 'green' ? 'green' : t.result === 'red' ? 'red' : t.result === 'void' ? 'void' : 'pending');
+  btn.textContent = t.result === 'green' ? '✓' : t.result === 'red' ? '✗' : t.result === 'void' ? '⊘' : '·';
+  // Refresh P&L summary
+  renderSettlement();
+}
+
+function switchTab(tab) {
+  const isLive = tab === 'live';
+  document.getElementById('tab-live').style.borderBottomColor = isLive ? 'var(--green)' : 'transparent';
+  document.getElementById('tab-live').style.color = isLive ? 'var(--text)' : 'var(--text3)';
+  document.getElementById('tab-sett').style.borderBottomColor = isLive ? 'transparent' : 'var(--green)';
+  document.getElementById('tab-sett').style.color = isLive ? 'var(--text3)' : 'var(--text)';
+  document.getElementById('view-list').classList.toggle('hidden', !isLive);
+  document.getElementById('subhdr').classList.toggle('hidden', !isLive);
+  document.getElementById('view-sett').classList.remove('hidden');
+  document.getElementById('view-sett').classList.toggle('hidden', !(!isLive));
+  if (!isLive) renderSettlement();
+}
+
 // ─────────────────────── VIEWS ───────────────────────
 function showView(v) {
   document.getElementById('view-list').classList.toggle('hidden', v !== 'list');
   document.getElementById('view-detail').classList.toggle('hidden', v !== 'detail');
+  document.getElementById('view-sett').classList.toggle('hidden', v !== 'sett');
   document.getElementById('subhdr').classList.toggle('hidden', v !== 'list');
   if (v === 'list') {
     S.selectedId = null;
@@ -1135,6 +2036,43 @@ document.getElementById('btn-det-refresh').addEventListener('click', () => {
 });
 document.getElementById('srch').addEventListener('input', renderList);
 
+// xG Manual modal events
+document.getElementById('modal-xg').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal-xg')) closeXgModal();
+});
+document.getElementById('btn-xg-save').addEventListener('click', () => {
+  if (!_xgModalId) return;
+  const hxg = parseFloat(document.getElementById('xg-home').value);
+  const axg = parseFloat(document.getElementById('xg-away').value);
+  if (isNaN(hxg) || isNaN(axg) || hxg < 0 || axg < 0) {
+    document.getElementById('xg-home').style.borderBottomColor = 'var(--red)';
+    document.getElementById('xg-away').style.borderBottomColor = 'var(--red)';
+    return;
+  }
+  const sh = parseInt(document.getElementById('xg-shots-home').value) || 0;
+  const sa = parseInt(document.getElementById('xg-shots-away').value) || 0;
+  const savedId = _xgModalId;
+  setManualXg(savedId, { homeXg: hxg, awayXg: axg, shotsHome: sh, shotsAway: sa, ts: Date.now() });
+  // Update xgCache immediately so bar refreshes without waiting for fetchDetail
+  S.xgCache[savedId] = { homeXg: hxg, awayXg: axg };
+  updateCardBar(savedId, hxg, axg);
+  // Invalidate detail cache so next render uses manual data
+  delete S.trackCache[savedId];
+  closeXgModal();
+  renderList(); // refresh badge on card
+  if (S.selectedId) fetchDetail(S.selectedId, true);
+});
+document.getElementById('btn-xg-clear').addEventListener('click', () => {
+  if (!_xgModalId) return;
+  const savedId = _xgModalId;
+  clearManualXg(savedId);
+  delete S.xgCache[savedId];
+  delete S.trackCache[savedId];
+  closeXgModal();
+  renderList();
+  if (S.selectedId) fetchDetail(S.selectedId, true);
+});
+
 // ─────────────────────── AUTO-REFRESH ───────────────────────
 function startAuto() {
   if (S.autoTimer) { clearInterval(S.autoTimer); S.autoTimer = null; }
@@ -1152,21 +2090,8 @@ function startAuto() {
 
 // ─────────────────────── INIT ───────────────────────
 showView('list');
-const _savedHost = localStorage.getItem('_sf_host');
-if (!_savedHost) {
-  // First launch — no host configured, show settings immediately
-  document.getElementById('mlist').innerHTML = `
-    <div style="padding:32px 16px;text-align:center">
-      <div style="font-size:28px;margin-bottom:12px;opacity:.4">⚙</div>
-      <div style="font-size:15px;font-weight:600;color:var(--text);margin-bottom:6px">Configura o servidor</div>
-      <div style="font-size:13px;color:var(--text3);margin-bottom:20px;line-height:1.5">Insere o URL do Railway para ligar ao servidor de dados.</div>
-      <button onclick="openSettings()" style="padding:12px 24px;border-radius:10px;background:var(--green-bg);border:1px solid rgba(74,222,128,.3);color:var(--green);font-family:var(--sans);font-size:14px;font-weight:600;cursor:pointer">⚙ Abrir Configurações</button>
-    </div>`;
-  openSettings();
-} else {
-  loadMatches();
-  startAuto();
-}
+loadMatches();
+startAuto();
 </script>
 </body>
 </html>
