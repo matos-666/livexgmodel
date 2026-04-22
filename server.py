@@ -1201,6 +1201,18 @@ def _parse_event(ev):
         elif code == 42:
             minute = 120  # Prolongamento 2ª parte
 
+    # Separar tempo de compensação do minuto base para:
+    # 1) exibição correta ("45+8'" em vez de "53'")
+    # 2) modelo usa minuto capped (45 ou 90) para "remaining" correto
+    injury_time = 0
+    if minute is not None:
+        if code == 6 and minute > 45:
+            injury_time = minute - 45
+            minute = 45
+        elif code == 7 and minute > 90:
+            injury_time = minute - 90
+            minute = 90
+
     return {
         "id": ev.get("id"),
         "slug": ev.get("slug", ""),
@@ -1214,6 +1226,7 @@ def _parse_event(ev):
         "statusType": st.get("type", ""),
         "statusDesc": str(desc) if desc else "",
         "minute": minute,
+        "injuryTime": injury_time,
         "startTimestamp": ev.get("startTimestamp"),
         "currentPeriodStartTimestamp": period_ts,
         "tournament": tourn.get("name", ""),

@@ -585,6 +585,13 @@ function countryFlag(c) {
   return COUNTRY_FLAGS[c.toLowerCase()] || '';
 }
 
+// Format minute for display — handles stoppage time (45+8', 90+3')
+function fmtMin(m) {
+  if (!m || !m.minute) return '';
+  if (m.injuryTime > 0) return m.minute + '+' + m.injuryTime + "'";
+  return m.minute + "'";
+}
+
 // ─────────────────────── xG MANUAL STORE ───────────────────────
 function getManualXg(id) {
   try { return JSON.parse(localStorage.getItem('_mxg_' + id) || 'null'); } catch { return null; }
@@ -903,7 +910,7 @@ function renderMatchRow(m, isLive) {
     if (m.statusCode === 31 || m.statusDesc?.toLowerCase() === 'halftime') {
       timeStr = 'HT'; timeCls = 'ht';
     } else {
-      timeStr = m.minute + "'"; timeCls = 'live';
+      timeStr = fmtMin(m); timeCls = 'live';
     }
   } else if (m.startTimestamp) {
     const d = new Date(m.startTimestamp * 1000);
@@ -983,7 +990,7 @@ function _PLACEHOLDER_renderList() {
   // kept for reference — real function above
 
   el.innerHTML = list.map(m => {
-    const min = m.minute ? `${m.minute}'` : (m.statusDesc || '');
+    const min = m.minute ? fmtMin(m) : (m.statusDesc || '');
     const cached = S.xgCache[m.id];
     const hxg = cached ? cached.homeXg : null;
     const axg = cached ? cached.awayXg : null;
@@ -1061,7 +1068,7 @@ async function openMatch(id) {
     const flag = countryFlag(m.country);
     document.getElementById('det-meta').innerHTML =
       `<div class="det-tourn">${flag ? flag + ' ' : ''}${m.tournament}` +
-      (m.isLive ? `<span class="det-live-chip"><span style="width:5px;height:5px;border-radius:50%;background:var(--red);display:inline-block;animation:pulse 1.2s infinite"></span>${m.minute ? m.minute + "'" : 'LIVE'}</span>` : '') +
+      (m.isLive ? `<span class="det-live-chip"><span style="width:5px;height:5px;border-radius:50%;background:var(--red);display:inline-block;animation:pulse 1.2s infinite"></span>${m.minute ? fmtMin(m) : 'LIVE'}</span>` : '') +
       `</div>`;
   }
 
@@ -1156,7 +1163,7 @@ function renderDetail(data) {
         <div class="s-sub a" style="color:var(--amber)">${axg.toFixed(2)} xG · ${shots.awayShots.length} rem.${isManual ? ' <span class="manual-badge">manual</span>' : ''}</div>
       </div>
     </div>
-    ${m.minute ? `<div class="score-time">${m.statusDesc ? m.statusDesc + ' · ' : ''}${m.minute}'</div>` : ''}
+    ${m.minute ? `<div class="score-time">${m.statusDesc ? m.statusDesc + ' · ' : ''}${fmtMin(m)}</div>` : ''}
     <div style="display:flex;justify-content:center;margin-top:10px">
       <button class="xg-edit-btn${isManual ? ' has-manual' : ''}" onclick="openXgModal(${m.id})">
         ✏ ${isManual ? 'Editar xG Manual' : 'Inserir xG Manual'}
@@ -1454,7 +1461,7 @@ function buildAnalysisCard(m, shots, inc, odds) {
   const hasValue = realPicks.length > 0 && canHavePicks;
   html += `<div class="ac-hdr">
     <span class="ac-title">${hasValue ? '✦ Análise · VALUE' : '◎ Análise'}</span>
-    ${minute > 0 ? `<span class="ac-min">${m.statusDesc || ''}${m.statusDesc && minute ? ' · ' : ''}${minute ? minute+"'" : ''}</span>` : ''}
+    ${minute > 0 ? `<span class="ac-min">${m.statusDesc || ''}${m.statusDesc && minute ? ' · ' : ''}${fmtMin(m)}</span>` : ''}
   </div>`;
 
   // Warnings
