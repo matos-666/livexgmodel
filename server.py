@@ -132,6 +132,8 @@ TOURNAMENT_TO_SPORT_KEY = {
     "ekstraklasa": "soccer_poland_ekstraklasa",
     "czech first league": "soccer_czech_republic_league",
     "greek super league": "soccer_greece_super_league",
+    "stoiximan super league": "soccer_greece_super_league",  # sponsor name used by Sofascore
+    "super league greece": "soccer_greece_super_league",
     # Belgium — "Jupiler" often absent in Sofascore tournament name
     "pro league": "soccer_belgium_first_div",
     "first division a": "soccer_belgium_first_div",
@@ -2044,6 +2046,26 @@ def _background_loop():
 
 
 # ── New API endpoints ──
+
+@app.route("/api/today/monitored")
+def r_today_monitored():
+    """Today\'s scheduled games for monitored leagues only."""
+    try:
+        all_today = get_scheduled()
+        result = []
+        for m in all_today:
+            if m.get("isFinished") or m.get("isLive"):
+                continue
+            sk = _resolve_sport_key(m.get("tournament",""), m.get("country",""))
+            if sk and sk in MONITORED_SPORT_KEYS:
+                m["_sport_key"] = sk
+                result.append(m)
+        # Sort by start time
+        result.sort(key=lambda m: m.get("startTimestamp") or 0)
+        return jsonify({"count": len(result), "matches": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/state")
 def r_state():
