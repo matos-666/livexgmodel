@@ -619,7 +619,7 @@ function buildManualShots(manual) {
 // ─────────────────────── FETCH ───────────────────────
 async function api(path) {
   const ctrl = new AbortController();
-  const tid = setTimeout(() => ctrl.abort(), 25000);
+  const tid = setTimeout(() => ctrl.abort(), 8000);
   try {
     const r = await fetch(BASE() + path, { signal: ctrl.signal });
     clearTimeout(tid);
@@ -652,6 +652,10 @@ async function loadMatches() {
     document.getElementById('btn-refresh').innerHTML = '↻ Refresh';
     return;
   }
+
+  // Show loading state immediately — clears setup form before the network call
+  const el2 = document.getElementById('mlist');
+  el2.innerHTML = '<div class="loading-row"><div class="spinner"></div>A ligar ao servidor…</div>';
 
   const btn = document.getElementById('btn-refresh');
   btn.classList.add('loading'); btn.innerHTML = '<span class="spin">↻</span>';
@@ -2177,6 +2181,9 @@ function saveSetup() {
   const url = (document.getElementById('setup-url')?.value || '').trim().replace(/\/+$/, '');
   if (!url) return;
   localStorage.setItem('_sf_host', url);
+  // Immediately clear the form and show connecting state
+  const el = document.getElementById('mlist');
+  if (el) el.innerHTML = '<div class="loading-row"><div class="spinner"></div>A ligar a ' + url + '…</div>';
   loadMatches();
 }
 
