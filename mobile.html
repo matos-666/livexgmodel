@@ -50,7 +50,9 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
   flex:1;padding:11px 0;font-size:13px;font-weight:700;font-family:var(--sans);
   background:transparent;border:none;border-bottom:2px solid transparent;
   color:var(--text3);cursor:pointer;transition:color .15s,border-color .15s;letter-spacing:-.01em;
+  outline:none;-webkit-tap-highlight-color:transparent;
 }
+.nav-tab:focus{outline:none}
 .nav-tab.active{color:var(--text);border-bottom-color:var(--green)}
 
 /* ── SUBHEADER ── */
@@ -152,9 +154,18 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
   background:rgba(96,165,250,.08);border-radius:4px;padding:2px 5px;
 }
 
+/* Team initials circle */
+.team-circle{
+  width:28px;height:28px;border-radius:50%;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  font-size:10px;font-weight:800;font-family:var(--sans);
+  color:#fff;text-transform:uppercase;letter-spacing:-.02em;
+}
+
 /* Scheduled game (today tab) */
 .mrow.scheduled .mrow-team-name{color:var(--text2)}
 .mrow.scheduled .mrow-score{color:var(--text3)}
+.mrow.scheduled .team-circle{opacity:.7}
 
 /* Loading / empty */
 .loading-row{display:flex;align-items:center;justify-content:center;gap:8px;padding:40px;color:var(--text3);font-size:13px}
@@ -740,13 +751,39 @@ function renderList() {
   const el = document.getElementById('mlist');
   const list = S.matches;
   if (!list.length) {
-    el.innerHTML = `<div class="mempty">Sem jogos live de momento nas ligas monitorizadas</div>`;
+    el.innerHTML = `<div class="mempty">
+      <div style="font-size:28px;margin-bottom:12px">⬡</div>
+      Sem jogos em curso nas ligas monitorizadas<br>
+      <span style="font-size:12px;margin-top:8px;display:block">Consulta a aba 📅 Hoje para os próximos jogos</span>
+    </div>`;
     return;
   }
   el.innerHTML = renderGrouped(list, true);
   el.querySelectorAll('.mrow[data-id]').forEach(r =>
     r.addEventListener('click', () => openMatch(parseInt(r.dataset.id)))
   );
+}
+
+// ─────────────────────── TEAM CIRCLE ───────────────────────
+const _CIRCLE_PALETTE = [
+  '#e74c3c','#e67e22','#f39c12','#27ae60','#16a085',
+  '#2980b9','#8e44ad','#c0392b','#d35400','#1a8a5a',
+  '#1abc9c','#3498db','#9b59b6','#2c3e50','#7f8c8d',
+];
+function teamInitials(name) {
+  const words = name.replace(/[^a-zA-Z0-9 ]/g,'').trim().split(/\s+/);
+  if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase();
+  return name.slice(0,2).toUpperCase();
+}
+function teamColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xffffffff;
+  return _CIRCLE_PALETTE[Math.abs(h) % _CIRCLE_PALETTE.length];
+}
+function teamCircle(name) {
+  const bg = teamColor(name);
+  const ini = teamInitials(name);
+  return `<div class="team-circle" style="background:${bg}">${ini}</div>`;
 }
 
 function renderGrouped(matches, isLive) {
@@ -832,6 +869,10 @@ function renderMatchRow(m, isLive) {
 
   return `<div class="mrow${isLive ? '' : ' scheduled'}" data-id="${m.id}">
     <div class="mrow-time ${timeCls}">${timeStr}</div>
+    <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0;margin:0 10px 0 2px">
+      ${teamCircle(m.homeTeam)}
+      ${teamCircle(m.awayTeam)}
+    </div>
     <div class="mrow-body">
       <div class="mrow-teams">
         <div class="mrow-team">
@@ -845,8 +886,9 @@ function renderMatchRow(m, isLive) {
       </div>
       ${xgHtml}
     </div>
-    ${isLive ? `<div style="display:flex;flex-direction:column;align-items:center;gap:2px;margin-right:10px">
-      ${scoreHtml}
+    ${isLive ? `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;margin-right:10px;min-width:18px">
+      <span class="mrow-score${m.homeGoals > m.awayGoals ? ' winner' : ''}">${m.homeGoals}</span>
+      <span class="mrow-score${m.awayGoals > m.homeGoals ? ' winner' : ''}">${m.awayGoals}</span>
     </div>` : ''}
     <div class="mrow-badge">${badgeHtml}</div>
   </div>`;

@@ -144,6 +144,22 @@ TOURNAMENT_TO_SPORT_KEY = {
     "2. liga austria": "soccer_austria_bundesliga2",
     # Scotland
     "scottish premiership": "soccer_scotland_premiership",
+    # ── Explicit NON-monitored entries — prevent false positives in keyword search ──
+    # These map real tournaments to sport keys NOT in MONITORED_SPORT_KEYS
+    "russian premier league":        "soccer_russia_premier_league_na",
+    "russia premier league":         "soccer_russia_premier_league_na",
+    "fnl":                           "soccer_russia_fnl_na",
+    "mozzart bet superliga":         "soccer_serbia_superliga_na",
+    "serbian superliga":             "soccer_serbia_superliga_na",
+    "superliga serbia":              "soccer_serbia_superliga_na",
+    "1. hnl":                        "soccer_croatia_hnl_na",
+    "latvian higher league":         "soccer_latvia_na",
+    "estonian premium liiga":        "soccer_estonia_na",
+    "georgian erovnuli liga":        "soccer_georgia_na",
+    "armenian premier league":       "soccer_armenia_na",
+    "kazakh premier league":         "soccer_kazakhstan_na",
+    "ukrainian premier league":      "soccer_ukraine_na",
+    "upl":                           "soccer_ukraine_na",
     "scottish championship": "soccer_scotland_championship",
     # Norway / Finland
     "veikkausliiga": "soccer_finland_veikkausliiga",
@@ -2047,20 +2063,92 @@ def _background_loop():
 
 # ── New API endpoints ──
 
+# Keywords that appear in legitimate monitored league names only
+# Used for strict matching in the "today" filter
+_MONITORED_LEAGUE_STRICT_KEYWORDS = {
+    "premier league": {"england", "english", "uk"},
+    "championship": {"england", "english"},
+    "efl": {"england", "english"},
+    "la liga": None,  # None = any country is OK (unique enough name)
+    "laliga": None,
+    "primera division": {"spain", "spanish"},
+    "serie a": {"italy", "italian"},
+    "bundesliga": {"germany", "german"},
+    "ligue 1": {"france", "french"},
+    "liga portugal": None,
+    "primeira liga": {"portugal", "portuguese"},
+    "eredivisie": None,
+    "jupiler": None,
+    "pro league": {"belgium"},
+    "first division a": {"belgium"},
+    "stoiximan super league": None,
+    "greek super league": None,
+    "super league greece": None,
+    "süper lig": None,
+    "super lig": {"turkey"},
+    "austrian bundesliga": None,
+    "admiral bundesliga": None,
+    "scottish premiership": None,
+    "champions league": None,
+    "europa league": None,
+    "conference league": None,
+    "mls": None,
+    "major league soccer": None,
+    "brasileirão": None,
+    "campeonato brasileiro": None,
+    "liga profesional": None,
+    "primera división": {"argentina"},
+    "copa libertadores": None,
+    "conmebol libertadores": None,
+    "copa sudamericana": None,
+    "conmebol sudamericana": None,
+    "j1 league": None,
+    "k league 1": None,
+    "a-league": None,
+    "allsvenskan": None,
+    "eliteserien": None,
+    "superligaen": None,
+    "ekstraklasa": None,
+    "swiss super league": None,
+    "czech first league": None,
+}
+
+_YOUTH_KEYWORDS = {"u23","u21","u20","u19","u18","u17","u15","youth","reserve","b team","women","feminine"}
+
+def _is_monitored_league_strict(tournament, country):
+    """Strict check: only pass leagues explicitly in our monitored list."""
+    import re as _re
+    t = _normalize_tournament(tournament).lower()
+    c = (country or "").lower()
+    # Exclude youth/reserve/women competitions
+    for yk in _YOUTH_KEYWORDS:
+        if yk in t:
+            return False
+    # Check against strict keyword map
+    for kw, allowed_countries in sorted(_MONITORED_LEAGUE_STRICT_KEYWORDS.items(), key=lambda x: -len(x[0])):
+        if kw in t:
+            if allowed_countries is None:
+                return True
+            for ac in allowed_countries:
+                if ac in c or ac in t:
+                    return True
+            return False  # keyword found but country doesn't match
+    return False
+
+
 @app.route("/api/today/monitored")
 def r_today_monitored():
-    """Today\'s scheduled games for monitored leagues only."""
+    """Today\'s scheduled games for monitored leagues only (strict filter)."""
     try:
         all_today = get_scheduled()
         result = []
         for m in all_today:
             if m.get("isFinished") or m.get("isLive"):
                 continue
-            sk = _resolve_sport_key(m.get("tournament",""), m.get("country",""))
-            if sk and sk in MONITORED_SPORT_KEYS:
+            if _is_monitored_league_strict(m.get("tournament",""), m.get("country","")):
+                sk = _resolve_sport_key(m.get("tournament",""), m.get("country",""))
                 m["_sport_key"] = sk
                 result.append(m)
-        # Sort by start time
         result.sort(key=lambda m: m.get("startTimestamp") or 0)
         return jsonify({"count": len(result), "matches": result})
     except Exception as e:
