@@ -435,6 +435,7 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
     <span class="qval dim" id="qval">—</span>
     <span class="qlbl">req</span>
   </div>
+  <button onclick="openSetup()" style="width:32px;height:32px;border-radius:8px;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:14px;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0" title="Configurar servidor">✎</button>
 </div>
 
 <!-- NAV TABS -->
@@ -536,14 +537,15 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
 // ─────────────────────── CONFIG ───────────────────────
-// Railway URL — update this to your own deployment URL
-const RAILWAY_HOST = localStorage.getItem('_sf_host') || 'web-production-397aa.up.railway.app';
+// Railway URL — read dynamically so changes take effect immediately
 function BASE() {
-  const v = RAILWAY_HOST.trim().replace(/\/+$/, '');
+  const v = (localStorage.getItem('_sf_host') || '').trim().replace(/\/+$/, '');
+  if (!v) return '';  // unconfigured
   if (v.startsWith('http://') || v.startsWith('https://')) return v;
   const local = v.startsWith('localhost') || v.startsWith('127.') || /^192\.168\.|^10\./.test(v);
   return (local ? 'http://' : 'https://') + v;
 }
+function isConfigured() { return !!localStorage.getItem('_sf_host'); }
 const autoMs = () => parseInt(localStorage.getItem('_auto_ms') || '60000');
 
 const S = {
@@ -641,16 +643,30 @@ async function refreshQuota() {
 
 // ─────────────────────── MATCH LIST ───────────────────────
 async function loadMatches() {
+  const el = document.getElementById('mlist');
+
+  // Show setup screen if Railway URL not configured
+  if (!isConfigured()) {
+    el.innerHTML = renderSetupPrompt();
+    document.getElementById('btn-refresh').classList.remove('loading');
+    document.getElementById('btn-refresh').innerHTML = '↻ Refresh';
+    return;
+  }
+
   const btn = document.getElementById('btn-refresh');
   btn.classList.add('loading'); btn.innerHTML = '<span class="spin">↻</span>';
   const { ok, data } = await api('/api/state');
   btn.classList.remove('loading'); btn.innerHTML = '↻ Refresh';
 
   if (!ok || !data) {
-    document.getElementById('mlist').innerHTML = `<div class="err-box">
-      Não foi possível ligar ao servidor.<br>
-      <strong style="font-family:var(--mono);font-size:12px">${BASE()}</strong><br><br>
-      Abre as ⚙ Configurações e verifica o host.
+    el.innerHTML = `<div class="err-box" style="margin:16px">
+      <strong>Servidor inacessível</strong><br>
+      <span style="font-size:12px;font-family:var(--mono);word-break:break-all">${BASE()}</span><br><br>
+      Verifica o URL do Railway ou aguarda o arranque do servidor (pode demorar ~30s).
+      <br><br>
+      <button onclick="openSetup()" style="margin-top:4px;padding:8px 16px;border-radius:8px;background:var(--bg3);border:1px solid var(--border2);color:var(--text);font-family:var(--sans);font-size:13px;cursor:pointer">
+        ✎ Alterar URL do servidor
+      </button>
     </div>`;
     return;
   }
@@ -2126,6 +2142,42 @@ async function loadToday() {
   el.querySelectorAll('.mrow[data-id]').forEach(r =>
     r.addEventListener('click', () => openMatch(parseInt(r.dataset.id)))
   );
+}
+
+// ─────────────────────── SETUP / CONFIG ───────────────────────
+function renderSetupPrompt() {
+  return `<div style="margin:24px 16px;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r);overflow:hidden">
+    <div style="padding:16px 16px 0;background:var(--bg3);border-bottom:1px solid var(--border)">
+      <div style="font-size:14px;font-weight:700;color:var(--green);margin-bottom:4px">⬡ Configuração inicial</div>
+      <div style="font-size:12px;color:var(--text3);padding-bottom:14px;line-height:1.5">
+        Introduz o URL do teu servidor Railway para começar.
+      </div>
+    </div>
+    <div style="padding:16px">
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);margin-bottom:6px">URL do servidor Railway</div>
+      <input id="setup-url" class="form-in" placeholder="xxx.up.railway.app" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false"
+        style="width:100%;margin-bottom:10px" value="${localStorage.getItem('_sf_host')||''}">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:14px;line-height:1.5">
+        Encontra o URL em Railway → Settings → Networking → Domains
+      </div>
+      <button onclick="saveSetup()" style="width:100%;padding:12px;border-radius:10px;background:var(--green-bg);border:1px solid rgba(74,222,128,.25);color:var(--green);font-family:var(--sans);font-size:14px;font-weight:600;cursor:pointer">
+        Ligar ao servidor
+      </button>
+    </div>
+  </div>`;
+}
+
+function openSetup() {
+  const el = document.getElementById('mlist');
+  el.innerHTML = renderSetupPrompt();
+  setTimeout(() => document.getElementById('setup-url')?.focus(), 100);
+}
+
+function saveSetup() {
+  const url = (document.getElementById('setup-url')?.value || '').trim().replace(/\/+$/, '');
+  if (!url) return;
+  localStorage.setItem('_sf_host', url);
+  loadMatches();
 }
 
 // ─────────────────────── VIEWS ───────────────────────
