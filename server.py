@@ -513,23 +513,29 @@ def _resolve_sport_key(tournament_name, country=None):
     if not tournament_name:
         return None
 
-    # Try with original name first, then with suffixes stripped
-    for candidate in [tournament_name, _normalize_tournament(tournament_name)]:
-        t = candidate.lower().strip()
+    raw  = tournament_name.lower().strip()
+    norm = _normalize_tournament(tournament_name)  # already lowercase
 
+    # 1. Exact match — try normalized first so "Pro League, Championship Round"
+    #    resolves via "pro league" before keyword scan finds "championship".
+    for t in [norm, raw]:
         if t in TOURNAMENT_TO_SPORT_KEY:
             return TOURNAMENT_TO_SPORT_KEY[t]
 
-        # Sort by keyword length descending: more specific keys (e.g. "austrian bundesliga")
-        # must be checked before shorter generic ones (e.g. "bundesliga")
-        for keyword, sport_key in sorted(TOURNAMENT_TO_SPORT_KEY.items(), key=lambda x: -len(x[0])):
+    # 2. Keyword scan — sorted longest-first so "austrian bundesliga" beats "bundesliga".
+    #    Scan normalized name first for the same reason as above.
+    sorted_map = sorted(TOURNAMENT_TO_SPORT_KEY.items(), key=lambda x: -len(x[0]))
+    for t in [norm, raw]:
+        for keyword, sport_key in sorted_map:
             if keyword in t:
                 return sport_key
 
-        if country:
-            cc = country.lower()
+    # 3. Country-prefixed scan (last resort)
+    if country:
+        cc = country.lower()
+        for t in [norm, raw]:
             combined = f"{cc} {t}"
-            for keyword, sport_key in sorted(TOURNAMENT_TO_SPORT_KEY.items(), key=lambda x: -len(x[0])):
+            for keyword, sport_key in sorted_map:
                 if keyword in combined:
                     return sport_key
 

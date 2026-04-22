@@ -1061,9 +1061,6 @@ async function fetchDetail(id, forceRefresh = false) {
 function setQuota(rem) {
   const dot = document.getElementById('qdot');
   const val = document.getElementById('qval');
-  const pill = val.closest('.quota-pill');
-  const k = apiKey();
-  if (pill && k) pill.title = `Key: ${k.slice(0,4)}…${k.slice(-4)}`;
   if (rem == null) { val.textContent = '—'; val.className = 'qval dim'; dot.className = 'qdot'; return; }
   val.textContent = rem >= 1000 ? (rem/1000).toFixed(1)+'k' : rem;
   const c = rem > 100 ? 'ok' : rem > 20 ? 'warn' : 'bad';
