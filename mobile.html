@@ -161,6 +161,8 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
   font-size:10px;font-weight:800;font-family:var(--sans);
   color:#fff;text-transform:uppercase;letter-spacing:-.02em;
 }
+.team-circle-logo{background:var(--bg3);padding:2px;}
+.team-circle-logo img{width:100%;height:100%;border-radius:50%;object-fit:contain;}
 
 /* Scheduled game (today tab) */
 .mrow.scheduled .mrow-team-name{color:var(--text2)}
@@ -784,6 +786,67 @@ function renderList() {
   );
 }
 
+// ─────────────────────── TEAM LOGOS ───────────────────────
+let _LOGOS = {};      // name → url  (from server)
+let _LOGOS_NORM = {}; // normalised key → url
+
+function _normTeam(n) {
+  return n.toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   // strip accents
+    .replace(/\b(fc|afc|sc|bk|fk|sk|cf|if|ac|as|ss|rcd|rc|sd|ud|cd|real|athletic|club|calcio|united|city|town|rovers|wanderers|hotspur|county|albion)\b/g, '')
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+function _buildLogoIndex(teams) {
+  _LOGOS = teams;
+  _LOGOS_NORM = {};
+  for (const [name, url] of Object.entries(teams)) {
+    _LOGOS_NORM[_normTeam(name)] = url;
+  }
+}
+
+function _findLogo(name) {
+  if (!name) return null;
+  // 1. exact
+  if (_LOGOS[name]) return _LOGOS[name];
+  // 2. normalised exact
+  const nk = _normTeam(name);
+  if (_LOGOS_NORM[nk]) return _LOGOS_NORM[nk];
+  // 3. word-overlap: find candidate whose normalised key shares all significant words with query
+  const words = nk.split(' ').filter(w => w.length > 2);
+  if (!words.length) return null;
+  let best = null, bestScore = 0;
+  for (const [k, url] of Object.entries(_LOGOS_NORM)) {
+    const kWords = k.split(' ');
+    const hits = words.filter(w => kWords.includes(w)).length;
+    const score = hits / Math.max(words.length, kWords.length);
+    if (score > bestScore && score >= 0.6) { bestScore = score; best = url; }
+  }
+  return best;
+}
+
+async function loadLogos() {
+  const LS_KEY = '_team_logos_v1';
+  const LS_TS  = '_team_logos_ts';
+  const TTL    = 86400 * 1000; // 24 h
+  try {
+    const ts = parseInt(localStorage.getItem(LS_TS) || '0');
+    if (Date.now() - ts < TTL) {
+      const cached = localStorage.getItem(LS_KEY);
+      if (cached) { _buildLogoIndex(JSON.parse(cached)); return; }
+    }
+  } catch(e) {}
+  const { ok, data } = await api('/api/team_logos');
+  if (ok && data?.teams) {
+    _buildLogoIndex(data.teams);
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(data.teams));
+      localStorage.setItem(LS_TS, String(Date.now()));
+    } catch(e) {}
+  }
+}
+
 // ─────────────────────── TEAM CIRCLE ───────────────────────
 const _CIRCLE_PALETTE = [
   '#e74c3c','#e67e22','#f39c12','#27ae60','#16a085',
@@ -801,6 +864,8 @@ function teamColor(name) {
   return _CIRCLE_PALETTE[Math.abs(h) % _CIRCLE_PALETTE.length];
 }
 function teamCircle(name) {
+  const logo = _findLogo(name);
+  if (logo) return `<div class="team-circle team-circle-logo"><img src="${logo}" alt="${name}" loading="lazy" onerror="this.parentElement.outerHTML=\`<div class='team-circle' style='background:${teamColor(name)}'>${teamInitials(name)}</div>\`"></div>`;
   const bg = teamColor(name);
   const ini = teamInitials(name);
   return `<div class="team-circle" style="background:${bg}">${ini}</div>`;
@@ -2263,8 +2328,7 @@ function startAuto() {
 // ─────────────────────── INIT ───────────────────────
 showView('list');
 switchMainTab('live');
-loadMatches();
-startAuto();
+loadLogos().finally(() => { loadMatches(); startAuto(); });
 </script>
 </body>
 </html>

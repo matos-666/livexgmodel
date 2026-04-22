@@ -2227,6 +2227,48 @@ def r_update_tip_result(match_id):
 
 
 
+# ── Team Logos ──
+_LOGOS_SHEET = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1tDUlWmZZcJKXHd0Nlr5QIm1V15OMsvkOgfhXUuPI9_M/"
+    "gviz/tq?tqx=out:csv&sheet=footballstats+team+logo"
+)
+_logos_cache: dict = {}   # name → url
+_logos_ts: float  = 0.0
+_LOGOS_TTL = 86400         # refresh every 24 h
+
+def _load_logos():
+    global _logos_cache, _logos_ts
+    import csv, io
+    try:
+        resp = _session.get(_LOGOS_SHEET, timeout=30)
+        resp.raise_for_status()
+        reader = csv.reader(io.StringIO(resp.text))
+        logos = {}
+        for row in reader:
+            # Two paired columns: (col0=name, col1=url) and (col3=name, col5=url)
+            for name_i, url_i in [(0, 1), (3, 5)]:
+                if len(row) > url_i:
+                    name = row[name_i].strip()
+                    url  = row[url_i].strip()
+                    if name and url.startswith("http"):
+                        logos[name] = url
+        _logos_cache = logos
+        _logos_ts    = time.time()
+        log.info(f"Team logos loaded: {len(logos)} entries")
+    except Exception as e:
+        log.error(f"Failed to load team logos: {e}")
+
+def _get_logos():
+    if time.time() - _logos_ts > _LOGOS_TTL or not _logos_cache:
+        _load_logos()
+    return _logos_cache
+
+@app.route("/api/team_logos")
+def r_team_logos():
+    return jsonify({"teams": _get_logos(), "count": len(_logos_cache)})
+
+
 if __name__ == "__main__":
     _load_aliases()
 
