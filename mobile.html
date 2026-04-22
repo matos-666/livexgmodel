@@ -835,7 +835,7 @@ function renderMatchRow(m, isLive) {
   // Time / minute
   let timeStr, timeCls = '';
   if (isLive && m.minute) {
-    if (m.statusCode === 31 || m.statusDesc?.toLowerCase().includes('half')) {
+    if (m.statusCode === 31 || m.statusDesc?.toLowerCase() === 'halftime') {
       timeStr = 'HT'; timeCls = 'ht';
     } else {
       timeStr = m.minute + "'"; timeCls = 'live';
