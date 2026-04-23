@@ -2132,11 +2132,13 @@ def _run_background_cycle():
         log.error(f"BG: get_live() failed: {e}")
         return
 
-    # Filter to monitored leagues only
+    # Filter to monitored leagues only — sport key check + strict name check
     monitored = []
     for m in live:
-        sk = _resolve_sport_key(m.get("tournament", ""), m.get("country", ""))
-        if sk in MONITORED_SPORT_KEYS:
+        tourn   = m.get("tournament", "")
+        country = m.get("country", "")
+        sk = _resolve_sport_key(tourn, country)
+        if sk in MONITORED_SPORT_KEYS and _is_monitored_league_strict(tourn, country):
             m["_sport_key"] = sk
             monitored.append(m)
 
@@ -2353,7 +2355,7 @@ _MONITORED_LEAGUE_STRICT_KEYWORDS = {
     "liga portugal": None,
     "primeira liga": {"portugal", "portuguese"},
     # Netherlands
-    "eredivisie": None,
+    "eredivisie": {"netherlands", "dutch", "holland"},
     # Belgium
     "jupiler": None,
     "pro league": {"belgium"},
@@ -2424,14 +2426,29 @@ _MONITORED_LEAGUE_STRICT_KEYWORDS = {
 
 _YOUTH_KEYWORDS = {"u23","u21","u20","u19","u18","u17","u15","youth","reserve","b team"}
 
+# Tournament fragments that always mean NOT a monitored competition
+_BLOCKED_TOURNAMENT_FRAGMENTS = {
+    "série d", "serie d", "série c", "serie c",   # Brazil lower divisions
+    "série a2", "série a3", "serie a2", "serie a3",
+    "paulista", "carioca", "gaúcho", "mineiro", "baiano",  # Brazil state leagues
+    "ligapro",                                    # Ecuador
+    "usl", "nisa",                                # US non-MLS
+}
+
 def _is_monitored_league_strict(tournament, country):
     """Strict check: only pass leagues explicitly in our monitored list."""
     import re as _re
+    # Use raw lowercase for fragment/youth checks (before normalization strips suffixes)
+    raw = tournament.lower()
     t = _normalize_tournament(tournament).lower()
     c = (country or "").lower()
-    # Exclude youth/reserve/women competitions
+    # Exclude youth/reserve competitions
     for yk in _YOUTH_KEYWORDS:
-        if yk in t:
+        if yk in raw:
+            return False
+    # Exclude explicitly blocked fragments (checked on raw name)
+    for frag in _BLOCKED_TOURNAMENT_FRAGMENTS:
+        if frag in raw:
             return False
     # Check against strict keyword map
     for kw, allowed_countries in sorted(_MONITORED_LEAGUE_STRICT_KEYWORDS.items(), key=lambda x: -len(x[0])):
