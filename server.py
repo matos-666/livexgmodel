@@ -1840,6 +1840,7 @@ _last_cycle_req = 0
 import sqlite3, pathlib
 
 DB_PATH = pathlib.Path(os.environ.get("DB_PATH", "/data/tips.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def _db():
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10)
