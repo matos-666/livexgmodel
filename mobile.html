@@ -336,6 +336,7 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
 .tip-odd-entry{font-size:12px;font-family:var(--mono);font-weight:700;color:var(--text)}
 .tip-odd-now{font-size:10px;font-family:var(--mono);color:var(--text3)}
 .tip-odd-now.up{color:var(--green)}.tip-odd-now.down{color:var(--red)}
+.tip-edge{font-size:9px;font-family:var(--mono);color:var(--green);margin-left:5px;opacity:.8}
 .tip-status{width:26px;height:26px;border-radius:6px;border:none;font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;background:var(--bg4);color:var(--text3)}
 .tip-status.green{background:rgba(74,222,128,.15);color:var(--green);border:1px solid rgba(74,222,128,.3)}
 .tip-status.red{background:rgba(248,113,113,.12);color:var(--red);border:1px solid rgba(248,113,113,.25)}
@@ -721,6 +722,7 @@ function mergeServerTips(matchId, serverTips) {
       existing.push({
         key: st.tip_key, market: st.market, label: st.label,
         oddEntry: st.odd_entry, oddNow: st.odd_now,
+        edgeEntry: st.edge_entry ?? null,
         minuteEntry: st.minute_entry, ts: (st.wall_ts || 0) * 1000,
         result: st.result,
       });
@@ -1260,11 +1262,12 @@ function syncTips(matchId, picks, minute) {
         key,
         market: p.market,
         label: p.label,
-        oddEntry: p.odds,          // odd at first suggestion
-        oddNow: p.odds,            // updated each refresh
-        minuteEntry: minute,       // match minute when first detected
-        ts: Date.now(),            // wall-clock timestamp
-        result: null,              // null | 'green' | 'red' | 'void'
+        oddEntry: p.odds,
+        oddNow: p.odds,
+        edgeEntry: p.edge ?? null,
+        minuteEntry: minute,
+        ts: Date.now(),
+        result: null,
       });
       changed = true;
     } else {
@@ -1525,10 +1528,11 @@ function buildTipsHistory(matchId, tips) {
     const resCls = t.result === 'green' ? 'green' : t.result === 'red' ? 'red' : t.result === 'void' ? 'void' : 'pending';
     const resIcon = t.result === 'green' ? '✓' : t.result === 'red' ? '✗' : t.result === 'void' ? '⊘' : '·';
     const timeStr = fmtTipTs(t.ts);
+    const edgeTxt2 = t.edgeEntry != null ? `+${Number(t.edgeEntry).toFixed(1)}%` : '';
     return `<div class="tip-row">
       <span class="tip-min">${t.minuteEntry ? t.minuteEntry+"'" : timeStr}</span>
       <span class="tip-mkt">${t.market}</span>
-      <span class="tip-lbl">${t.label}</span>
+      <span class="tip-lbl">${t.label}${edgeTxt2 ? `<span class="tip-edge">${edgeTxt2}</span>` : ''}</span>
       <div class="tip-odds">
         <span class="tip-odd-entry">${oddEntry}</span>
         <span class="tip-odd-now ${diffCls}">${diffTxt}</span>
@@ -2146,7 +2150,7 @@ function renderSettlement() {
       return `<div class="sett-tip-row">
         <span class="sett-tip-min">${t.minuteEntry ? t.minuteEntry+"'" : '—'}</span>
         <span class="sett-tip-mkt">${t.market}</span>
-        <span class="sett-tip-lbl">${t.label}</span>
+        <span class="sett-tip-lbl">${t.label}${t.edgeEntry != null ? `<span class="tip-edge">+${Number(t.edgeEntry).toFixed(1)}%</span>` : ''}</span>
         <span class="sett-tip-odd">@${t.oddEntry ? Number(t.oddEntry).toFixed(2) : '—'}</span>
         <button class="sett-tip-res ${resCls}" onclick="toggleArchiveTip('${g.matchId}','${t.key.replace(/'/g,"\'")}',this)">${resIcon}</button>
       </div>`;

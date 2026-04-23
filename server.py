@@ -729,7 +729,7 @@ def calculate_benter_value(model_probs, bookie_novig, bookie_odds, minute):
             "impliedOdds": round(1 / blended, 3) if blended > 0 else None,
             "bookieOdds": odds,
             "value": round(value, 4),
-            "isValue": value > 0,
+            "isValue": value > 0.10,   # >10% edge required
             "edge": round(value * 100, 2),
         }
 
@@ -1796,6 +1796,7 @@ def _init_db():
             label        TEXT NOT NULL,
             odd_entry    REAL,
             odd_now      REAL,
+            edge_entry   REAL,
             minute_entry INTEGER,
             wall_ts      INTEGER NOT NULL,
             result       TEXT DEFAULT NULL,
@@ -1804,6 +1805,12 @@ def _init_db():
         CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id);
         CREATE INDEX IF NOT EXISTS idx_games_finished ON games(is_finished);
         """)
+    # Migration: add edge_entry column to existing DBs
+    with _db() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(tips)").fetchall()]
+        if "edge_entry" not in cols:
+            conn.execute("ALTER TABLE tips ADD COLUMN edge_entry REAL")
+            log.info("DB migration: added edge_entry column to tips")
     log.info(f"DB ready: {DB_PATH}")
 
 def _upsert_game(match: dict):
@@ -1846,10 +1853,10 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict) -> list:
             if not existing:
                 conn.execute("""
                     INSERT INTO tips (tip_key, match_id, market, label,
-                                      odd_entry, odd_now, minute_entry, wall_ts)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                      odd_entry, odd_now, edge_entry, minute_entry, wall_ts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (key, match_id, p["market"], p["label"],
-                      p["odds"], p["odds"], minute, now_ts))
+                      p["odds"], p["odds"], p.get("edge"), minute, now_ts))
             else:
                 # Update current odd if still open
                 if existing["result"] is None:
