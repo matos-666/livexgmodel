@@ -1909,13 +1909,46 @@ def _upsert_game(match: dict):
                 (int(time.time()), match["id"])
             )
 
-def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict) -> list:
+GOAL_COOLDOWN_MINUTES = 4  # block new tips for this many minutes after a goal
+
+def _hcp_canonical(label: str) -> str:
+    """Normalise HCP label for dedup: strip trailing .0, lowercase team prefix."""
+    import re as _re
+    m = _re.search(r'([+-][\d.]+)$', label)
+    if not m:
+        return label.lower()
+    value = float(m.group(1))
+    # Format as int if whole number, else keep decimal
+    val_str = str(int(value)) if value == int(value) else str(value)
+    team = label[:label.rfind(m.group(0))].strip().lower()
+    return f"{team}|{val_str}"
+
+def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
+                  last_goal_minute=None) -> list:
     """
     Sync server-computed picks into the DB.
     Returns the full tip list for this match (including historical).
     """
+    import re as _re
     now_ts = int(time.time())
+
+    # Goal cooldown: suppress NEW tip insertions within GOAL_COOLDOWN_MINUTES of a goal
+    in_cooldown = (
+        last_goal_minute is not None
+        and minute is not None
+        and 0 <= (minute - last_goal_minute) < GOAL_COOLDOWN_MINUTES
+    )
+    if in_cooldown:
+        log.info(f"match {match_id}: goal cooldown active (goal@{last_goal_minute}', now@{minute}') — skipping new tips")
+
     with _db() as conn:
+        # Pre-load existing HCP canonical keys to prevent near-duplicates
+        existing_hcp = conn.execute(
+            "SELECT label FROM tips WHERE match_id = ? AND market = 'HCP'",
+            (match_id,)
+        ).fetchall()
+        existing_hcp_canonical = {_hcp_canonical(r["label"]) for r in existing_hcp}
+
         for p in picks:
             key = f"{p['market']}|{p['label']}"
             existing = conn.execute(
@@ -1923,12 +1956,23 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict) -> list:
                 (key, match_id)
             ).fetchone()
             if not existing:
+                # Dedup HCP: skip if canonical form already stored
+                if p["market"] == "HCP":
+                    canon = _hcp_canonical(p["label"])
+                    if canon in existing_hcp_canonical:
+                        log.info(f"match {match_id}: skipping duplicate HCP tip '{p['label']}' (canonical: {canon})")
+                        continue
+                # Goal cooldown: only block brand-new tips, not already-stored ones
+                if in_cooldown:
+                    continue
                 conn.execute("""
                     INSERT INTO tips (tip_key, match_id, market, label,
                                       odd_entry, odd_now, edge_entry, minute_entry, wall_ts)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (key, match_id, p["market"], p["label"],
                       p["odds"], p["odds"], p.get("edge"), minute, now_ts))
+                if p["market"] == "HCP":
+                    existing_hcp_canonical.add(_hcp_canonical(p["label"]))
             else:
                 # Update current odd if still open
                 if existing["result"] is None:
@@ -2127,7 +2171,8 @@ def _run_background_cycle():
             # Extract picks + sync to DB
             minute = m.get("minute") or 0
             picks  = _extract_picks_from_odds(odds, m) if odds else []
-            tips   = _sync_tips_db(mid, picks, minute, odds or {})
+            last_goal_minute = incidents.get("lastGoalMinute") if incidents else None
+            tips   = _sync_tips_db(mid, picks, minute, odds or {}, last_goal_minute)
             _auto_resolve_db(mid, m, incidents)
 
             # Re-read tips after resolution
