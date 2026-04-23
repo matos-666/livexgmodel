@@ -143,11 +143,58 @@ TOURNAMENT_TO_SPORT_KEY = {
     "osterreichische bundesliga": "soccer_austria_bundesliga",
     "2. liga austria": "soccer_austria_bundesliga2",
     # Scotland
-    "scottish premiership": "soccer_scotland_premiership",
+    "scottish premiership": "soccer_spl",
+    "scottish premier league": "soccer_spl",
+    # Russia
+    "russian premier league": "soccer_russia_premier_league",
+    "russia premier league":  "soccer_russia_premier_league",
+    "rpl":                    "soccer_russia_premier_league",
+    # Brazil Serie B
+    "brasileirão série b":              "soccer_brazil_serie_b",
+    "serie b brazil":                   "soccer_brazil_serie_b",
+    "campeonato brasileiro série b":    "soccer_brazil_serie_b",
+    # Chile
+    "primera división de chile":        "soccer_chile_campeonato",
+    "campeonato nacional":              "soccer_chile_campeonato",
+    # China
+    "chinese super league":             "soccer_china_superleague",
+    "csl":                              "soccer_china_superleague",
+    # League of Ireland
+    "league of ireland":                "soccer_league_of_ireland",
+    "sse airtricity league":            "soccer_league_of_ireland",
+    "airtricity league":                "soccer_league_of_ireland",
+    # Saudi Arabia
+    "saudi pro league":                 "soccer_saudi_arabia_pro_league",
+    "saudi professional league":        "soccer_saudi_arabia_pro_league",
+    "roshn saudi league":               "soccer_saudi_arabia_pro_league",
+    # UEFA – extra competitions
+    "champions league qualification":   "soccer_uefa_champs_league_qualification",
+    "ucl qualification":                "soccer_uefa_champs_league_qualification",
+    "women's champions league":         "soccer_uefa_champs_league_women",
+    "uefa women's champions league":    "soccer_uefa_champs_league_women",
+    "european championship":            "soccer_uefa_european_championship",
+    "uefa european championship":       "soccer_uefa_european_championship",
+    "uefa euro":                        "soccer_uefa_european_championship",
+    "euro 2024":                        "soccer_uefa_european_championship",
+    "euro qualification":               "soccer_uefa_euro_qualification",
+    "euro qualifying":                  "soccer_uefa_euro_qualification",
+    "nations league":                   "soccer_uefa_nations_league",
+    "uefa nations league":              "soccer_uefa_nations_league",
+    # FIFA
+    "fifa world cup":                   "soccer_fifa_world_cup",
+    "world cup":                        "soccer_fifa_world_cup",
+    "world cup qualifiers europe":      "soccer_fifa_world_cup_qualifiers_europe",
+    "world cup qualifiers south america": "soccer_fifa_world_cup_qualifiers_south_america",
+    "world cup qualifying":             "soccer_fifa_world_cup_qualifiers_europe",
+    "women's world cup":                "soccer_fifa_world_cup_womens",
+    "fifa women's world cup":           "soccer_fifa_world_cup_womens",
+    "club world cup":                   "soccer_fifa_club_world_cup",
+    "fifa club world cup":              "soccer_fifa_club_world_cup",
+    # Copa America
+    "copa america":                     "soccer_conmebol_copa_america",
+    "conmebol copa america":            "soccer_conmebol_copa_america",
     # ── Explicit NON-monitored entries — prevent false positives in keyword search ──
     # These map real tournaments to sport keys NOT in MONITORED_SPORT_KEYS
-    "russian premier league":        "soccer_russia_premier_league_na",
-    "russia premier league":         "soccer_russia_premier_league_na",
     "fnl":                           "soccer_russia_fnl_na",
     "mozzart bet superliga":         "soccer_serbia_superliga_na",
     "serbian superliga":             "soccer_serbia_superliga_na",
@@ -1737,21 +1784,39 @@ def cli_test():
 # The set of sport keys we actively monitor.
 # Only games in these leagues trigger odds fetches.
 MONITORED_SPORT_KEYS = {
+    # England
     "soccer_epl", "soccer_efl_champ",
+    # Top 5 European domestic
     "soccer_spain_la_liga", "soccer_italy_serie_a",
     "soccer_germany_bundesliga", "soccer_france_ligue_one",
+    # Other European domestic
     "soccer_portugal_primeira_liga", "soccer_netherlands_eredivisie",
     "soccer_belgium_first_div", "soccer_turkey_super_league",
-    "soccer_austria_bundesliga", "soccer_scotland_premiership",
-    "soccer_uefa_champs_league", "soccer_uefa_europa_league",
-    "soccer_uefa_europa_conference_league",
-    "soccer_usa_mls", "soccer_brazil_campeonato",
-    "soccer_argentina_primera_division",
-    "soccer_conmebol_copa_libertadores", "soccer_conmebol_copa_sudamericana",
-    "soccer_japan_j_league", "soccer_korea_kleague1", "soccer_australia_aleague",
+    "soccer_austria_bundesliga", "soccer_spl",
+    "soccer_greece_super_league",
     "soccer_sweden_allsvenskan", "soccer_norway_eliteserien", "soccer_denmark_superliga",
     "soccer_switzerland_superleague", "soccer_poland_ekstraklasa",
-    "soccer_czech_republic_league", "soccer_greece_super_league",
+    "soccer_finland_veikkausliiga", "soccer_russia_premier_league",
+    "soccer_league_of_ireland", "soccer_saudi_arabia_pro_league",
+    # UEFA
+    "soccer_uefa_champs_league", "soccer_uefa_champs_league_qualification",
+    "soccer_uefa_champs_league_women",
+    "soccer_uefa_europa_league", "soccer_uefa_europa_conference_league",
+    "soccer_uefa_european_championship", "soccer_uefa_euro_qualification",
+    "soccer_uefa_nations_league",
+    # FIFA
+    "soccer_fifa_world_cup", "soccer_fifa_world_cup_qualifiers_europe",
+    "soccer_fifa_world_cup_qualifiers_south_america",
+    "soccer_fifa_world_cup_womens", "soccer_fifa_club_world_cup",
+    # Americas
+    "soccer_usa_mls",
+    "soccer_brazil_campeonato", "soccer_brazil_serie_b",
+    "soccer_argentina_primera_division",
+    "soccer_chile_campeonato", "soccer_mexico_ligamx",
+    "soccer_conmebol_copa_libertadores", "soccer_conmebol_copa_sudamericana",
+    "soccer_conmebol_copa_america",
+    # Asia
+    "soccer_japan_j_league", "soccer_china_superleague",
 }
 
 BG_INTERVAL   = 120   # seconds between cycles (2 minutes)
@@ -2158,54 +2223,94 @@ def _background_loop():
 # Keywords that appear in legitimate monitored league names only
 # Used for strict matching in the "today" filter
 _MONITORED_LEAGUE_STRICT_KEYWORDS = {
+    # England
     "premier league": {"england", "english", "uk"},
     "championship": {"england", "english"},
     "efl": {"england", "english"},
-    "la liga": None,  # None = any country is OK (unique enough name)
+    # Spain
+    "la liga": None,
     "laliga": None,
     "primera division": {"spain", "spanish"},
+    # Italy
     "serie a": {"italy", "italian"},
+    # Germany
     "bundesliga": {"germany", "german"},
+    # France
     "ligue 1": {"france", "french"},
+    # Portugal
     "liga portugal": None,
     "primeira liga": {"portugal", "portuguese"},
+    # Netherlands
     "eredivisie": None,
+    # Belgium
     "jupiler": None,
     "pro league": {"belgium"},
     "first division a": {"belgium"},
+    # Greece
     "stoiximan super league": None,
     "greek super league": None,
     "super league greece": None,
+    # Turkey
     "süper lig": None,
     "super lig": {"turkey"},
+    # Austria
     "austrian bundesliga": None,
     "admiral bundesliga": None,
+    # Scotland
     "scottish premiership": None,
+    "scottish premier league": None,
+    # Scandinavia
+    "allsvenskan": None,
+    "eliteserien": None,
+    "superligaen": None,
+    "veikkausliiga": None,
+    # Other Europe
+    "ekstraklasa": None,
+    "swiss super league": None,
+    "league of ireland": None,
+    "airtricity league": None,
+    # Russia / Saudi
+    "russian premier league": None,
+    "saudi pro league": None,
+    "roshn saudi league": None,
+    "saudi professional league": None,
+    # UEFA
     "champions league": None,
     "europa league": None,
     "conference league": None,
+    "nations league": None,
+    "european championship": None,
+    "uefa euro": None,
+    "euro qualification": None,
+    "euro qualifying": None,
+    "women's champions league": None,
+    # FIFA
+    "fifa world cup": None,
+    "world cup": None,
+    "women's world cup": None,
+    "club world cup": None,
+    # Americas
     "mls": None,
     "major league soccer": None,
     "brasileirão": None,
     "campeonato brasileiro": None,
     "liga profesional": None,
-    "primera división": {"argentina"},
+    "primera división": {"argentina", "chile"},
     "copa libertadores": None,
     "conmebol libertadores": None,
     "copa sudamericana": None,
     "conmebol sudamericana": None,
+    "copa america": None,
+    "liga mx": None,
+    "liga bbva": None,
+    "campeonato nacional": {"chile"},
+    "brasileirão série b": None,
+    # Asia
     "j1 league": None,
-    "k league 1": None,
-    "a-league": None,
-    "allsvenskan": None,
-    "eliteserien": None,
-    "superligaen": None,
-    "ekstraklasa": None,
-    "swiss super league": None,
-    "czech first league": None,
+    "chinese super league": None,
 }
 
-_YOUTH_KEYWORDS = {"u23","u21","u20","u19","u18","u17","u15","youth","reserve","b team","women","feminine"}
+_YOUTH_KEYWORDS = {"u23","u21","u20","u19","u18","u17","u15","youth","reserve","b team"}
 
 def _is_monitored_league_strict(tournament, country):
     """Strict check: only pass leagues explicitly in our monitored list."""
