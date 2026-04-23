@@ -1289,6 +1289,13 @@ def get_live():
     return [_parse_event(e) for e in (data or {}).get("events", [])]
 
 
+def get_event(event_id: int):
+    """Fetch a single Sofascore event by ID."""
+    data = _get(f"{SOFASCORE_API}/event/{event_id}")
+    ev = (data or {}).get("event")
+    return _parse_event(ev) if ev else None
+
+
 def get_scheduled(date_str=None):
     if not date_str:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1974,6 +1981,19 @@ def _auto_resolve_db(match_id: int, match: dict, inc: dict):
                         new_result = "green" if side == ft else "red"
                         break
 
+            # HCP — only at FT
+            if mkt == "HCP" and finished and new_result is None:
+                hm = _re.search(r'([+-][\d.]+)$', lbl)
+                if hm:
+                    hcp = float(hm.group(1))
+                    team_part = lbl[:lbl.rfind(hm.group(0))].strip()
+                    home_name = match.get("homeTeam", "")
+                    is_home = team_part.lower() in home_name.lower() or \
+                              (len(team_part) > 3 and home_name.lower().startswith(team_part[:4].lower()))
+                    margin = (hg - ag) if is_home else (ag - hg)
+                    adj = margin + hcp
+                    new_result = "green" if adj > 0 else ("red" if adj < 0 else "void")
+
             if new_result:
                 conn.execute(
                     "UPDATE tips SET result = ? WHERE tip_key = ? AND match_id = ?",
@@ -2131,7 +2151,9 @@ def _run_background_cycle():
         _live_state.clear()
         _live_state.update(new_state)
 
-    # Resolve tips on finished games that may have dropped off the live list
+    # Finalize games that dropped off the live feed, then resolve their tips
+    live_ids = {m["id"] for m in monitored}
+    _finalize_dropped_games(live_ids)
     _resolve_finished_tips()
 
     req_after = _api_requests_remaining or 0
@@ -2141,6 +2163,51 @@ def _run_background_cycle():
         f"BG cycle done in {time.time()-t0:.1f}s — "
         f"{len(new_state)} games processed, {_last_cycle_req} API req used"
     )
+
+
+def _finalize_dropped_games(live_ids: set):
+    """
+    For any DB game with is_finished=0 that is NOT in the current live feed,
+    fetch its current state from Sofascore directly. If it's finished, mark it
+    and update the score so _resolve_finished_tips() can settle its tips.
+    """
+    with _db() as conn:
+        pending = conn.execute(
+            "SELECT id FROM games WHERE is_finished = 0"
+        ).fetchall()
+
+    dropped = [r["id"] for r in pending if r["id"] not in live_ids]
+    if not dropped:
+        return
+
+    log.info(f"_finalize_dropped_games: checking {len(dropped)} dropped game(s): {dropped}")
+    for gid in dropped:
+        try:
+            ev = get_event(gid)
+            if ev is None:
+                continue
+            if ev.get("isFinished"):
+                hg = ev.get("homeGoals", 0)
+                ag = ev.get("awayGoals", 0)
+                now_ts = int(time.time())
+                with _db() as conn:
+                    conn.execute(
+                        "UPDATE games SET is_finished=1, home_goals=?, away_goals=?, "
+                        "archived_at=COALESCE(archived_at,?) WHERE id=?",
+                        (hg, ag, now_ts, gid)
+                    )
+                log.info(f"Finalized dropped game {gid} ({ev['homeTeam']} {hg}-{ag} {ev['awayTeam']})")
+            # Also handle still-live games: update score silently
+            elif ev.get("isLive"):
+                hg = ev.get("homeGoals", 0)
+                ag = ev.get("awayGoals", 0)
+                with _db() as conn:
+                    conn.execute(
+                        "UPDATE games SET home_goals=?, away_goals=? WHERE id=?",
+                        (hg, ag, gid)
+                    )
+        except Exception as e:
+            log.warning(f"_finalize_dropped_games: failed for game {gid}: {e}")
 
 
 def _resolve_finished_tips():
@@ -2471,6 +2538,49 @@ def _get_logos():
 @app.route("/api/team_logos")
 def r_team_logos():
     return jsonify({"teams": _get_logos(), "count": len(_logos_cache)})
+
+
+@app.route("/api/admin/resolve", methods=["GET", "POST"])
+def r_admin_resolve():
+    """
+    Force-check all unfinished DB games against Sofascore and resolve pending tips.
+    Call this once to fix any tips left pending from games that already finished.
+    """
+    with _db() as conn:
+        pending_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM games WHERE is_finished = 0"
+        ).fetchall()]
+
+    fixed_games = []
+    for gid in pending_ids:
+        try:
+            ev = get_event(gid)
+            if ev and ev.get("isFinished"):
+                hg, ag = ev.get("homeGoals", 0), ev.get("awayGoals", 0)
+                now_ts = int(time.time())
+                with _db() as conn:
+                    conn.execute(
+                        "UPDATE games SET is_finished=1, home_goals=?, away_goals=?, "
+                        "archived_at=COALESCE(archived_at,?) WHERE id=?",
+                        (hg, ag, now_ts, gid)
+                    )
+                fixed_games.append({"id": gid, "score": f"{hg}-{ag}",
+                                    "home": ev["homeTeam"], "away": ev["awayTeam"]})
+        except Exception as e:
+            log.warning(f"admin/resolve: game {gid} error: {e}")
+
+    _resolve_finished_tips()
+
+    with _db() as conn:
+        still_pending = conn.execute(
+            "SELECT COUNT(*) FROM tips WHERE result IS NULL"
+        ).fetchone()[0]
+
+    return jsonify({
+        "finalized_games": fixed_games,
+        "still_pending_tips": still_pending,
+        "ok": True
+    })
 
 
 if __name__ == "__main__":
