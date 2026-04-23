@@ -2617,13 +2617,17 @@ def r_admin_resolve():
     _resolve_finished_tips()
 
     with _db() as conn:
-        still_pending = conn.execute(
-            "SELECT COUNT(*) FROM tips WHERE result IS NULL"
-        ).fetchone()[0]
+        still_pending_rows = conn.execute("""
+            SELECT g.id, g.home_team, g.away_team, g.home_goals, g.away_goals,
+                   g.is_finished, t.tip_key, t.market, t.label
+            FROM games g JOIN tips t ON t.match_id = g.id
+            WHERE t.result IS NULL
+        """).fetchall()
 
     return jsonify({
         "finalized_games": fixed_games,
-        "still_pending_tips": still_pending,
+        "still_pending_tips": len(still_pending_rows),
+        "pending_detail": [dict(r) for r in still_pending_rows],
         "ok": True
     })
 
