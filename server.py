@@ -2489,13 +2489,13 @@ def r_state_tips():
     to_ts   = flask_request.args.get("to_ts",   type=int)
     limit   = flask_request.args.get("limit", 500, type=int)
 
-    where  = "WHERE tip_count > 0"
+    date_where = ""
     params = []
     if from_ts:
-        where += " AND coalesce(g.start_ts, g.archived_at) >= ?"
+        date_where += " AND coalesce(g.start_ts, g.archived_at) >= ?"
         params.append(from_ts)
     if to_ts:
-        where += " AND coalesce(g.start_ts, g.archived_at) <= ?"
+        date_where += " AND coalesce(g.start_ts, g.archived_at) <= ?"
         params.append(to_ts)
 
     with _db() as conn:
@@ -2503,8 +2503,9 @@ def r_state_tips():
             SELECT g.*, COUNT(t.tip_key) as tip_count
             FROM games g
             LEFT JOIN tips t ON t.match_id = g.id
+            WHERE 1=1 {date_where}
             GROUP BY g.id
-            {where}
+            HAVING COUNT(t.tip_key) > 0
             ORDER BY coalesce(g.start_ts, g.archived_at) DESC
             LIMIT ?
         """, (*params, limit)).fetchall()
