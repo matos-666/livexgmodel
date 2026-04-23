@@ -1839,7 +1839,7 @@ _last_cycle_req = 0
 # ── SQLite persistence ──
 import sqlite3, pathlib
 
-DB_PATH = pathlib.Path(os.path.dirname(os.path.abspath(__file__))) / "tips.db"
+DB_PATH = pathlib.Path(os.environ.get("DB_PATH", "/data/tips.db"))
 
 def _db():
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10)
