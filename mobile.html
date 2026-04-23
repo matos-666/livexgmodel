@@ -2087,16 +2087,58 @@ function confirmClearArchive() {
   }
 }
 
-function renderSettlement() {
-  const archive = getArchive();
+// Normalise a server-side tips row to the same shape used everywhere
+function _normServerTip(t) {
+  return {
+    key:         t.tip_key,
+    market:      t.market,
+    label:       t.label,
+    oddEntry:    t.odd_entry,
+    oddNow:      t.odd_now,
+    edgeEntry:   t.edge_entry ?? null,
+    minuteEntry: t.minute_entry,
+    ts:          (t.wall_ts || 0) * 1000,
+    result:      t.result,
+  };
+}
+
+async function renderSettlement() {
   const summaryEl = document.getElementById('sett-summary');
   const listEl    = document.getElementById('sett-list');
   if (!summaryEl || !listEl) return;
 
+  listEl.innerHTML = '<div class="loading-row"><div class="spinner"></div>A carregar histórico…</div>';
+
+  // Fetch from server — source of truth for resolved tips
+  const { ok, data } = await api('/api/state/tips?limit=200');
+
+  // Fall back to localStorage if server unreachable
+  let games = [];
+  if (ok && data?.games) {
+    // Only games that have at least one tip
+    games = data.games
+      .filter(g => g.tips && g.tips.length > 0)
+      .map(g => ({
+        matchId:   g.id,
+        homeTeam:  g.home_team,
+        awayTeam:  g.away_team,
+        homeGoals: g.home_goals,
+        awayGoals: g.away_goals,
+        tournament: g.tournament || '',
+        country:   g.country || '',
+        archivedAt: (g.archived_at || g.start_ts || 0) * 1000,
+        tips:      g.tips.map(_normServerTip),
+      }))
+      .sort((a, b) => (b.archivedAt || 0) - (a.archivedAt || 0));
+  } else {
+    // Offline fallback: localStorage archive
+    games = [...getArchive()].reverse();
+  }
+
   // ── Global summary ──
   let totalGreen = 0, totalRed = 0, totalVoid = 0, totalPl = 0;
-  for (const g of archive) {
-    const {pl, settled} = gamePL(g.tips);
+  for (const g of games) {
+    const {pl} = gamePL(g.tips);
     totalPl += pl;
     for (const t of g.tips) {
       if (t.result === 'green') totalGreen++;
@@ -2119,40 +2161,43 @@ function renderSettlement() {
       <div class="sett-sum-lbl">P&L Total</div>
     </div>`;
 
-  if (!archive.length) {
-    listEl.innerHTML = '<div class="sett-empty">Nenhum jogo arquivado ainda.<br>Os jogos são guardados automaticamente quando terminam.</div>';
+  if (!games.length) {
+    listEl.innerHTML = '<div class="sett-empty">Nenhum jogo com tips ainda.<br>As tips são registadas automaticamente nos jogos monitorados.</div>';
     return;
   }
 
   // ── Filter ──
-  let games = [...archive].reverse(); // most recent first
-  if (S_filter === 'profit')  games = games.filter(g => gamePL(g.tips).pl > 0);
-  if (S_filter === 'loss')    games = games.filter(g => gamePL(g.tips).pl < 0);
-  if (S_filter === 'pending') games = games.filter(g => g.tips.some(t => t.result === null));
+  let filtered = games;
+  if (S_filter === 'profit')  filtered = games.filter(g => gamePL(g.tips).pl > 0);
+  if (S_filter === 'loss')    filtered = games.filter(g => gamePL(g.tips).pl < 0);
+  if (S_filter === 'pending') filtered = games.filter(g => g.tips.some(t => t.result === null));
 
-  if (!games.length) {
+  if (!filtered.length) {
     listEl.innerHTML = '<div class="sett-empty">Nenhum jogo nesta categoria.</div>';
     return;
   }
 
-  listEl.innerHTML = games.map(g => {
-    const {pl, settled} = gamePL(g.tips);
+  listEl.innerHTML = filtered.map(g => {
+    const {pl} = gamePL(g.tips);
     const plTxt = pl !== 0 ? (pl > 0 ? '+' : '') + pl.toFixed(2) + 'u' : '—';
     const plCls = pl > 0.001 ? 'green' : pl < -0.001 ? 'red' : 'neutral';
     const flag  = countryFlag(g.country);
-    const dateStr = new Date(g.archivedAt).toLocaleDateString('pt-PT', {day:'2-digit',month:'2-digit'});
+    const dateStr = g.archivedAt
+      ? new Date(g.archivedAt).toLocaleDateString('pt-PT', {day:'2-digit',month:'2-digit'})
+      : '—';
     const pending = g.tips.filter(t=>t.result===null).length;
     const hasPending = pending > 0;
 
     const tipsHtml = g.tips.map(t => {
-      const resCls = t.result === 'green' ? 'green' : t.result === 'red' ? 'red' : t.result === 'void' ? 'void' : 'pending';
+      const resCls  = t.result === 'green' ? 'green' : t.result === 'red' ? 'red' : t.result === 'void' ? 'void' : 'pending';
       const resIcon = t.result === 'green' ? '✓' : t.result === 'red' ? '✗' : t.result === 'void' ? '⊘' : '·';
+      const safeKey = (t.key || t.tip_key || '').replace(/'/g, "\\'");
       return `<div class="sett-tip-row">
         <span class="sett-tip-min">${t.minuteEntry ? t.minuteEntry+"'" : '—'}</span>
         <span class="sett-tip-mkt">${t.market}</span>
         <span class="sett-tip-lbl">${t.label}${t.edgeEntry != null ? `<span class="tip-edge">+${Number(t.edgeEntry).toFixed(1)}%</span>` : ''}</span>
         <span class="sett-tip-odd">@${t.oddEntry ? Number(t.oddEntry).toFixed(2) : '—'}</span>
-        <button class="sett-tip-res ${resCls}" onclick="toggleArchiveTip('${g.matchId}','${t.key.replace(/'/g,"\'")}',this)">${resIcon}</button>
+        <button class="sett-tip-res ${resCls}" onclick="toggleArchiveTip(${g.matchId},'${safeKey}',this)">${resIcon}</button>
       </div>`;
     }).join('');
 
@@ -2169,18 +2214,19 @@ function renderSettlement() {
   }).join('');
 }
 
-function toggleArchiveTip(matchId, key, btn) {
-  const archive = getArchive();
-  const game = archive.find(g => g.matchId == matchId);
-  if (!game) return;
-  const t = game.tips.find(t => t.key === key);
-  if (!t) return;
-  t.result = t.result === null ? 'green' : t.result === 'green' ? 'red' : t.result === 'red' ? 'void' : null;
-  saveArchive(archive);
-  btn.className = 'sett-tip-res ' + (t.result === 'green' ? 'green' : t.result === 'red' ? 'red' : t.result === 'void' ? 'void' : 'pending');
-  btn.textContent = t.result === 'green' ? '✓' : t.result === 'red' ? '✗' : t.result === 'void' ? '⊘' : '·';
-  // Refresh P&L summary
-  renderSettlement();
+async function toggleArchiveTip(matchId, key, btn) {
+  // Cycle result via server PATCH, then re-render
+  const resCycle = { null: 'green', green: 'red', red: 'void', void: null };
+  const curCls   = [...btn.classList].find(c => ['green','red','void','pending'].includes(c)) || 'pending';
+  const curRes   = curCls === 'pending' ? null : curCls;
+  const newRes   = resCycle[String(curRes)] ?? null;
+
+  const r = await fetch(BASE() + `/api/state/tips/${matchId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tip_key: key, result: newRes }),
+  });
+  if (r.ok) renderSettlement();
 }
 
 function switchMainTab(tab) {

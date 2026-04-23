@@ -2066,6 +2066,9 @@ def _run_background_cycle():
         _live_state.clear()
         _live_state.update(new_state)
 
+    # Resolve tips on finished games that may have dropped off the live list
+    _resolve_finished_tips()
+
     req_after = _api_requests_remaining or 0
     _last_cycle_ts = time.time()
     _last_cycle_req = req_before - req_after
@@ -2073,6 +2076,69 @@ def _run_background_cycle():
         f"BG cycle done in {time.time()-t0:.1f}s — "
         f"{len(new_state)} games processed, {_last_cycle_req} API req used"
     )
+
+
+def _resolve_finished_tips():
+    """
+    After each cycle, resolve any unresolved tips for games already marked
+    finished in the DB. These games have left the live feed so _auto_resolve_db
+    never ran for their final state.
+    """
+    import re as _re
+    try:
+        with _db() as conn:
+            rows = conn.execute("""
+                SELECT g.id, g.home_team, g.away_team, g.home_goals, g.away_goals,
+                       t.tip_key, t.market, t.label
+                FROM games g
+                JOIN tips t ON t.match_id = g.id
+                WHERE g.is_finished = 1 AND t.result IS NULL
+            """).fetchall()
+
+            for r in rows:
+                hg, ag = r["home_goals"], r["away_goals"]
+                total   = hg + ag
+                lbl, mkt = r["label"], r["market"]
+                new_result = None
+
+                om = _re.match(r'^Over\s+([\d.]+)$',  lbl, _re.IGNORECASE)
+                um = _re.match(r'^Under\s+([\d.]+)$', lbl, _re.IGNORECASE)
+                if om:
+                    line = float(om.group(1))
+                    new_result = "green" if total > line else "red"
+                elif um:
+                    line = float(um.group(1))
+                    new_result = "red" if total > line else "green"
+                elif mkt == "1X2":
+                    ft = "home" if hg > ag else ("draw" if hg == ag else "away")
+                    out_map = {"home": r["home_team"], "draw": "Empate", "away": r["away_team"]}
+                    for side, name in out_map.items():
+                        if lbl.lower() in name.lower() or (len(lbl) > 3 and name.lower().startswith(lbl[:4].lower())):
+                            new_result = "green" if side == ft else "red"
+                            break
+                elif mkt == "HCP":
+                    # HCP: "Team +X.X" or "Team -X.X"
+                    hm = _re.search(r'([+-][\d.]+)$', lbl)
+                    if hm:
+                        hcp = float(hm.group(1))
+                        # Determine if home or away team
+                        team_part = lbl[:lbl.rfind(hm.group(0))].strip()
+                        is_home = team_part.lower() in r["home_team"].lower() or \
+                                  (len(team_part) > 3 and r["home_team"].lower().startswith(team_part[:4].lower()))
+                        margin = (hg - ag) if is_home else (ag - hg)
+                        adj = margin + hcp
+                        if adj > 0:    new_result = "green"
+                        elif adj < 0:  new_result = "red"
+                        else:          new_result = "void"
+
+                if new_result:
+                    conn.execute(
+                        "UPDATE tips SET result = ? WHERE tip_key = ? AND match_id = ?",
+                        (new_result, r["tip_key"], r["id"])
+                    )
+                    log.info(f"Resolved tip {r['tip_key']} ({lbl}) → {new_result}")
+    except Exception as e:
+        log.error(f"_resolve_finished_tips failed: {e}")
 
 
 def _background_loop():
