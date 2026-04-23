@@ -1911,6 +1911,8 @@ def _upsert_game(match: dict):
             )
 
 GOAL_COOLDOWN_MINUTES = 4  # block new tips for this many minutes after a goal
+HCP_MIN_GAP_MINUTES   = 8  # minimum minutes between HCP tips for the same team
+MAX_TIPS_PER_GAME     = 6  # hard cap on tips per game
 
 def _hcp_canonical(label: str) -> str:
     """Normalise HCP label for dedup: strip trailing .0, lowercase team prefix."""
@@ -1943,44 +1945,95 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
         log.info(f"match {match_id}: goal cooldown active (goal@{last_goal_minute}', now@{minute}') — skipping new tips")
 
     with _db() as conn:
-        # Pre-load existing HCP canonical keys to prevent near-duplicates
-        existing_hcp = conn.execute(
-            "SELECT label FROM tips WHERE match_id = ? AND market = 'HCP'",
+        # Pre-load all existing tips for this game
+        existing_all = conn.execute(
+            "SELECT tip_key, market, label, minute_entry FROM tips WHERE match_id = ?",
             (match_id,)
         ).fetchall()
-        existing_hcp_canonical = {_hcp_canonical(r["label"]) for r in existing_hcp}
+        existing_keys      = {r["tip_key"] for r in existing_all}
+        existing_hcp_rows  = [r for r in existing_all if r["market"] == "HCP"]
+        existing_hcp_canonical = {_hcp_canonical(r["label"]) for r in existing_hcp_rows}
+
+        # O/U conflict index: line → set of directions already stored ("over"/"under")
+        existing_ou = {}
+        for r in existing_all:
+            if r["market"].startswith("O/U"):
+                m_ou = _re.match(r'^(Over|Under)\s+([\d.]+)$', r["label"], _re.IGNORECASE)
+                if m_ou:
+                    line = m_ou.group(2)
+                    existing_ou.setdefault(line, set()).add(m_ou.group(1).lower())
+
+        total_tips = len(existing_all)
 
         for p in picks:
             key = f"{p['market']}|{p['label']}"
-            existing = conn.execute(
-                "SELECT * FROM tips WHERE tip_key = ? AND match_id = ?",
-                (key, match_id)
-            ).fetchone()
-            if not existing:
-                # Dedup HCP: skip if canonical form already stored
-                if p["market"] == "HCP":
-                    canon = _hcp_canonical(p["label"])
-                    if canon in existing_hcp_canonical:
-                        log.info(f"match {match_id}: skipping duplicate HCP tip '{p['label']}' (canonical: {canon})")
+
+            if key in existing_keys:
+                # Tip already stored — update current odd if still open
+                conn.execute(
+                    "UPDATE tips SET odd_now = ? WHERE tip_key = ? AND match_id = ? AND result IS NULL",
+                    (p["odds"], key, match_id)
+                )
+                continue
+
+            # ── All checks below only apply to brand-new tips ──
+
+            # Hard cap
+            if total_tips >= MAX_TIPS_PER_GAME:
+                log.info(f"match {match_id}: tip cap ({MAX_TIPS_PER_GAME}) reached, skipping '{p['label']}'")
+                continue
+
+            # Goal cooldown
+            if in_cooldown:
+                continue
+
+            # O/U conflict: block opposite direction on same line
+            if p["market"].startswith("O/U"):
+                m_ou = _re.match(r'^(Over|Under)\s+([\d.]+)$', p["label"], _re.IGNORECASE)
+                if m_ou:
+                    direction = m_ou.group(1).lower()
+                    line      = m_ou.group(2)
+                    opposite  = "under" if direction == "over" else "over"
+                    if opposite in existing_ou.get(line, set()):
+                        log.info(f"match {match_id}: skipping {p['label']} — opposite direction already stored for line {line}")
                         continue
-                # Goal cooldown: only block brand-new tips, not already-stored ones
-                if in_cooldown:
+
+            # HCP dedup: same canonical value already stored
+            if p["market"] == "HCP":
+                canon = _hcp_canonical(p["label"])
+                if canon in existing_hcp_canonical:
+                    log.info(f"match {match_id}: skipping duplicate HCP '{p['label']}'")
                     continue
-                conn.execute("""
-                    INSERT INTO tips (tip_key, match_id, market, label,
-                                      odd_entry, odd_now, edge_entry, minute_entry, wall_ts)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (key, match_id, p["market"], p["label"],
-                      p["odds"], p["odds"], p.get("edge"), minute, now_ts))
-                if p["market"] == "HCP":
-                    existing_hcp_canonical.add(_hcp_canonical(p["label"]))
-            else:
-                # Update current odd if still open
-                if existing["result"] is None:
-                    conn.execute(
-                        "UPDATE tips SET odd_now = ? WHERE tip_key = ? AND match_id = ?",
-                        (p["odds"], key, match_id)
-                    )
+
+                # HCP gap: same team, less than HCP_MIN_GAP_MINUTES ago
+                hm = _re.search(r'([+-][\d.]+)$', p["label"])
+                if hm:
+                    team_part = p["label"][:p["label"].rfind(hm.group(0))].strip().lower()
+                    for r in existing_hcp_rows:
+                        rt = r["label"][:r["label"].rfind(_re.search(r'([+-][\d.]+)$', r["label"]).group(0))].strip().lower() \
+                             if _re.search(r'([+-][\d.]+)$', r["label"]) else ""
+                        if rt == team_part and r["minute_entry"] is not None:
+                            gap = (minute or 0) - r["minute_entry"]
+                            if 0 <= gap < HCP_MIN_GAP_MINUTES:
+                                log.info(f"match {match_id}: skipping HCP '{p['label']}' — same team tipped {gap}' ago")
+                                continue
+
+            conn.execute("""
+                INSERT INTO tips (tip_key, match_id, market, label,
+                                  odd_entry, odd_now, edge_entry, minute_entry, wall_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (key, match_id, p["market"], p["label"],
+                  p["odds"], p["odds"], p.get("edge"), minute, now_ts))
+            existing_keys.add(key)
+            total_tips += 1
+            if p["market"] == "HCP":
+                existing_hcp_canonical.add(_hcp_canonical(p["label"]))
+                existing_hcp_rows.append({"label": p["label"], "minute_entry": minute,
+                                          "market": "HCP", "tip_key": key})
+            if p["market"].startswith("O/U"):
+                m_ou = _re.match(r'^(Over|Under)\s+([\d.]+)$', p["label"], _re.IGNORECASE)
+                if m_ou:
+                    existing_ou.setdefault(m_ou.group(2), set()).add(m_ou.group(1).lower())
 
         # Auto-resolve based on current state
         all_tips = conn.execute(
