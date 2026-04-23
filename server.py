@@ -2267,17 +2267,30 @@ def r_state():
 
 @app.route("/api/state/tips")
 def r_state_tips():
-    """Returns tip history (all games, including finished) from the DB."""
-    limit = flask_request.args.get("limit", 100, type=int)
+    """Returns tip history (all games with tips) from the DB, optionally filtered by date range."""
+    from_ts = flask_request.args.get("from_ts", type=int)   # unix seconds
+    to_ts   = flask_request.args.get("to_ts",   type=int)
+    limit   = flask_request.args.get("limit", 500, type=int)
+
+    where  = "WHERE tip_count > 0"
+    params = []
+    if from_ts:
+        where += " AND coalesce(g.start_ts, g.archived_at) >= ?"
+        params.append(from_ts)
+    if to_ts:
+        where += " AND coalesce(g.start_ts, g.archived_at) <= ?"
+        params.append(to_ts)
+
     with _db() as conn:
-        games = conn.execute("""
+        games = conn.execute(f"""
             SELECT g.*, COUNT(t.tip_key) as tip_count
             FROM games g
             LEFT JOIN tips t ON t.match_id = g.id
             GROUP BY g.id
-            ORDER BY g.archived_at DESC, g.id DESC
+            {where}
+            ORDER BY coalesce(g.start_ts, g.archived_at) DESC
             LIMIT ?
-        """, (limit,)).fetchall()
+        """, (*params, limit)).fetchall()
         result = []
         for g in games:
             gd = dict(g)
