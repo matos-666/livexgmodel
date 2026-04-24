@@ -1795,7 +1795,7 @@ MONITORED_SPORT_KEYS = {
     "soccer_epl", "soccer_efl_champ",
     # Top 5 European domestic
     "soccer_spain_la_liga", "soccer_italy_serie_a",
-    "soccer_germany_bundesliga", "soccer_france_ligue_one",
+    "soccer_germany_bundesliga", "soccer_germany_2_bundesliga", "soccer_france_ligue_one",
     # Other European domestic
     "soccer_portugal_primeira_liga", "soccer_netherlands_eredivisie",
     "soccer_belgium_first_div", "soccer_turkey_super_league",

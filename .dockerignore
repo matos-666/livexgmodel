@@ -1,0 +1,14 @@
+.git
+.gitignore
+.claude
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.db
+tips.db
+.env
+.DS_Store
+node_modules
+railway.toml
