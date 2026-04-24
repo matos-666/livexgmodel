@@ -1941,7 +1941,9 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
     in_cooldown = (
         last_goal_minute is not None
         and minute is not None
-        and 0 <= (minute - last_goal_minute) < GOAL_COOLDOWN_MINUTES
+        and minute > 0  # only check if we have a real minute value
+        and (minute - last_goal_minute) >= 0  # goal was in past (same or earlier minute)
+        and (minute - last_goal_minute) < GOAL_COOLDOWN_MINUTES
     )
     if in_cooldown:
         log.info(f"match {match_id}: goal cooldown active (goal@{last_goal_minute}', now@{minute}') — skipping new tips")
@@ -2227,7 +2229,7 @@ def _run_background_cycle():
             _upsert_game(m)
 
             # Extract picks + sync to DB
-            minute = m.get("minute") or 0
+            minute = m.get("minute")  # None if not available
             picks  = _extract_picks_from_odds(odds, m) if odds else []
             last_goal_minute = incidents.get("lastGoalMinute") if incidents else None
             tips   = _sync_tips_db(mid, picks, minute, odds or {}, last_goal_minute)
