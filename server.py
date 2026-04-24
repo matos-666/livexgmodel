@@ -595,6 +595,8 @@ def _extract_bookmaker_odds(bookmakers, market_key):
 
     for bookie_key, max_stale in priority:
         for bm in bookmakers:
+            if bm["key"] == "pinnacle":  # Explicitly exclude Pinnacle
+                continue
             if bm["key"] == bookie_key:
                 for mkt in bm.get("markets", []):
                     mkt_key = mkt["key"]
