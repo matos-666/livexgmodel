@@ -2440,10 +2440,14 @@ _MONITORED_LEAGUE_STRICT_KEYWORDS = {
     "primera division": {"spain", "spanish"},
     # Italy
     "serie a": {"italy", "italian"},
+    "serie b": None,
     # Germany
     "bundesliga": {"germany", "german"},
+    "2. bundesliga": None,
+    "bundesliga 2": None,
     # France
     "ligue 1": {"france", "french"},
+    "ligue 2": None,
     # Portugal
     "liga portugal": None,
     "primeira liga": {"portugal", "portuguese"},
@@ -2463,6 +2467,9 @@ _MONITORED_LEAGUE_STRICT_KEYWORDS = {
     # Austria
     "austrian bundesliga": None,
     "admiral bundesliga": None,
+    "austrian bundesliga 2": None,
+    "admiral bundesliga 2": None,
+    "second league": {"austria"},
     # Scotland
     "scottish premiership": None,
     "scottish premier league": None,
