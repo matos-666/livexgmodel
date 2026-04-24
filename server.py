@@ -2607,6 +2607,11 @@ def r_today_monitored():
             if _is_monitored_league_strict(tourn_name, country_name):
                 sk = _resolve_sport_key(tourn_name, country_name)
                 m["_sport_key"] = sk
+                # Extract team names from team objects if needed
+                if isinstance(m.get("homeTeam"), dict):
+                    m["homeTeam"] = m["homeTeam"].get("name", "")
+                if isinstance(m.get("awayTeam"), dict):
+                    m["awayTeam"] = m["awayTeam"].get("name", "")
                 result.append(m)
         result.sort(key=lambda m: m.get("startTimestamp") or 0)
         return jsonify({"count": len(result), "matches": result, "date": date_str})
