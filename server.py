@@ -1958,6 +1958,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
         existing_keys      = {r["tip_key"] for r in existing_all}
         existing_hcp_rows  = [r for r in existing_all if r["market"] == "HCP"]
         existing_hcp_canonical = {_hcp_canonical(r["label"]) for r in existing_hcp_rows}
+        existing_1x2_rows  = [r for r in existing_all if r["market"] == "1X2"]
 
         # O/U conflict index: line → set of directions already stored ("over"/"under")
         existing_ou = {}
@@ -2002,6 +2003,39 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     if opposite in existing_ou.get(line, set()):
                         log.info(f"match {match_id}: skipping {p['label']} — opposite direction already stored for line {line}")
                         continue
+
+            # 1X2 ↔ HCP conflict: same team, same phase (no goal between them)
+            phase_cutoff = (last_goal_minute or 0)
+            if p["market"] == "HCP":
+                hm_new = _re.search(r'([+-][\d.]+)$', p["label"])
+                if hm_new:
+                    team_part = p["label"][:p["label"].rfind(hm_new.group(0))].strip().lower()
+                    for r in existing_1x2_rows:
+                        if r["label"].strip().lower() == team_part and (r["minute_entry"] or 0) >= phase_cutoff:
+                            log.info(f"match {match_id}: skipping HCP '{p['label']}' — 1X2 for same team already in this phase")
+                            break
+                    else:
+                        pass  # no conflict, continue below
+                    if any(r["label"].strip().lower() == team_part and (r["minute_entry"] or 0) >= phase_cutoff for r in existing_1x2_rows):
+                        continue
+            if p["market"] == "1X2":
+                team_part_1x2 = p["label"].strip().lower()
+                for r in existing_hcp_rows:
+                    hm_ex = _re.search(r'([+-][\d.]+)$', r["label"])
+                    if hm_ex:
+                        rt = r["label"][:r["label"].rfind(hm_ex.group(0))].strip().lower()
+                        if rt == team_part_1x2 and (r["minute_entry"] or 0) >= phase_cutoff:
+                            log.info(f"match {match_id}: skipping 1X2 '{p['label']}' — HCP for same team already in this phase")
+                            break
+                else:
+                    pass
+                if any(
+                    (_re.search(r'([+-][\d.]+)$', r["label"]) and
+                     r["label"][:r["label"].rfind(_re.search(r'([+-][\d.]+)$', r["label"]).group(0))].strip().lower() == team_part_1x2 and
+                     (r["minute_entry"] or 0) >= phase_cutoff)
+                    for r in existing_hcp_rows
+                ):
+                    continue
 
             # HCP dedup: same canonical value already stored
             if p["market"] == "HCP":
