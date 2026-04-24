@@ -2598,8 +2598,14 @@ def r_today_monitored():
         for m in all_events:
             if m.get("isFinished") or m.get("isLive"):
                 continue
-            if _is_monitored_league_strict(m.get("tournament",""), m.get("country","")):
-                sk = _resolve_sport_key(m.get("tournament",""), m.get("country",""))
+            # Extract tournament name (could be dict or string)
+            tourn = m.get("tournament", {})
+            tourn_name = tourn.get("name", "") if isinstance(tourn, dict) else str(tourn or "")
+            country = m.get("country", {})
+            country_name = country.get("name", "") if isinstance(country, dict) else str(country or "")
+
+            if _is_monitored_league_strict(tourn_name, country_name):
+                sk = _resolve_sport_key(tourn_name, country_name)
                 m["_sport_key"] = sk
                 result.append(m)
         result.sort(key=lambda m: m.get("startTimestamp") or 0)
