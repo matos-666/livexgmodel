@@ -1327,6 +1327,9 @@ def get_shotmap(eid):
 
     for s in data["shotmap"]:
         xg = float(s.get("xg") or s.get("expectedGoals") or 0)
+        situation = (s.get("situation") or "").lower()
+        is_penalty = "penalty" in situation
+
         p = {
             "xg": round(xg, 4),
             "minute": s.get("time", 0),
@@ -1339,13 +1342,17 @@ def get_shotmap(eid):
             "goalMouthLocation": s.get("goalMouthLocation", ""),
             "isGoal": s.get("shotType") == "goal",
             "isHome": s.get("isHome", False),
+            "isPenalty": is_penalty,
             "x": s.get("playerCoordinates", {}).get("x"),
             "y": s.get("playerCoordinates", {}).get("y"),
         }
+        # Exclude penalty xG from team totals (penalties are not representative of true xG)
+        xg_for_total = 0 if is_penalty else p["xg"]
+
         if p["isHome"]:
-            hs.append(p); hx += p["xg"]
+            hs.append(p); hx += xg_for_total
         else:
-            aws.append(p); ax += p["xg"]
+            aws.append(p); ax += xg_for_total
 
     hs.sort(key=lambda x: (x["minute"], x["addedTime"]))
     aws.sort(key=lambda x: (x["minute"], x["addedTime"]))
