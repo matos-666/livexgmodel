@@ -2657,6 +2657,39 @@ def r_team_logos():
     return jsonify({"teams": _get_logos(), "count": len(_logos_cache)})
 
 
+@app.route("/api/admin/diag")
+def r_admin_diag():
+    """Diagnose Sofascore connectivity from the server."""
+    import traceback
+    out = {"client": _client_type}
+    try:
+        resp = _session.get(f"{SOFASCORE_API}/sport/football/events/live", timeout=15)
+        out["sofascore_live_status"] = resp.status_code
+        out["sofascore_live_body_sample"] = resp.text[:300]
+        try:
+            data = resp.json()
+            out["sofascore_live_event_count"] = len(data.get("events", []))
+        except Exception:
+            out["sofascore_live_event_count"] = "parse_failed"
+    except Exception as e:
+        out["sofascore_error"] = f"{type(e).__name__}: {e}"
+        out["trace"] = traceback.format_exc()[:500]
+
+    try:
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        resp2 = _session.get(f"{SOFASCORE_API}/sport/football/scheduled-events/{today_str}", timeout=15)
+        out["sofascore_today_status"] = resp2.status_code
+        try:
+            data2 = resp2.json()
+            out["sofascore_today_event_count"] = len(data2.get("events", []))
+        except Exception:
+            out["sofascore_today_event_count"] = "parse_failed"
+    except Exception as e:
+        out["sofascore_today_error"] = f"{type(e).__name__}: {e}"
+
+    return jsonify(out)
+
+
 @app.route("/api/admin/resolve", methods=["GET", "POST"])
 def r_admin_resolve():
     """
