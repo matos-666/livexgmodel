@@ -906,16 +906,55 @@ function teamCircle(name) {
   return `<div class="team-circle" style="background:${bg}">${ini}</div>`;
 }
 
+const LEAGUE_PRIORITY = [
+  'champions league','europa league','conference league',
+  'premier league','la liga','bundesliga','serie a','ligue 1',
+  '2. bundesliga','efl championship',
+  'primeira liga','eredivisie','jupiler','ekstraklasa','super lig','süper lig',
+  'allsvenskan','eliteserien','superligaen','veikkausliiga',
+  'mls','liga mx','brasileirão','serie b',
+  'saudi pro league','roshn saudi league','j1 league','chinese super league',
+  'copa libertadores','copa sudamericana',
+  'nations league','world cup','european championship',
+];
+
+function tournStr(val) {
+  if (!val) return '';
+  if (typeof val === 'string') return val;
+  if (typeof val === 'object') return val.name || '';
+  return String(val);
+}
+function countryStr(val) {
+  if (!val) return '';
+  if (typeof val === 'string') return val;
+  if (typeof val === 'object') return val.name || '';
+  return String(val);
+}
+function leaguePriority(name) {
+  const n = (name || '').toLowerCase();
+  const idx = LEAGUE_PRIORITY.findIndex(k => n.includes(k));
+  return idx === -1 ? 999 : idx;
+}
+
 function renderGrouped(matches, isLive) {
   // Group by tournament
   const groups = {};
   for (const m of matches) {
-    const key = m.tournament || 'Outro';
-    if (!groups[key]) groups[key] = { matches: [], country: m.country, tournament: m.tournament };
+    const tName = tournStr(m.tournament);
+    const cName = countryStr(m.country);
+    const key = tName || 'Outro';
+    if (!groups[key]) groups[key] = { matches: [], country: cName, tournament: tName };
     groups[key].matches.push(m);
   }
 
-  return Object.values(groups).map(g => {
+  // Sort groups by league priority, then alphabetically
+  const sorted = Object.values(groups).sort((a, b) => {
+    const pa = leaguePriority(a.tournament), pb = leaguePriority(b.tournament);
+    if (pa !== pb) return pa - pb;
+    return a.tournament.localeCompare(b.tournament);
+  });
+
+  return sorted.map(g => {
     const flag = countryFlag(g.country);
     const rows = g.matches.map(m => renderMatchRow(m, isLive)).join('');
     return `<div class="league-section">

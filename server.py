@@ -2594,9 +2594,19 @@ def r_today_monitored():
         data = _get(url)
         all_events = data.get("events", []) if data else []
 
+        # Build date range for the requested date (UTC)
+        from datetime import date as _date
+        req_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        day_start = int(req_date.timestamp())
+        day_end   = day_start + 86400
+
         result = []
         for m in all_events:
             if m.get("isFinished") or m.get("isLive"):
+                continue
+            # Only include games that actually start on the requested date
+            ts = m.get("startTimestamp", 0)
+            if ts and not (day_start <= ts < day_end):
                 continue
             # Extract tournament name (could be dict or string)
             tourn = m.get("tournament", {})
