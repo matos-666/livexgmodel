@@ -2055,6 +2055,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                 hm = _re.search(r'([+-][\d.]+)$', p["label"])
                 if hm:
                     team_part = p["label"][:p["label"].rfind(hm.group(0))].strip().lower()
+                    skip_due_to_gap = False
                     for r in existing_hcp_rows:
                         rt = r["label"][:r["label"].rfind(_re.search(r'([+-][\d.]+)$', r["label"]).group(0))].strip().lower() \
                              if _re.search(r'([+-][\d.]+)$', r["label"]) else ""
@@ -2062,16 +2063,25 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                             gap = (minute or 0) - r["minute_entry"]
                             if 0 <= gap < HCP_MIN_GAP_MINUTES:
                                 log.info(f"match {match_id}: skipping HCP '{p['label']}' — same team tipped {gap}' ago")
-                                continue
+                                skip_due_to_gap = True
+                                break
+                    if skip_due_to_gap:
+                        continue
 
-            conn.execute("""
-                INSERT INTO tips (tip_key, match_id, market, label,
-                                  odd_entry, odd_now, edge_entry, minute_entry, wall_ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (key, match_id, p["market"], p["label"],
-                  p["odds"], p["odds"], p.get("edge"), minute, now_ts))
-            existing_keys.add(key)
-            total_tips += 1
+            try:
+                conn.execute("""
+                    INSERT INTO tips (tip_key, match_id, market, label,
+                                      odd_entry, odd_now, edge_entry, minute_entry, wall_ts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (key, match_id, p["market"], p["label"],
+                      p["odds"], p["odds"], p.get("edge"), minute, now_ts))
+                existing_keys.add(key)
+                total_tips += 1
+            except Exception as e:
+                if "UNIQUE constraint failed" in str(e):
+                    log.debug(f"match {match_id}: tip {key} already exists, skipping")
+                else:
+                    raise
             if p["market"] == "HCP":
                 existing_hcp_canonical.add(_hcp_canonical(p["label"]))
                 existing_hcp_rows.append({"label": p["label"], "minute_entry": minute,
