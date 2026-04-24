@@ -2590,10 +2590,9 @@ def r_today_monitored():
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         # Fetch scheduled games for the given date
-        resp = _session.get(f"{SOFASCORE_API}/sport/football/scheduled-events/{date_str}", timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        all_events = data.get("events", [])
+        url = f"{SOFASCORE_API}/sport/football/scheduled-events/{date_str}"
+        data = _get(url)
+        all_events = data.get("events", []) if data else []
 
         result = []
         for m in all_events:
@@ -2606,6 +2605,7 @@ def r_today_monitored():
         result.sort(key=lambda m: m.get("startTimestamp") or 0)
         return jsonify({"count": len(result), "matches": result, "date": date_str})
     except Exception as e:
+        log.error(f"r_today_monitored error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
