@@ -2582,11 +2582,21 @@ def _is_monitored_league_strict(tournament, country):
 
 @app.route("/api/today/monitored")
 def r_today_monitored():
-    """Today\'s scheduled games for monitored leagues only (strict filter)."""
+    """Scheduled games for a given date (default: today) for monitored leagues only."""
     try:
-        all_today = get_scheduled()
+        # Parse optional date parameter (YYYY-MM-DD)
+        date_str = flask_request.args.get("date")
+        if not date_str:
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Fetch scheduled games for the given date
+        resp = _session.get(f"{SOFASCORE_API}/sport/football/scheduled-events/{date_str}", timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        all_events = data.get("events", [])
+
         result = []
-        for m in all_today:
+        for m in all_events:
             if m.get("isFinished") or m.get("isLive"):
                 continue
             if _is_monitored_league_strict(m.get("tournament",""), m.get("country","")):
@@ -2594,7 +2604,7 @@ def r_today_monitored():
                 m["_sport_key"] = sk
                 result.append(m)
         result.sort(key=lambda m: m.get("startTimestamp") or 0)
-        return jsonify({"count": len(result), "matches": result})
+        return jsonify({"count": len(result), "matches": result, "date": date_str})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

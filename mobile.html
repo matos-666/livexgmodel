@@ -478,6 +478,10 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
 
 <!-- TODAY LIST -->
 <div class="view hidden" id="view-today">
+  <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center">
+    <input type="date" id="date-picker" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);color:var(--text);font-family:var(--mono);font-size:13px">
+    <button onclick="loadTodayWithDate()" style="padding:8px 12px;background:var(--green-bg);border:1px solid rgba(74,222,128,.25);color:var(--green);border-radius:6px;font-weight:600;cursor:pointer">↻</button>
+  </div>
   <div class="mlist" id="today-list">
     <div class="loading-row"><div class="spinner"></div>A carregar jogos…</div>
   </div>
@@ -2369,16 +2373,28 @@ const switchTab = switchMainTab;
 
 // ─────────────────────── TODAY TAB ───────────────────────
 async function loadToday() {
+  // Set date picker to today
+  const today = new Date().toISOString().split('T')[0];
+  const dp = document.getElementById('date-picker');
+  if (dp) dp.value = today;
+  await loadTodayWithDate();
+}
+
+async function loadTodayWithDate() {
   const el = document.getElementById('today-list');
+  const dp = document.getElementById('date-picker');
+  const selectedDate = dp?.value || new Date().toISOString().split('T')[0];
+
   el.innerHTML = '<div class="loading-row"><div class="spinner"></div>A carregar jogos…</div>';
-  const { ok, data } = await api('/api/today/monitored');
+  const { ok, data } = await api(`/api/today/monitored?date=${selectedDate}`);
   if (!ok || !data) {
-    el.innerHTML = '<div class="mempty">Não foi possível carregar os jogos de hoje.</div>';
+    el.innerHTML = '<div class="mempty">Não foi possível carregar os jogos.</div>';
     return;
   }
   const matches = data.matches || [];
   if (!matches.length) {
-    el.innerHTML = '<div class="mempty">Sem jogos agendados hoje nas ligas monitorizadas.</div>';
+    const dateStr = new Date(selectedDate).toLocaleDateString('pt-PT', {weekday:'long', year:'numeric', month:'long', day:'numeric'});
+    el.innerHTML = `<div class="mempty">Sem jogos agendados a ${dateStr} nas ligas monitorizadas.</div>`;
     return;
   }
   el.innerHTML = renderGrouped(matches, false);
