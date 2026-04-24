@@ -2661,7 +2661,29 @@ def r_team_logos():
 def r_admin_diag():
     """Diagnose Sofascore connectivity from the server."""
     import traceback
-    out = {"client": _client_type}
+    out = {"client": _client_type, "tried": []}
+
+    # Try curl_cffi directly
+    try:
+        from curl_cffi.requests import Session as CffiSession
+        s = CffiSession(impersonate="chrome")
+        r = s.get(f"{SOFASCORE_API}/sport/football/events/live", timeout=15)
+        out["tried"].append({"curl_cffi": r.status_code, "sample": r.text[:200]})
+    except ImportError:
+        out["tried"].append({"curl_cffi": "NOT_INSTALLED"})
+    except Exception as e:
+        out["tried"].append({"curl_cffi": f"ERROR: {type(e).__name__}: {e}"})
+
+    # Try cloudscraper directly
+    try:
+        import cloudscraper
+        s = cloudscraper.create_scraper(browser={"browser":"chrome","platform":"windows","desktop":True})
+        r = s.get(f"{SOFASCORE_API}/sport/football/events/live", timeout=15)
+        out["tried"].append({"cloudscraper": r.status_code, "sample": r.text[:200]})
+    except ImportError:
+        out["tried"].append({"cloudscraper": "NOT_INSTALLED"})
+    except Exception as e:
+        out["tried"].append({"cloudscraper": f"ERROR: {type(e).__name__}: {e}"})
     try:
         resp = _session.get(f"{SOFASCORE_API}/sport/football/events/live", timeout=15)
         out["sofascore_live_status"] = resp.status_code
