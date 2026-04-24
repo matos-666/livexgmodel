@@ -593,10 +593,11 @@ def _extract_bookmaker_odds(bookmakers, market_key):
     priority = BOOKMAKER_PRIORITY.get(market_key, [])
     now_iso = datetime.now(timezone.utc)
 
+    # Filter out Pinnacle completely from bookmakers list
+    bookmakers_filtered = [bm for bm in bookmakers if bm.get("key", "").lower() != "pinnacle"]
+
     for bookie_key, max_stale in priority:
-        for bm in bookmakers:
-            if bm["key"] == "pinnacle":  # Explicitly exclude Pinnacle
-                continue
+        for bm in bookmakers_filtered:
             if bm["key"] == bookie_key:
                 for mkt in bm.get("markets", []):
                     mkt_key = mkt["key"]
