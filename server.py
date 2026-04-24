@@ -2487,6 +2487,7 @@ _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "paulista", "carioca", "gaúcho", "mineiro", "baiano",  # Brazil state leagues
     "ligapro",                                    # Ecuador
     "usl", "nisa",                                # US non-MLS
+    "frauen",                                     # Women's competitions
 }
 
 def _is_monitored_league_strict(tournament, country):
