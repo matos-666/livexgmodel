@@ -1828,7 +1828,6 @@ MONITORED_SPORT_KEYS = {
     # Americas
     "soccer_usa_mls",
     "soccer_brazil_campeonato", "soccer_brazil_serie_b",
-    "soccer_argentina_primera_division",
     "soccer_chile_campeonato", "soccer_mexico_ligamx",
     "soccer_conmebol_copa_libertadores", "soccer_conmebol_copa_sudamericana",
     "soccer_conmebol_copa_america",
@@ -2525,8 +2524,7 @@ _MONITORED_LEAGUE_STRICT_KEYWORDS = {
     "major league soccer": None,
     "brasileirão": None,
     "campeonato brasileiro": None,
-    "liga profesional": None,
-    "primera división": {"argentina", "chile"},
+    "primera división": {"chile"},
     "copa libertadores": None,
     "conmebol libertadores": None,
     "copa sudamericana": None,
