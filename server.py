@@ -2766,6 +2766,37 @@ def r_admin_diag():
     return jsonify(out)
 
 
+@app.route("/api/admin/live-debug")
+def r_admin_live_debug():
+    """Show all live games from Sofascore and filtering results."""
+    try:
+        live = get_live()
+        result = {"total_live": len(live), "games": []}
+
+        for m in live:
+            tourn   = m.get("tournament", "")
+            country = m.get("country", "")
+            home    = m.get("homeTeam", "")
+            away    = m.get("awayTeam", "")
+            sk      = _resolve_sport_key(tourn, country)
+            is_strict = _is_monitored_league_strict(tourn, country) if sk else False
+            is_in_keys = sk in MONITORED_SPORT_KEYS if sk else False
+
+            result["games"].append({
+                "match": f"{home} vs {away}",
+                "tournament": tourn,
+                "country": country,
+                "sport_key": sk,
+                "in_monitored_keys": is_in_keys,
+                "passes_strict_check": is_strict,
+                "included": is_in_keys and is_strict,
+            })
+
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/admin/resolve", methods=["GET", "POST"])
 def r_admin_resolve():
     """
