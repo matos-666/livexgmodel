@@ -2877,7 +2877,8 @@ def r_state_tips():
         for g in games:
             gd = dict(g)
             tips_rows = conn.execute(
-                "SELECT * FROM tips WHERE match_id = ? ORDER BY wall_ts", (g["id"],)
+                "SELECT * FROM tips WHERE match_id = ? AND (minute_entry IS NULL OR minute_entry <= ?) ORDER BY wall_ts",
+                (g["id"], MAX_MINUTE_FOR_TIPS)
             ).fetchall()
             gd["tips"] = [dict(t) for t in tips_rows]
             result.append(gd)

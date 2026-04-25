@@ -1519,7 +1519,9 @@ function buildAnalysisCard(m, shots, inc, odds) {
 
   // ── Sync tip history — only real picks, not warnings ──
   const realPicks = picks.filter(p => !p.isWarning);
-  const activePicks = (canHavePicks && realPicks.length) ? realPicks : [];
+  // Block picks after 85 minutes to avoid late-game chaos
+  const MAX_MINUTE_FOR_PICKS = 85;
+  const activePicks = (canHavePicks && realPicks.length && minute <= MAX_MINUTE_FOR_PICKS) ? realPicks : [];
   const allTips = syncTips(m.id, activePicks, minute);
   autoResolveTips(m.id, allTips, m, inc);
   maybeArchive(m.id, m, allTips); // archive when game finishes
