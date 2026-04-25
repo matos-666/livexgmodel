@@ -2738,9 +2738,6 @@ _MONITORED_LEAGUE_STRICT_KEYWORDS = {
     "liga bbva": None,
     "campeonato nacional": {"chile"},
     "brasileirão série b": None,
-    # Asia
-    "j1 league": None,
-    "chinese super league": None,
 }
 
 _YOUTH_KEYWORDS = {"u23","u21","u20","u19","u18","u17","u15","youth","reserve","b team"}
@@ -2755,6 +2752,8 @@ _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "frauen", "women", "femminile",               # Women's competitions (German + English + Italian)
     "liga portugal 2",                            # Portuguese 2nd division
     "j1 league",                                  # Japanese J1 (no live xG from Sofascore)
+    "chinese super league",                       # China (no live xG from Sofascore)
+    "damallsvenskan",                             # Swedish women's league (no live xG from Sofascore)
 }
 
 def _is_monitored_league_strict(tournament, country):
