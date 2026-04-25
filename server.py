@@ -2091,6 +2091,9 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                 existing_hcp_canonical.add(_hcp_canonical(p["label"]))
                 existing_hcp_rows.append({"label": p["label"], "minute_entry": minute,
                                           "market": "HCP", "tip_key": key})
+            if p["market"] == "1X2":
+                existing_1x2_rows.append({"label": p["label"], "minute_entry": minute,
+                                          "market": "1X2", "tip_key": key})
             if p["market"].startswith("O/U"):
                 m_ou = _re.match(r'^(Over|Under)\s+([\d.]+)$', p["label"], _re.IGNORECASE)
                 if m_ou:
