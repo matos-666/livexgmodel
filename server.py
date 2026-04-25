@@ -2559,6 +2559,7 @@ _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "usl", "nisa", "next pro",                    # US non-MLS, lower divisions
     "frauen", "women", "femminile",               # Women's competitions (German + English + Italian)
     "liga portugal 2",                            # Portuguese 2nd division
+    "j1 league",                                  # Japanese J1 (no live xG from Sofascore)
 }
 
 def _is_monitored_league_strict(tournament, country):
