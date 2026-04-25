@@ -1403,12 +1403,23 @@ function autoResolveTips(matchId, tips, match, inc) {
 
         // Can settle live if margin > remaining possible goals (conservative: 4 goals/half)
         const maxRemaining = remMin > 45 ? 4 : remMin > 0 ? 2 : 0;
-        if (margin > maxRemaining)       { t.result = 'green'; changed = true; }
-        else if (-margin > maxRemaining) { t.result = 'red';   changed = true; }
+
+        // If home pick: needs adjHome > adjAway. If away pick: needs adjAway > adjHome
+        const winCondition = isHomePick ? margin > maxRemaining : -margin > maxRemaining;
+        const lossCondition = isHomePick ? -margin > maxRemaining : margin > maxRemaining;
+
+        if (winCondition)       { t.result = 'green'; changed = true; }
+        else if (lossCondition) { t.result = 'red';   changed = true; }
         else if (isFinished) {
-          if (margin > 0)      { t.result = 'green'; changed = true; }
-          else if (margin < 0) { t.result = 'red';   changed = true; }
-          else                 { t.result = 'void';  changed = true; } // push
+          if (isHomePick) {
+            if (margin > 0)      { t.result = 'green'; changed = true; }
+            else if (margin < 0) { t.result = 'red';   changed = true; }
+            else                 { t.result = 'void';  changed = true; } // push
+          } else {
+            if (margin < 0)      { t.result = 'green'; changed = true; }
+            else if (margin > 0) { t.result = 'red';   changed = true; }
+            else                 { t.result = 'void';  changed = true; } // push
+          }
         }
       }
     }
