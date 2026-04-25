@@ -2716,6 +2716,26 @@ def r_update_tip_result(match_id):
     return jsonify({"ok": True, "tip_key": tip_key, "result": result})
 
 
+@app.route("/api/state/tips/<int:match_id>/delete", methods=["POST"])
+def r_delete_tip(match_id):
+    """
+    Permanently delete a tip from the DB.
+    Body: {"tip_key": "..."}
+    """
+    body = flask_request.get_json(silent=True) or {}
+    tip_key = body.get("tip_key")
+
+    if not tip_key:
+        return jsonify({"error": "tip_key required"}), 400
+
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM tips WHERE tip_key = ? AND match_id = ?",
+            (tip_key, match_id)
+        )
+    log.info(f"Deleted tip {tip_key} from match {match_id}")
+    return jsonify({"ok": True, "tip_key": tip_key})
+
 
 # ── Team Logos ──
 _LOGOS_SHEET = (

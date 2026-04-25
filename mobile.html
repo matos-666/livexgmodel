@@ -403,6 +403,8 @@ body{font-family:var(--sans);color:var(--text);display:flex;flex-direction:colum
 .sett-tip-res.red{background:rgba(248,113,113,.12);color:var(--red)}
 .sett-tip-res.void{background:rgba(96,165,250,.1);color:var(--blue)}
 .sett-tip-res.pending{background:var(--bg4);color:var(--text3)}
+.sett-tip-del{width:22px;height:22px;border-radius:5px;border:none;background:transparent;color:var(--text3);font-size:13px;display:flex;align-items:center;justify-content:center;flex-shrink:0;cursor:pointer;opacity:0;transition:opacity .2s}
+.sett-tip-row:hover .sett-tip-del,.sett-tip-row:active .sett-tip-del{opacity:1}
 .sett-empty{padding:48px 24px;text-align:center;color:var(--text3);font-size:13px;line-height:1.7}
 .sett-clr-btn{font-size:11px;color:var(--red);background:transparent;border:none;font-family:var(--sans);cursor:pointer;padding:2px 8px}
 
@@ -2335,6 +2337,7 @@ async function renderSettlement() {
         <span class="sett-tip-lbl">${t.label}${t.edgeEntry != null ? `<span class="tip-edge">+${Number(t.edgeEntry).toFixed(1)}%</span>` : ''}</span>
         <span class="sett-tip-odd">@${t.oddEntry ? Number(t.oddEntry).toFixed(2) : '—'}</span>
         <button class="sett-tip-res ${resCls}" onclick="toggleArchiveTip(${g.matchId},'${safeKey}',this)">${resIcon}</button>
+        <button class="sett-tip-del" onclick="deleteTip(${g.matchId},'${safeKey}')" title="Eliminar tip">🗑</button>
       </div>`;
     }).join('');
     return `<div class="sett-game">
@@ -2388,6 +2391,16 @@ async function toggleArchiveTip(matchId, key, btn) {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tip_key: key, result: newRes }),
+  });
+  if (r.ok) renderSettlement();
+}
+
+async function deleteTip(matchId, key) {
+  if (!confirm('Eliminar esta tip do histórico?')) return;
+  const r = await fetch(BASE() + `/api/state/tips/${matchId}/delete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tip_key: key }),
   });
   if (r.ok) renderSettlement();
 }
