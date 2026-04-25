@@ -2156,6 +2156,61 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
 
         total_tips = len(existing_all)
 
+        # ── Pre-filter: keep only best-edge pick per team direction within this cycle ──
+        # Determines if a pick is in favour of home or away team
+        def _pick_direction(p, match):
+            """Returns 'home', 'away', or None."""
+            home = (match.get("homeTeam") or "").lower()
+            away = (match.get("awayTeam") or "").lower()
+            lbl  = (p.get("label") or "").lower()
+            mkt  = p.get("market", "")
+            if mkt == "1X2":
+                # label is team name
+                if home and (home.split()[0] in lbl or lbl in home):
+                    return "home"
+                if away and (away.split()[0] in lbl or lbl in away):
+                    return "away"
+                return "draw" if "empate" in lbl else None
+            if mkt == "HCP":
+                hm = _re.search(r'([+-][\d.]+)$', p["label"])
+                if not hm:
+                    return None
+                team_lbl = p["label"][:p["label"].rfind(hm.group(0))].strip().lower()
+                if home and (home.split()[0] in team_lbl or team_lbl in home):
+                    return "home"
+                if away and (away.split()[0] in team_lbl or team_lbl in away):
+                    return "away"
+            return None
+
+        # Within this cycle: for each direction keep only the pick with highest edge
+        if match:
+            dir_best: dict = {}  # direction → best pick so far
+            for p in picks:
+                d = _pick_direction(p, match)
+                if d is None:
+                    continue
+                cur = dir_best.get(d)
+                if cur is None or (p.get("edge") or 0) > (cur.get("edge") or 0):
+                    dir_best[d] = p
+            # Rebuild picks: only best per direction + picks with no direction (e.g. O/U)
+            picks_with_dir  = {id(p) for p in dir_best.values()}
+            picks_no_dir    = [p for p in picks if _pick_direction(p, match) is None]
+            picks           = list(dir_best.values()) + picks_no_dir
+
+        # ── Block: if a pick in the same direction already exists since the last goal, skip whole cycle ──
+        phase_cutoff_global = (last_goal_minute or 0)
+        if match:
+            active_directions = set()
+            for r in existing_all:
+                if (r["minute_entry"] or 0) >= phase_cutoff_global:
+                    fake = {"market": r["market"], "label": r["label"], "edge": 0}
+                    d = _pick_direction(fake, match)
+                    if d and d != "draw":
+                        active_directions.add(d)
+            # Remove picks whose direction is already active (same phase, no goal)
+            picks = [p for p in picks if _pick_direction(p, match) not in active_directions
+                     or p.get("market", "").startswith("O/U")]
+
         for p in picks:
             key = f"{p['market']}|{p['label']}"
 
