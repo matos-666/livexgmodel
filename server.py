@@ -2809,6 +2809,8 @@ _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "j1 league",                                  # Japanese J1 (no live xG from Sofascore)
     "chinese super league",                       # China (no live xG from Sofascore)
     "damallsvenskan",                             # Swedish women's league (no live xG from Sofascore)
+    "northern premier",                           # English amateur pyramid (all divisions)
+    "amateur",                                    # Any amateur competition
 }
 
 def _is_monitored_league_strict(tournament, country):
