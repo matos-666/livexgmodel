@@ -50,7 +50,7 @@ _session = None
 #  THE ODDS API — Configuration
 # ════════════════════════════════════════════════════════════
 
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "85e4f12b9d76a7bb0464eeb802f6f388")
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "52e6d0bb0daaa9934550b4dc72614f0e")
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 # Sofascore tournament name → The Odds API sport key mapping
