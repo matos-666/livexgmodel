@@ -129,6 +129,8 @@ def _format_pick_alert(match: dict, pick: dict, minute) -> str:
     away        = match.get("awayTeam", "Fora")
     hg          = match.get("homeGoals", 0)
     ag          = match.get("awayGoals", 0)
+    home_xg     = match.get("homeXg", 0)
+    away_xg     = match.get("awayXg", 0)
     market      = pick.get("market", "")
     label       = pick.get("label", "")
     odds        = pick.get("odds") or 0
@@ -144,6 +146,7 @@ def _format_pick_alert(match: dict, pick: dict, minute) -> str:
         f"\n"
         f"{flag} <b>{tournament}</b>\n"
         f"⚽ {home} {hg}–{ag} {away}\n"
+        f"📊 xG: <b>{home_xg:.2f}</b> — <b>{away_xg:.2f}</b>\n"
         f"⏱ {minute}' em jogo\n"
         f"\n"
         f"{mkt_icon} Mercado: <b>{market} → {label}</b>\n"
