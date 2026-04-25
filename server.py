@@ -53,6 +53,146 @@ _session = None
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "52e6d0bb0daaa9934550b4dc72614f0e")
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
+# ════════════════════════════════════════════════════════════
+#  TELEGRAM BOT
+# ════════════════════════════════════════════════════════════
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")  # comma-separated chat IDs
+
+_COUNTRY_FLAGS = {
+    "england": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "spain": "🇪🇸", "italy": "🇮🇹", "germany": "🇩🇪",
+    "france": "🇫🇷", "portugal": "🇵🇹", "netherlands": "🇳🇱", "belgium": "🇧🇪",
+    "turkey": "🇹🇷", "scotland": "🏴󠁧󠁢󠁳󠁣󠁴󠁿", "austria": "🇦🇹", "switzerland": "🇨🇭",
+    "russia": "🇷🇺", "ukraine": "🇺🇦", "greece": "🇬🇷", "poland": "🇵🇱",
+    "czech republic": "🇨🇿", "denmark": "🇩🇰", "sweden": "🇸🇪", "norway": "🇳🇴",
+    "usa": "🇺🇸", "brazil": "🇧🇷", "argentina": "🇦🇷", "mexico": "🇲🇽",
+    "colombia": "🇨🇴", "chile": "🇨🇱", "japan": "🇯🇵", "south korea": "🇰🇷",
+    "australia": "🇦🇺", "china": "🇨🇳", "international": "🌍",
+}
+
+def _country_flag(country: str) -> str:
+    if not country:
+        return "⚽"
+    return _COUNTRY_FLAGS.get(country.lower(), "⚽")
+
+def _tg_chat_ids() -> list:
+    if not TELEGRAM_CHAT_ID:
+        return []
+    return [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
+
+def _send_telegram(text: str, chat_id=None):
+    """Send a message via Telegram Bot API."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    ids = [str(chat_id)] if chat_id else _tg_chat_ids()
+    for cid in ids:
+        try:
+            import urllib.request as _urllib
+            import urllib.parse as _urlparse
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = json.dumps({
+                "chat_id": cid,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }).encode()
+            req = _urllib.Request(url, data=payload,
+                                  headers={"Content-Type": "application/json"})
+            _urllib.urlopen(req, timeout=10)
+        except Exception as e:
+            log.error(f"Telegram send failed to {cid}: {e}")
+
+def _format_pick_alert(match: dict, pick: dict, minute) -> str:
+    """Build the Telegram message for a new pick."""
+    flag        = _country_flag(match.get("country", ""))
+    tournament  = match.get("tournament", "")
+    home        = match.get("homeTeam", "Casa")
+    away        = match.get("awayTeam", "Fora")
+    hg          = match.get("homeGoals", 0)
+    ag          = match.get("awayGoals", 0)
+    market      = pick.get("market", "")
+    label       = pick.get("label", "")
+    odds        = pick.get("odds") or 0
+    edge        = pick.get("edge") or 0
+    model_p     = (pick.get("model") or 0) * 100
+    blend_p     = (pick.get("blend") or 0) * 100
+
+    market_icons = {"1X2": "🎯", "HCP": "⚖️"}
+    mkt_icon = market_icons.get(market, "📊")
+
+    return (
+        f"🔔 <b>NOVA PICK</b>\n"
+        f"\n"
+        f"{flag} <b>{tournament}</b>\n"
+        f"⚽ {home} {hg}–{ag} {away}\n"
+        f"⏱ {minute}' em jogo\n"
+        f"\n"
+        f"{mkt_icon} Mercado: <b>{market} → {label}</b>\n"
+        f"💰 Odds: <b>{odds:.2f}</b>\n"
+        f"\n"
+        f"📊 Modelo: <b>{model_p:.0f}%</b> | Mercado: <b>{blend_p:.0f}%</b>\n"
+        f"📈 Edge: <b>+{edge:.1f}%</b>"
+    )
+
+_TG_WELCOME = (
+    "👋 <b>Bem-vindo ao xG Live Bot</b>\n"
+    "\n"
+    "Este bot envia-te em tempo real as picks geradas pelo nosso algoritmo de <b>value betting</b> baseado em <b>Expected Goals (xG)</b>.\n"
+    "\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "📐 <b>Como funciona?</b>\n"
+    "Enquanto o jogo decorre, o modelo analisa continuamente:\n"
+    "• O xG acumulado de cada equipa (via Sofascore)\n"
+    "• As odds ao vivo das casas de apostas\n"
+    "• A probabilidade blended pelo modelo Benter\n"
+    "\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "📌 <b>Porque temos vantagem?</b>\n"
+    "As casas de apostas são lentas a ajustar as odds ao fluxo real do jogo. "
+    "O nosso modelo deteta quando a probabilidade calculada pelos xG diverge significativamente das odds do mercado. "
+    "Essa diferença é o <b>edge</b> — e é onde está o valor.\n"
+    "\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "✅ <b>Filtros de qualidade</b>\n"
+    "Só receberes picks quando:\n"
+    "• ⏱ Jogo com mais de 25 minutos\n"
+    "• 🚫 Sem golo nos últimos 4 minutos\n"
+    "• 📈 Edge positivo e significativo\n"
+    "• 💰 Odds entre 1.40 e 4.00\n"
+    "\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "Cada pick indica o mercado, as odds, a probabilidade do modelo vs. mercado e o edge em %.\n"
+    "\n"
+    "Boa sorte 🎯"
+)
+
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    """Handle incoming Telegram messages."""
+    data    = flask_request.get_json(silent=True) or {}
+    msg     = data.get("message") or data.get("edited_message") or {}
+    text    = (msg.get("text") or "").strip()
+    chat_id = (msg.get("chat") or {}).get("id")
+
+    if not chat_id:
+        return "", 200
+
+    log.info(f"Telegram message from chat_id={chat_id}: {text[:60]}")
+
+    if text.startswith("/start"):
+        _send_telegram(_TG_WELCOME, chat_id=chat_id)
+    elif text.startswith("/chatid"):
+        _send_telegram(f"O teu Chat ID é: <code>{chat_id}</code>\n\nDefine a variável de ambiente <code>TELEGRAM_CHAT_ID={chat_id}</code> no Fly.io para receber as picks.", chat_id=chat_id)
+    elif text.startswith("/status"):
+        ids = _tg_chat_ids()
+        if str(chat_id) in ids:
+            _send_telegram("✅ Estás registado para receber picks em tempo real.", chat_id=chat_id)
+        else:
+            _send_telegram(f"⚠️ Não estás registado.\nO teu Chat ID: <code>{chat_id}</code>", chat_id=chat_id)
+
+    return "", 200
+
 # Sofascore tournament name → The Odds API sport key mapping
 TOURNAMENT_TO_SPORT_KEY = {
     # England
@@ -1937,7 +2077,7 @@ def _hcp_canonical(label: str) -> str:
     return f"{team}|{val_str}"
 
 def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
-                  last_goal_minute=None) -> list:
+                  last_goal_minute=None, match: dict = None) -> list:
     """
     Sync server-computed picks into the DB.
     Returns the full tip list for this match (including historical).
@@ -2082,6 +2222,12 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                       p["odds"], p["odds"], p.get("edge"), minute, now_ts))
                 existing_keys.add(key)
                 total_tips += 1
+                # Telegram notification for new tip
+                if match:
+                    try:
+                        _send_telegram(_format_pick_alert(match, p, minute))
+                    except Exception as tg_err:
+                        log.error(f"Telegram alert failed: {tg_err}")
             except Exception as e:
                 if "UNIQUE constraint failed" in str(e):
                     log.debug(f"match {match_id}: tip {key} already exists, skipping")
@@ -2292,7 +2438,7 @@ def _run_background_cycle():
             minute = m.get("minute")  # None if not available
             picks  = _extract_picks_from_odds(odds, m) if odds else []
             last_goal_minute = incidents.get("lastGoalMinute") if incidents else None
-            tips   = _sync_tips_db(mid, picks, minute, odds or {}, last_goal_minute)
+            tips   = _sync_tips_db(mid, picks, minute, odds or {}, last_goal_minute, match=m)
             _auto_resolve_db(mid, m, incidents)
 
             # Re-read tips after resolution
