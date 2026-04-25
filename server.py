@@ -678,7 +678,7 @@ def get_odds_for_sport(sport_key, force=False, api_key=None):
 
     with _odds_cache_lock:
         cached = _odds_cache.get(cache_key)
-        if cached and not force and (now - cached["ts"]) < ODDS_CACHE_TTL:
+        if cached and not force and (now - cached["ts"]) <= ODDS_CACHE_TTL:
             log.info(f"Odds cache HIT for {cache_key} ({now - cached['ts']:.0f}s old)")
             return cached["data"]
 
