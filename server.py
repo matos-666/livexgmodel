@@ -674,7 +674,10 @@ def _get_odds_api(url, params=None, api_key=None):
 
 def get_odds_for_sport(sport_key, force=False, api_key=None):
     now = time.time()
-    cache_key = f"{sport_key}:{api_key or 'default'}"
+    # Normalize cache key by effective API key (resolved), so background cycle
+    # and frontend requests using the same key share the same cache entry.
+    effective_key = api_key or ODDS_API_KEY or "default"
+    cache_key = f"{sport_key}:{effective_key}"
 
     with _odds_cache_lock:
         cached = _odds_cache.get(cache_key)
@@ -2806,6 +2809,7 @@ _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "usl", "nisa", "next pro",                    # US non-MLS, lower divisions
     "frauen", "women", "femminile",               # Women's competitions (German + English + Italian)
     "liga portugal 2",                            # Portuguese 2nd division
+    "laliga 2", "la liga 2",                      # Spanish 2nd division (no live xG from Sofascore)
     "j1 league",                                  # Japanese J1 (no live xG from Sofascore)
     "chinese super league",                       # China (no live xG from Sofascore)
     "damallsvenskan",                             # Swedish women's league (no live xG from Sofascore)
