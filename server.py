@@ -121,7 +121,7 @@ def _send_telegram(text: str, chat_id=None):
         except Exception as e:
             log.error(f"Telegram send failed to {cid}: {e}")
 
-def _format_pick_alert(match: dict, pick: dict, minute) -> str:
+def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> str:
     """Build the Telegram message for a new pick."""
     flag        = _country_flag(match.get("country", ""))
     tournament  = match.get("tournament", "")
@@ -129,8 +129,8 @@ def _format_pick_alert(match: dict, pick: dict, minute) -> str:
     away        = match.get("awayTeam", "Fora")
     hg          = match.get("homeGoals", 0)
     ag          = match.get("awayGoals", 0)
-    home_xg     = match.get("homeXg", 0)
-    away_xg     = match.get("awayXg", 0)
+    home_xg     = (shots or {}).get("homeXg", 0)
+    away_xg     = (shots or {}).get("awayXg", 0)
     market      = pick.get("market", "")
     label       = pick.get("label", "")
     odds        = pick.get("odds") or 0
@@ -2115,7 +2115,7 @@ def _hcp_canonical(label: str) -> str:
     return f"{team}|{val_str}"
 
 def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
-                  last_goal_minute=None, match: dict = None) -> list:
+                  last_goal_minute=None, match: dict = None, shots: dict = None) -> list:
     """
     Sync server-computed picks into the DB.
     Returns the full tip list for this match (including historical).
@@ -2268,7 +2268,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                 # Telegram notification for new tip
                 if match:
                     try:
-                        _send_telegram(_format_pick_alert(match, p, minute))
+                        _send_telegram(_format_pick_alert(match, p, minute, shots=shots))
                     except Exception as tg_err:
                         log.error(f"Telegram alert failed: {tg_err}")
             except Exception as e:
@@ -2487,7 +2487,7 @@ def _run_background_cycle():
             minute = m.get("minute")  # None if not available
             picks  = _extract_picks_from_odds(odds, m) if odds else []
             last_goal_minute = incidents.get("lastGoalMinute") if incidents else None
-            tips   = _sync_tips_db(mid, picks, minute, odds or {}, last_goal_minute, match=m)
+            tips   = _sync_tips_db(mid, picks, minute, odds or {}, last_goal_minute, match=m, shots=shots)
             _auto_resolve_db(mid, m, incidents)
 
             # Re-read tips after resolution
