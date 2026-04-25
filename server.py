@@ -2543,7 +2543,14 @@ def _run_background_cycle():
 
             # Extract picks + sync to DB
             minute = m.get("minute")  # None if not available
-            picks  = _extract_picks_from_odds(odds, m) if odds else []
+            # Suppress new picks when there's a red card — superioridade numérica
+            # invalida o modelo (regra também mostrada na UI).
+            red_cards = incidents.get("redCards", 0) if incidents else 0
+            if red_cards > 0:
+                picks = []
+                log.info(f"BG: Skipping picks for match {mid} — {red_cards} red card(s) invalidate model")
+            else:
+                picks = _extract_picks_from_odds(odds, m) if odds else []
             last_goal_minute = incidents.get("lastGoalMinute") if incidents else None
             tips   = _sync_tips_db(mid, picks, minute, odds or {}, last_goal_minute, match=m, shots=shots)
             _auto_resolve_db(mid, m, incidents)
