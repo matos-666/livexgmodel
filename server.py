@@ -2126,6 +2126,30 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
     import re as _re
     now_ts = int(time.time())
 
+    # ── DIAGNOSTIC LOGGING ──
+    # Track per-pick decisions so we can later understand why client-visible
+    # picks (localStorage) sometimes never make it into the server DB.
+    _decision_log = []   # list of (label, "ACCEPTED"|reason)
+    _tag_summary = "TIP-SYNC"
+    _home = (match.get("homeTeam") if match else "") or ""
+    _away = (match.get("awayTeam") if match else "") or ""
+    _match_label = f"{_home} vs {_away}".strip(" vs")
+    if picks:
+        log.info(
+            f"[{_tag_summary}] match {match_id} ({_match_label}) "
+            f"min={minute} lastGoal={last_goal_minute} "
+            f"received {len(picks)} candidate pick(s): "
+            + ", ".join(f"{p.get('market','?')}|{p.get('label','?')}@{p.get('odds','?')}/edge={p.get('edge','?')}" for p in picks)
+        )
+
+    def _reject(p, reason):
+        _decision_log.append((f"{p.get('market','?')}|{p.get('label','?')}", reason))
+        log.info(f"[{_tag_summary}] match {match_id} REJECT {p.get('market','?')}|{p.get('label','?')} — {reason}")
+
+    def _accept(p):
+        _decision_log.append((f"{p.get('market','?')}|{p.get('label','?')}", "ACCEPTED"))
+        log.info(f"[{_tag_summary}] match {match_id} ACCEPT {p.get('market','?')}|{p.get('label','?')} @ {p.get('odds','?')} (edge={p.get('edge','?')})")
+
     # Goal cooldown: suppress NEW tip insertions within GOAL_COOLDOWN_MINUTES of a goal
     in_cooldown = (
         last_goal_minute is not None
@@ -2135,7 +2159,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
         and (minute - last_goal_minute) < GOAL_COOLDOWN_MINUTES
     )
     if in_cooldown:
-        log.info(f"match {match_id}: goal cooldown active (goal@{last_goal_minute}', now@{minute}') — skipping new tips")
+        log.info(f"[{_tag_summary}] match {match_id}: goal cooldown active (goal@{last_goal_minute}', now@{minute}') — new picks will be blocked")
 
     with _db() as conn:
         # Pre-load all existing tips for this game
@@ -2198,7 +2222,14 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
             # Rebuild picks: only best per direction + picks with no direction (e.g. O/U)
             picks_with_dir  = {id(p) for p in dir_best.values()}
             picks_no_dir    = [p for p in picks if _pick_direction(p, match) is None]
-            picks           = list(dir_best.values()) + picks_no_dir
+            new_picks       = list(dir_best.values()) + picks_no_dir
+            # DIAG: log picks dropped by direction-best filter
+            kept_ids = {id(p) for p in new_picks}
+            for p in picks:
+                if id(p) not in kept_ids:
+                    d = _pick_direction(p, match)
+                    _reject(p, f"dropped by dir-best filter (direction={d}, lower edge than best in same direction)")
+            picks = new_picks
 
         # ── Block: if a pick in the same direction already exists since the last goal, skip whole cycle ──
         phase_cutoff_global = (last_goal_minute or 0)
@@ -2211,8 +2242,15 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     if d and d != "draw":
                         active_directions.add(d)
             # Remove picks whose direction is already active (same phase, no goal)
-            picks = [p for p in picks if _pick_direction(p, match) not in active_directions
-                     or p.get("market", "").startswith("O/U")]
+            new_picks = [p for p in picks if _pick_direction(p, match) not in active_directions
+                         or p.get("market", "").startswith("O/U")]
+            # DIAG: log picks dropped by active-directions filter
+            kept_ids = {id(p) for p in new_picks}
+            for p in picks:
+                if id(p) not in kept_ids:
+                    d = _pick_direction(p, match)
+                    _reject(p, f"direction '{d}' already has tip in current phase (cutoff={phase_cutoff_global}')")
+            picks = new_picks
 
         for p in picks:
             key = f"{p['market']}|{p['label']}"
@@ -2229,21 +2267,22 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
 
             # Hard cap
             if total_tips >= MAX_TIPS_PER_GAME:
-                log.info(f"match {match_id}: tip cap ({MAX_TIPS_PER_GAME}) reached, skipping '{p['label']}'")
+                _reject(p, f"tip cap reached ({total_tips} >= MAX_TIPS_PER_GAME={MAX_TIPS_PER_GAME})")
                 continue
 
             # Goal cooldown
             if in_cooldown:
+                _reject(p, f"goal cooldown (goal@{last_goal_minute}', now@{minute}', window={GOAL_COOLDOWN_MINUTES}')")
                 continue
 
             # Minimum minute threshold
             if minute is not None and minute < MIN_MINUTE_FOR_TIPS:
-                log.info(f"match {match_id}: skipping '{p['label']}' — below minimum minute ({minute} < {MIN_MINUTE_FOR_TIPS})")
+                _reject(p, f"below MIN_MINUTE_FOR_TIPS (minute={minute} < {MIN_MINUTE_FOR_TIPS})")
                 continue
 
             # Maximum minute threshold (avoid late-game chaos)
             if minute is not None and minute > MAX_MINUTE_FOR_TIPS:
-                log.info(f"match {match_id}: skipping '{p['label']}' — beyond maximum minute ({minute} > {MAX_MINUTE_FOR_TIPS})")
+                _reject(p, f"above MAX_MINUTE_FOR_TIPS (minute={minute} > {MAX_MINUTE_FOR_TIPS})")
                 continue
 
             # O/U conflict: block opposite direction on same line
@@ -2254,7 +2293,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     line      = m_ou.group(2)
                     opposite  = "under" if direction == "over" else "over"
                     if opposite in existing_ou.get(line, set()):
-                        log.info(f"match {match_id}: skipping {p['label']} — opposite direction already stored for line {line}")
+                        _reject(p, f"O/U opposite direction already stored (line {line}, existing={opposite})")
                         continue
 
             # 1X2 ↔ HCP conflict: same team, same phase (no goal between them)
@@ -2263,38 +2302,25 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                 hm_new = _re.search(r'([+-][\d.]+)$', p["label"])
                 if hm_new:
                     team_part = p["label"][:p["label"].rfind(hm_new.group(0))].strip().lower()
-                    for r in existing_1x2_rows:
-                        if r["label"].strip().lower() == team_part and (r["minute_entry"] or 0) >= phase_cutoff:
-                            log.info(f"match {match_id}: skipping HCP '{p['label']}' — 1X2 for same team already in this phase")
-                            break
-                    else:
-                        pass  # no conflict, continue below
                     if any(r["label"].strip().lower() == team_part and (r["minute_entry"] or 0) >= phase_cutoff for r in existing_1x2_rows):
+                        _reject(p, f"HCP↔1X2 conflict: 1X2 for '{team_part}' already in this phase (cutoff={phase_cutoff}')")
                         continue
             if p["market"] == "1X2":
                 team_part_1x2 = p["label"].strip().lower()
-                for r in existing_hcp_rows:
-                    hm_ex = _re.search(r'([+-][\d.]+)$', r["label"])
-                    if hm_ex:
-                        rt = r["label"][:r["label"].rfind(hm_ex.group(0))].strip().lower()
-                        if rt == team_part_1x2 and (r["minute_entry"] or 0) >= phase_cutoff:
-                            log.info(f"match {match_id}: skipping 1X2 '{p['label']}' — HCP for same team already in this phase")
-                            break
-                else:
-                    pass
                 if any(
                     (_re.search(r'([+-][\d.]+)$', r["label"]) and
                      r["label"][:r["label"].rfind(_re.search(r'([+-][\d.]+)$', r["label"]).group(0))].strip().lower() == team_part_1x2 and
                      (r["minute_entry"] or 0) >= phase_cutoff)
                     for r in existing_hcp_rows
                 ):
+                    _reject(p, f"1X2↔HCP conflict: HCP for '{team_part_1x2}' already in this phase (cutoff={phase_cutoff}')")
                     continue
 
             # HCP dedup: same canonical value already stored
             if p["market"] == "HCP":
                 canon = _hcp_canonical(p["label"])
                 if canon in existing_hcp_canonical:
-                    log.info(f"match {match_id}: skipping duplicate HCP '{p['label']}'")
+                    _reject(p, f"duplicate HCP (canonical='{canon}' already stored)")
                     continue
 
                 # HCP gap: same team, less than HCP_MIN_GAP_MINUTES ago
@@ -2308,7 +2334,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                         if rt == team_part and r["minute_entry"] is not None:
                             gap = (minute or 0) - r["minute_entry"]
                             if 0 <= gap < HCP_MIN_GAP_MINUTES:
-                                log.info(f"match {match_id}: skipping HCP '{p['label']}' — same team tipped {gap}' ago")
+                                _reject(p, f"HCP gap too small (same team '{team_part}' tipped {gap}' ago, min={HCP_MIN_GAP_MINUTES}')")
                                 skip_due_to_gap = True
                                 break
                     if skip_due_to_gap:
@@ -2323,6 +2349,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                       p["odds"], p["odds"], p.get("edge"), minute, now_ts))
                 existing_keys.add(key)
                 total_tips += 1
+                _accept(p)
                 # Telegram notification for new tip
                 if match:
                     try:
@@ -2345,6 +2372,18 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                 m_ou = _re.match(r'^(Over|Under)\s+([\d.]+)$', p["label"], _re.IGNORECASE)
                 if m_ou:
                     existing_ou.setdefault(m_ou.group(2), set()).add(m_ou.group(1).lower())
+
+        # DIAG: summary line per cycle (only when there were candidates)
+        if _decision_log:
+            from collections import Counter
+            counts = Counter(reason for _, reason in _decision_log)
+            accepted = counts.pop("ACCEPTED", 0)
+            rej_summary = "; ".join(f"{n}× {r}" for r, n in counts.most_common())
+            log.info(
+                f"[{_tag_summary}] match {match_id} ({_match_label}) SUMMARY: "
+                f"{accepted} accepted, {sum(counts.values())} rejected"
+                + (f" — {rej_summary}" if rej_summary else "")
+            )
 
         # Auto-resolve based on current state
         all_tips = conn.execute(
