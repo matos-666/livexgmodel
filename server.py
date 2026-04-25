@@ -58,7 +58,6 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 # ════════════════════════════════════════════════════════════
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")  # comma-separated chat IDs
 
 _COUNTRY_FLAGS = {
     "england": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "spain": "🇪🇸", "italy": "🇮🇹", "germany": "🇩🇪",
@@ -76,20 +75,39 @@ def _country_flag(country: str) -> str:
         return "⚽"
     return _COUNTRY_FLAGS.get(country.lower(), "⚽")
 
-def _tg_chat_ids() -> list:
-    if not TELEGRAM_CHAT_ID:
+def _tg_subscribers() -> list:
+    """Return all active subscriber chat_ids from DB."""
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT chat_id FROM tg_subscribers WHERE active = 1"
+            ).fetchall()
+            return [str(r["chat_id"]) for r in rows]
+    except Exception:
         return []
-    return [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
+
+def _tg_subscribe(chat_id: int, username: str = None, first_name: str = None):
+    with _db() as conn:
+        conn.execute("""
+            INSERT INTO tg_subscribers (chat_id, username, first_name, subscribed_at, active)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(chat_id) DO UPDATE SET active = 1, subscribed_at = excluded.subscribed_at
+        """, (chat_id, username, first_name, int(time.time())))
+
+def _tg_unsubscribe(chat_id: int):
+    with _db() as conn:
+        conn.execute(
+            "UPDATE tg_subscribers SET active = 0 WHERE chat_id = ?", (chat_id,)
+        )
 
 def _send_telegram(text: str, chat_id=None):
-    """Send a message via Telegram Bot API."""
+    """Send a message via Telegram Bot API. If chat_id is None, sends to all subscribers."""
     if not TELEGRAM_BOT_TOKEN:
         return
-    ids = [str(chat_id)] if chat_id else _tg_chat_ids()
+    import urllib.request as _urllib
+    ids = [str(chat_id)] if chat_id else _tg_subscribers()
     for cid in ids:
         try:
-            import urllib.request as _urllib
-            import urllib.parse as _urlparse
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             payload = json.dumps({
                 "chat_id": cid,
@@ -138,7 +156,7 @@ def _format_pick_alert(match: dict, pick: dict, minute) -> str:
 _TG_WELCOME = (
     "👋 <b>Bem-vindo ao xG Live Bot</b>\n"
     "\n"
-    "Este bot envia-te em tempo real as picks geradas pelo nosso algoritmo de <b>value betting</b> baseado em <b>Expected Goals (xG)</b>.\n"
+    "Ficaste inscrito e vais receber em tempo real as picks geradas pelo nosso algoritmo de <b>value betting</b> baseado em <b>Expected Goals (xG)</b>.\n"
     "\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "📐 <b>Como funciona?</b>\n"
@@ -162,7 +180,7 @@ _TG_WELCOME = (
     "• 💰 Odds entre 1.40 e 4.00\n"
     "\n"
     "━━━━━━━━━━━━━━━━━━\n"
-    "Cada pick indica o mercado, as odds, a probabilidade do modelo vs. mercado e o edge em %.\n"
+    "Para cancelar as notificações envia /stop\n"
     "\n"
     "Boa sorte 🎯"
 )
@@ -170,26 +188,35 @@ _TG_WELCOME = (
 @app.route("/telegram/webhook", methods=["POST"])
 def telegram_webhook():
     """Handle incoming Telegram messages."""
-    data    = flask_request.get_json(silent=True) or {}
-    msg     = data.get("message") or data.get("edited_message") or {}
-    text    = (msg.get("text") or "").strip()
-    chat_id = (msg.get("chat") or {}).get("id")
+    data       = flask_request.get_json(silent=True) or {}
+    msg        = data.get("message") or data.get("edited_message") or {}
+    text       = (msg.get("text") or "").strip()
+    chat_id    = (msg.get("chat") or {}).get("id")
+    username   = (msg.get("from") or {}).get("username")
+    first_name = (msg.get("from") or {}).get("first_name")
 
     if not chat_id:
         return "", 200
 
-    log.info(f"Telegram message from chat_id={chat_id}: {text[:60]}")
+    log.info(f"Telegram: chat_id={chat_id} username={username}: {text[:60]}")
 
     if text.startswith("/start"):
+        _tg_subscribe(chat_id, username=username, first_name=first_name)
         _send_telegram(_TG_WELCOME, chat_id=chat_id)
-    elif text.startswith("/chatid"):
-        _send_telegram(f"O teu Chat ID é: <code>{chat_id}</code>\n\nDefine a variável de ambiente <code>TELEGRAM_CHAT_ID={chat_id}</code> no Fly.io para receber as picks.", chat_id=chat_id)
+
+    elif text.startswith("/stop"):
+        _tg_unsubscribe(chat_id)
+        _send_telegram(
+            "🔕 Notificações canceladas.\nPara voltar a receber picks envia /start.",
+            chat_id=chat_id
+        )
+
     elif text.startswith("/status"):
-        ids = _tg_chat_ids()
-        if str(chat_id) in ids:
-            _send_telegram("✅ Estás registado para receber picks em tempo real.", chat_id=chat_id)
+        subs = _tg_subscribers()
+        if str(chat_id) in subs:
+            _send_telegram("✅ Estás inscrito e a receber picks em tempo real.", chat_id=chat_id)
         else:
-            _send_telegram(f"⚠️ Não estás registado.\nO teu Chat ID: <code>{chat_id}</code>", chat_id=chat_id)
+            _send_telegram("⚠️ Não estás inscrito. Envia /start para receber picks.", chat_id=chat_id)
 
     return "", 200
 
@@ -2026,6 +2053,13 @@ def _init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id);
         CREATE INDEX IF NOT EXISTS idx_games_finished ON games(is_finished);
+        CREATE TABLE IF NOT EXISTS tg_subscribers (
+            chat_id       INTEGER PRIMARY KEY,
+            username      TEXT,
+            first_name    TEXT,
+            subscribed_at INTEGER NOT NULL,
+            active        INTEGER DEFAULT 1
+        );
         """)
     # Migration: add edge_entry column to existing DBs
     with _db() as conn:
