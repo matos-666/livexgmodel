@@ -1315,20 +1315,30 @@ function clearTips(matchId) {
 }
 
 // Called on every renderDetail — detects new tips and updates existing ones
+function normalizeHcpLabel(market, label) {
+  // Normalise HCP labels so -2.0 and -2 are treated as the same pick
+  if (market !== 'HCP') return label;
+  return label.replace(/([-+][\d.]+)\s*$/, (_, pt) => {
+    const n = parseFloat(pt);
+    return (n >= 0 ? '+' : '') + (n === Math.trunc(n) ? String(Math.trunc(n)) : String(n));
+  });
+}
+
 function syncTips(matchId, picks, minute) {
   if (!picks || !picks.length) return getTips(matchId);
   const existing = getTips(matchId);
   let changed = false;
 
   for (const p of picks) {
-    const key = p.market + '|' + p.label;
+    const normLabel = normalizeHcpLabel(p.market, p.label);
+    const key = p.market + '|' + normLabel;
     const found = existing.find(t => t.key === key);
     if (!found) {
       // First time this tip appears — record it
       existing.push({
         key,
         market: p.market,
-        label: p.label,
+        label: normLabel,
         oddEntry: p.odds,
         oddNow: p.odds,
         edgeEntry: p.edge ?? null,

@@ -2401,8 +2401,14 @@ def _extract_picks_from_odds(odds: dict, match: dict) -> list:
     # Spreads
     bs = benter.get("spreads")
     if bs and bs.get("outcomes"):
-        hpt_h = (("+" if (bs.get("homePoint") or 0) >= 0 else "") + str(bs.get("homePoint", ""))) if bs.get("homePoint") is not None else ""
-        hpt_a = (("+" if (bs.get("awayPoint") or 0) >= 0 else "") + str(bs.get("awayPoint", ""))) if bs.get("awayPoint") is not None else ""
+        def _fmt_hcp_pt(pt):
+            """Normalise HCP point: strip trailing .0 (e.g. -2.0 → -2, +0.25 → +0.25)."""
+            if pt is None:
+                return ""
+            sign = "+" if pt >= 0 else ""
+            return sign + (str(int(pt)) if pt == int(pt) else str(pt))
+        hpt_h = _fmt_hcp_pt(bs.get("homePoint"))
+        hpt_a = _fmt_hcp_pt(bs.get("awayPoint"))
         sp_lbl = {
             "home": f"{match.get('homeTeam','Casa')} {hpt_h}".strip(),
             "away": f"{match.get('awayTeam','Fora')} {hpt_a}".strip(),
