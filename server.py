@@ -2161,7 +2161,12 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
     if in_cooldown:
         log.info(f"[{_tag_summary}] match {match_id}: goal cooldown active (goal@{last_goal_minute}', now@{minute}') — new picks will be blocked")
 
+    if picks:
+        log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-1: about to open DB")
+
     with _db() as conn:
+        if picks:
+            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-2: DB opened, loading existing")
         # Pre-load all existing tips for this game
         existing_all = conn.execute(
             "SELECT tip_key, market, label, minute_entry FROM tips WHERE match_id = ?",
@@ -2171,6 +2176,8 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
         existing_hcp_rows  = [r for r in existing_all if r["market"] == "HCP"]
         existing_hcp_canonical = {_hcp_canonical(r["label"]) for r in existing_hcp_rows}
         existing_1x2_rows  = [r for r in existing_all if r["market"] == "1X2"]
+        if picks:
+            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-3: existing loaded ({len(existing_all)} rows)")
 
         # O/U conflict index: line → set of directions already stored ("over"/"under")
         existing_ou = {}
@@ -2209,6 +2216,8 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     return "away"
             return None
 
+        if picks:
+            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-4: entering dir-best filter (match={'present' if match else 'None'})")
         # Within this cycle: for each direction keep only the pick with highest edge
         if match:
             dir_best: dict = {}  # direction → best pick so far
@@ -2230,6 +2239,8 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     d = _pick_direction(p, match)
                     _reject(p, f"dropped by dir-best filter (direction={d}, lower edge than best in same direction)")
             picks = new_picks
+        if picks:
+            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-5: after dir-best, {len(picks)} pick(s) remain")
 
         # ── Block: if a pick in the same direction already exists since the last goal, skip whole cycle ──
         phase_cutoff_global = (last_goal_minute or 0)
@@ -2251,9 +2262,12 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     d = _pick_direction(p, match)
                     _reject(p, f"direction '{d}' already has tip in current phase (cutoff={phase_cutoff_global}')")
             picks = new_picks
+        if picks:
+            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-6: about to enter main loop with {len(picks)} pick(s)")
 
         for p in picks:
             key = f"{p['market']}|{p['label']}"
+            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-LOOP: processing {key}")
 
             if key in existing_keys:
                 # Tip already stored — update current odd if still open
@@ -2261,6 +2275,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     "UPDATE tips SET odd_now = ? WHERE tip_key = ? AND match_id = ? AND result IS NULL",
                     (p["odds"], key, match_id)
                 )
+                log.info(f"[{_tag_summary}] match {match_id} EXISTING-UPDATE for {key}")
                 continue
 
             # ── All checks below only apply to brand-new tips ──
