@@ -1324,34 +1324,216 @@ function normalizeHcpLabel(market, label) {
   });
 }
 
-function syncTips(matchId, picks, minute) {
+// Server-side filter constants — keep in sync with server.py
+const _SRV_GOAL_COOLDOWN_MINUTES = 4;
+const _SRV_HCP_MIN_GAP_MINUTES   = 8;
+const _SRV_MIN_MINUTE_FOR_TIPS   = 25;
+const _SRV_MAX_MINUTE_FOR_TIPS   = 85;
+const _SRV_MAX_TIPS_PER_GAME     = 6;
+
+// Mirror of server's _pick_direction — returns 'home'|'away'|'draw'|null
+function _tipDirection(p, match) {
+  const home = (match?.homeTeam || '').toLowerCase();
+  const away = (match?.awayTeam || '').toLowerCase();
+  const lbl  = (p.label || '').toLowerCase();
+  const mkt  = p.market || '';
+  const homeFirst = home.split(' ')[0] || '';
+  const awayFirst = away.split(' ')[0] || '';
+  if (mkt === '1X2') {
+    if (home && (homeFirst && lbl.includes(homeFirst) || home.includes(lbl))) return 'home';
+    if (away && (awayFirst && lbl.includes(awayFirst) || away.includes(lbl))) return 'away';
+    return lbl.includes('empate') ? 'draw' : null;
+  }
+  if (mkt === 'HCP') {
+    const hm = lbl.match(/([+-][\d.]+)$/);
+    if (!hm) return null;
+    const teamLbl = lbl.substring(0, lbl.lastIndexOf(hm[1])).trim();
+    if (home && (homeFirst && teamLbl.includes(homeFirst) || home.includes(teamLbl))) return 'home';
+    if (away && (awayFirst && teamLbl.includes(awayFirst) || away.includes(teamLbl))) return 'away';
+  }
+  return null;
+}
+
+// Mirror of server's _hcp_canonical — strips trailing ".0" on integer HCP values
+function _hcpCanonical(label) {
+  const hm = label.match(/([+-][\d.]+)$/);
+  if (!hm) return label.toLowerCase();
+  const n = parseFloat(hm[1]);
+  const team = label.substring(0, label.lastIndexOf(hm[1])).trim().toLowerCase();
+  const sign = n >= 0 ? '+' : '';
+  const num = n === Math.trunc(n) ? String(Math.trunc(n)) : String(n);
+  return `${team} ${sign}${num}`;
+}
+
+function syncTips(matchId, picks, minute, match, inc) {
   if (!picks || !picks.length) return getTips(matchId);
   const existing = getTips(matchId);
   let changed = false;
+
+  // Goal cooldown
+  const lastGoalMinute = (inc && typeof inc.lastGoalMinute === 'number') ? inc.lastGoalMinute : null;
+  const inCooldown = (
+    lastGoalMinute !== null &&
+    minute !== null && minute !== undefined && minute > 0 &&
+    (minute - lastGoalMinute) >= 0 &&
+    (minute - lastGoalMinute) < _SRV_GOAL_COOLDOWN_MINUTES
+  );
+
+  // ── Pre-filter 1: dir-best — keep only highest-edge pick per direction ──
+  if (match) {
+    const dirBest = {};
+    for (const p of picks) {
+      const d = _tipDirection(p, match);
+      if (d === null) continue;
+      if (!dirBest[d] || (p.edge || 0) > (dirBest[d].edge || 0)) {
+        dirBest[d] = p;
+      }
+    }
+    const picksNoDir = picks.filter(p => _tipDirection(p, match) === null);
+    picks = [...Object.values(dirBest), ...picksNoDir];
+  }
+
+  // ── Pre-filter 2: active-directions — block direction already tipped in current phase ──
+  const phaseCutoff = lastGoalMinute || 0;
+  if (match) {
+    const activeDirs = new Set();
+    for (const t of existing) {
+      if ((t.minuteEntry || 0) >= phaseCutoff) {
+        const d = _tipDirection({ market: t.market, label: t.label, edge: 0 }, match);
+        if (d && d !== 'draw') activeDirs.add(d);
+      }
+    }
+    picks = picks.filter(p =>
+      !activeDirs.has(_tipDirection(p, match)) || (p.market || '').startsWith('O/U')
+    );
+  }
+
+  // ── Build conflict indices from existing tips ──
+  const existingOu = {};         // line → Set<'over'|'under'>
+  const existingHcpCanonical = new Set();
+  const existing1x2 = [];
+  const existingHcp = [];
+  for (const t of existing) {
+    if ((t.market || '').startsWith('O/U')) {
+      const m_ou = (t.label || '').match(/^(Over|Under)\s+([\d.]+)$/i);
+      if (m_ou) {
+        const line = m_ou[2];
+        if (!existingOu[line]) existingOu[line] = new Set();
+        existingOu[line].add(m_ou[1].toLowerCase());
+      }
+    }
+    if (t.market === '1X2') existing1x2.push(t);
+    if (t.market === 'HCP') {
+      existingHcp.push(t);
+      existingHcpCanonical.add(_hcpCanonical(t.label || ''));
+    }
+  }
+  let totalTips = existing.length;
 
   for (const p of picks) {
     const normLabel = normalizeHcpLabel(p.market, p.label);
     const key = p.market + '|' + normLabel;
     const found = existing.find(t => t.key === key);
-    if (!found) {
-      // First time this tip appears — record it
-      existing.push({
-        key,
-        market: p.market,
-        label: normLabel,
-        oddEntry: p.odds,
-        oddNow: p.odds,
-        edgeEntry: p.edge ?? null,
-        minuteEntry: minute,
-        ts: Date.now(),
-        result: null,
-      });
-      changed = true;
-    } else {
-      // Update current odd
+
+    if (found) {
+      // Update current odd if still open
       if (found.result === null && p.odds !== found.oddNow) {
         found.oddNow = p.odds;
         changed = true;
+      }
+      continue;
+    }
+
+    // ── All checks below only apply to brand-new tips ──
+    if (totalTips >= _SRV_MAX_TIPS_PER_GAME) continue;
+    if (inCooldown) continue;
+    if (minute !== null && minute !== undefined && minute < _SRV_MIN_MINUTE_FOR_TIPS) continue;
+    if (minute !== null && minute !== undefined && minute > _SRV_MAX_MINUTE_FOR_TIPS) continue;
+
+    // O/U opposite direction conflict
+    if ((p.market || '').startsWith('O/U')) {
+      const m_ou = normLabel.match(/^(Over|Under)\s+([\d.]+)$/i);
+      if (m_ou) {
+        const dir = m_ou[1].toLowerCase();
+        const line = m_ou[2];
+        const opposite = dir === 'over' ? 'under' : 'over';
+        if (existingOu[line]?.has(opposite)) continue;
+      }
+    }
+
+    // HCP ↔ 1X2 cross-conflict (same team, same phase)
+    if (p.market === 'HCP') {
+      const hm = normLabel.match(/([+-][\d.]+)$/);
+      if (hm) {
+        const teamPart = normLabel.substring(0, normLabel.lastIndexOf(hm[1])).trim().toLowerCase();
+        const conflict = existing1x2.some(t =>
+          (t.label || '').trim().toLowerCase() === teamPart &&
+          (t.minuteEntry || 0) >= phaseCutoff
+        );
+        if (conflict) continue;
+      }
+    }
+    if (p.market === '1X2') {
+      const teamPart = (normLabel || '').trim().toLowerCase();
+      const conflict = existingHcp.some(t => {
+        const hm = (t.label || '').match(/([+-][\d.]+)$/);
+        if (!hm) return false;
+        const tt = t.label.substring(0, t.label.lastIndexOf(hm[1])).trim().toLowerCase();
+        return tt === teamPart && (t.minuteEntry || 0) >= phaseCutoff;
+      });
+      if (conflict) continue;
+    }
+
+    // HCP dedup + gap
+    if (p.market === 'HCP') {
+      const canon = _hcpCanonical(normLabel);
+      if (existingHcpCanonical.has(canon)) continue;
+
+      const hm = normLabel.match(/([+-][\d.]+)$/);
+      if (hm) {
+        const teamPart = normLabel.substring(0, normLabel.lastIndexOf(hm[1])).trim().toLowerCase();
+        let skipGap = false;
+        for (const t of existingHcp) {
+          const hm2 = (t.label || '').match(/([+-][\d.]+)$/);
+          if (!hm2) continue;
+          const tt = t.label.substring(0, t.label.lastIndexOf(hm2[1])).trim().toLowerCase();
+          if (tt === teamPart && t.minuteEntry !== null && t.minuteEntry !== undefined) {
+            const gap = (minute || 0) - t.minuteEntry;
+            if (gap >= 0 && gap < _SRV_HCP_MIN_GAP_MINUTES) { skipGap = true; break; }
+          }
+        }
+        if (skipGap) continue;
+      }
+    }
+
+    // ── Accept ──
+    const newTip = {
+      key,
+      market: p.market,
+      label: normLabel,
+      oddEntry: p.odds,
+      oddNow: p.odds,
+      edgeEntry: p.edge ?? null,
+      minuteEntry: minute,
+      ts: Date.now(),
+      result: null,
+    };
+    existing.push(newTip);
+    totalTips++;
+    changed = true;
+
+    // Update trackers so subsequent picks in same call see this one
+    if (p.market === 'HCP') {
+      existingHcpCanonical.add(_hcpCanonical(normLabel));
+      existingHcp.push(newTip);
+    }
+    if (p.market === '1X2') existing1x2.push(newTip);
+    if ((p.market || '').startsWith('O/U')) {
+      const m_ou = normLabel.match(/^(Over|Under)\s+([\d.]+)$/i);
+      if (m_ou) {
+        const line = m_ou[2];
+        if (!existingOu[line]) existingOu[line] = new Set();
+        existingOu[line].add(m_ou[1].toLowerCase());
       }
     }
   }
@@ -1539,11 +1721,12 @@ function buildAnalysisCard(m, shots, inc, odds) {
   const canHavePicks = warnings.filter(w => w.icon !== '◈').length === 0;
 
   // ── Sync tip history — only real picks, not warnings ──
+  // syncTips() now mirrors all server-side filters (cooldown, min/max minute,
+  // O/U opposite, 1X2↔HCP cross-conflict, HCP dedup/gap, dir-best, active-dirs)
+  // so localStorage stays in sync with the server DB and Settlements page.
   const realPicks = picks.filter(p => !p.isWarning);
-  // Block picks after 85 minutes to avoid late-game chaos
-  const MAX_MINUTE_FOR_PICKS = 85;
-  const activePicks = (canHavePicks && realPicks.length && minute <= MAX_MINUTE_FOR_PICKS) ? realPicks : [];
-  const allTips = syncTips(m.id, activePicks, minute);
+  const activePicks = (canHavePicks && realPicks.length) ? realPicks : [];
+  const allTips = syncTips(m.id, activePicks, minute, m, inc);
   autoResolveTips(m.id, allTips, m, inc);
   maybeArchive(m.id, m, allTips); // archive when game finishes
 
