@@ -2099,6 +2099,7 @@ def _upsert_game(match: dict):
 GOAL_COOLDOWN_MINUTES = 4  # block new tips for this many minutes after a goal
 HCP_MIN_GAP_MINUTES   = 8  # minimum minutes between HCP tips for the same team
 MIN_MINUTE_FOR_TIPS   = 25 # minimum match minute before tips can be generated
+MAX_MINUTE_FOR_TIPS   = 85 # maximum match minute before tips can be generated (avoid late-game chaos)
 MAX_TIPS_PER_GAME     = 6  # hard cap on tips per game
 
 def _hcp_canonical(label: str) -> str:
@@ -2180,6 +2181,11 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
             # Minimum minute threshold
             if minute is not None and minute < MIN_MINUTE_FOR_TIPS:
                 log.info(f"match {match_id}: skipping '{p['label']}' — below minimum minute ({minute} < {MIN_MINUTE_FOR_TIPS})")
+                continue
+
+            # Maximum minute threshold (avoid late-game chaos)
+            if minute is not None and minute > MAX_MINUTE_FOR_TIPS:
+                log.info(f"match {match_id}: skipping '{p['label']}' — beyond maximum minute ({minute} > {MAX_MINUTE_FOR_TIPS})")
                 continue
 
             # O/U conflict: block opposite direction on same line
