@@ -1747,7 +1747,7 @@ function renderOdds(odds, match) {
         <span class="b-out">${lbl(k)}</span>
         <div class="b-info">
           <div class="b-blend">${pct(o.blendedProb)}%</div>
-          <div class="b-sub">mod ${pct(o.modelProb)}% · bk ${pct(o.bookieNoVig)}% · ${fmt2(o.bookieOdds)}</div>
+          <div class="b-sub">Model: ${pct(o.modelProb)}% | Market: ${pct(o.bookieNoVig)}% | Odds: ${fmt2(o.bookieOdds)}</div>
         </div>
         <span class="b-edge ${edgeCls(o.edge)}">${edgeTxt(o.edge)}</span>
         ${o.isValue?'<span class="val-badge">VALUE</span>':''}
