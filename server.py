@@ -2553,11 +2553,12 @@ _YOUTH_KEYWORDS = {"u23","u21","u20","u19","u18","u17","u15","youth","reserve","
 # Tournament fragments that always mean NOT a monitored competition
 _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "série d", "serie d", "série c", "serie c",   # Brazil lower divisions
-    "série a2", "série a3", "serie a2", "serie a3",
+    "série a2", "série a3", "seria a2", "serie a3",
     "paulista", "carioca", "gaúcho", "mineiro", "baiano",  # Brazil state leagues
     "ligapro",                                    # Ecuador
     "usl", "nisa", "next pro",                    # US non-MLS, lower divisions
-    "frauen", "women",                            # Women's competitions (German + English)
+    "frauen", "women", "femminile",               # Women's competitions (German + English + Italian)
+    "liga portugal 2",                            # Portuguese 2nd division
 }
 
 def _is_monitored_league_strict(tournament, country):
