@@ -2002,6 +2002,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
 
             # Minimum minute threshold
             if minute is not None and minute < MIN_MINUTE_FOR_TIPS:
+                log.info(f"match {match_id}: skipping '{p['label']}' — below minimum minute ({minute} < {MIN_MINUTE_FOR_TIPS})")
                 continue
 
             # O/U conflict: block opposite direction on same line
