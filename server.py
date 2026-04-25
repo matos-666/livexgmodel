@@ -2045,7 +2045,7 @@ def _init_db():
             start_ts    INTEGER
         );
         CREATE TABLE IF NOT EXISTS tips (
-            tip_key      TEXT PRIMARY KEY,
+            tip_key      TEXT NOT NULL,
             match_id     INTEGER NOT NULL,
             market       TEXT NOT NULL,
             label        TEXT NOT NULL,
@@ -2055,6 +2055,7 @@ def _init_db():
             minute_entry INTEGER,
             wall_ts      INTEGER NOT NULL,
             result       TEXT DEFAULT NULL,
+            PRIMARY KEY (match_id, tip_key),
             FOREIGN KEY (match_id) REFERENCES games(id)
         );
         CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id);
@@ -2073,6 +2074,41 @@ def _init_db():
         if "edge_entry" not in cols:
             conn.execute("ALTER TABLE tips ADD COLUMN edge_entry REAL")
             log.info("DB migration: added edge_entry column to tips")
+
+    # Migration: change PRIMARY KEY from tip_key alone to (match_id, tip_key)
+    # Bug: when 2 different games produced picks with same market+label
+    # (e.g. "1X2|Empate"), 2nd game's INSERT failed silently with
+    # UNIQUE constraint, dropping all subsequent same-key tips.
+    with _db() as conn:
+        pk_info = conn.execute("PRAGMA table_info(tips)").fetchall()
+        pk_cols = sorted([r[1] for r in pk_info if r[5] > 0])  # rows with pk index > 0
+        if pk_cols == ["tip_key"]:
+            log.info("DB migration: rebuilding tips with composite PK (match_id, tip_key)")
+            conn.executescript("""
+                CREATE TABLE tips_new (
+                    tip_key      TEXT NOT NULL,
+                    match_id     INTEGER NOT NULL,
+                    market       TEXT NOT NULL,
+                    label        TEXT NOT NULL,
+                    odd_entry    REAL,
+                    odd_now      REAL,
+                    edge_entry   REAL,
+                    minute_entry INTEGER,
+                    wall_ts      INTEGER NOT NULL,
+                    result       TEXT DEFAULT NULL,
+                    PRIMARY KEY (match_id, tip_key),
+                    FOREIGN KEY (match_id) REFERENCES games(id)
+                );
+                INSERT INTO tips_new (tip_key, match_id, market, label, odd_entry,
+                                      odd_now, edge_entry, minute_entry, wall_ts, result)
+                SELECT tip_key, match_id, market, label, odd_entry,
+                       odd_now, edge_entry, minute_entry, wall_ts, result
+                FROM tips;
+                DROP TABLE tips;
+                ALTER TABLE tips_new RENAME TO tips;
+                CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id);
+            """)
+            log.info("DB migration: tips table rebuilt with composite PK")
     log.info(f"DB ready: {DB_PATH}")
 
 def _upsert_game(match: dict):
@@ -2161,12 +2197,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
     if in_cooldown:
         log.info(f"[{_tag_summary}] match {match_id}: goal cooldown active (goal@{last_goal_minute}', now@{minute}') — new picks will be blocked")
 
-    if picks:
-        log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-1: about to open DB")
-
     with _db() as conn:
-        if picks:
-            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-2: DB opened, loading existing")
         # Pre-load all existing tips for this game
         existing_all = conn.execute(
             "SELECT tip_key, market, label, minute_entry FROM tips WHERE match_id = ?",
@@ -2176,8 +2207,6 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
         existing_hcp_rows  = [r for r in existing_all if r["market"] == "HCP"]
         existing_hcp_canonical = {_hcp_canonical(r["label"]) for r in existing_hcp_rows}
         existing_1x2_rows  = [r for r in existing_all if r["market"] == "1X2"]
-        if picks:
-            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-3: existing loaded ({len(existing_all)} rows)")
 
         # O/U conflict index: line → set of directions already stored ("over"/"under")
         existing_ou = {}
@@ -2216,8 +2245,6 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     return "away"
             return None
 
-        if picks:
-            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-4: entering dir-best filter (match={'present' if match else 'None'})")
         # Within this cycle: for each direction keep only the pick with highest edge
         if match:
             dir_best: dict = {}  # direction → best pick so far
@@ -2239,8 +2266,6 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     d = _pick_direction(p, match)
                     _reject(p, f"dropped by dir-best filter (direction={d}, lower edge than best in same direction)")
             picks = new_picks
-        if picks:
-            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-5: after dir-best, {len(picks)} pick(s) remain")
 
         # ── Block: if a pick in the same direction already exists since the last goal, skip whole cycle ──
         phase_cutoff_global = (last_goal_minute or 0)
@@ -2262,12 +2287,9 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     d = _pick_direction(p, match)
                     _reject(p, f"direction '{d}' already has tip in current phase (cutoff={phase_cutoff_global}')")
             picks = new_picks
-        if picks:
-            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-6: about to enter main loop with {len(picks)} pick(s)")
 
         for p in picks:
             key = f"{p['market']}|{p['label']}"
-            log.info(f"[{_tag_summary}] match {match_id} CHECKPOINT-LOOP: processing {key}")
 
             if key in existing_keys:
                 # Tip already stored — update current odd if still open
@@ -2275,7 +2297,6 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     "UPDATE tips SET odd_now = ? WHERE tip_key = ? AND match_id = ? AND result IS NULL",
                     (p["odds"], key, match_id)
                 )
-                log.info(f"[{_tag_summary}] match {match_id} EXISTING-UPDATE for {key}")
                 continue
 
             # ── All checks below only apply to brand-new tips ──
@@ -2373,7 +2394,10 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                         log.error(f"Telegram alert failed: {tg_err}")
             except Exception as e:
                 if "UNIQUE constraint failed" in str(e):
-                    log.debug(f"match {match_id}: tip {key} already exists, skipping")
+                    # Should never happen now (composite PK is per-match) but log
+                    # loudly so future regressions surface immediately.
+                    _reject(p, f"UNIQUE constraint failed (composite PK violation: {e})")
+                    log.warning(f"[{_tag_summary}] match {match_id}: UNIQUE collision for {key} — {e}")
                 else:
                     raise
             if p["market"] == "HCP":
