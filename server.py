@@ -2175,11 +2175,14 @@ _SETTINGS_DEFAULTS = {
     "hcp_min_gap_minutes":   8,
     "odds_max_age_seconds":  120,
     "bg_interval_seconds":   120,
+    "blocked_keywords":      "",     # comma-separated extra tournament fragments to block
 }
 
 def _coerce_setting(key: str, raw: str):
-    """Convert string from DB to int/float based on the default's type."""
+    """Convert string from DB to int/float/str based on the default's type."""
     default = _SETTINGS_DEFAULTS.get(key)
+    if isinstance(default, str):
+        return raw  # keep as string (e.g. blocked_keywords)
     if isinstance(default, int) and not isinstance(default, bool):
         try: return int(float(raw))
         except: return default
@@ -3084,6 +3087,16 @@ _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "amateur",                                    # Any amateur competition
 }
 
+def _get_blocked_fragments() -> set:
+    """Return merged set of hardcoded + admin-defined blocked keywords."""
+    extra_raw = get_setting("blocked_keywords", "")
+    if extra_raw and isinstance(extra_raw, str):
+        extra = {kw.strip().lower() for kw in extra_raw.split(",") if kw.strip()}
+    else:
+        extra = set()
+    return _BLOCKED_TOURNAMENT_FRAGMENTS | extra
+
+
 def _is_monitored_league_strict(tournament, country):
     """Strict check: only pass leagues explicitly in our monitored list."""
     import re as _re
@@ -3095,8 +3108,8 @@ def _is_monitored_league_strict(tournament, country):
     for yk in _YOUTH_KEYWORDS:
         if yk in raw:
             return False
-    # Exclude explicitly blocked fragments (checked on raw name)
-    for frag in _BLOCKED_TOURNAMENT_FRAGMENTS:
+    # Exclude blocked fragments: hardcoded + dynamic from admin panel
+    for frag in _get_blocked_fragments():
         if frag in raw:
             return False
     # Check against strict keyword map
@@ -3468,6 +3481,9 @@ def r_admin_settings():
         for k, v in data.items():
             if k not in _SETTINGS_DEFAULTS:
                 continue  # ignore unknown keys
+            # blocked_keywords may arrive as list from admin panel → join to string
+            if k == "blocked_keywords" and isinstance(v, list):
+                v = ",".join(str(x).strip().lower() for x in v if x)
             conn.execute(
                 "INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
