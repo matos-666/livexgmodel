@@ -30,7 +30,7 @@ log = logging.getLogger("sofascore")
 @app.after_request
 def add_cors(response):
     response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
@@ -58,6 +58,31 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 # ════════════════════════════════════════════════════════════
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+# ── Affiliate CTAs — rotated on every pick alert ──────────────────────────
+# Each entry: (display_text, url)
+_TG_CTAS = [
+    ("🎯 Apostar nesta pick",          "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),
+    ("⚡ Colocar aposta agora",         "https://dashboard.onetwoaffiliates.com/click?campaign_id=796&ref_id=370"),
+    ("💰 Aproveitar o edge",            "https://track.affshares.com/visit/?bta=657658&nci=5653"),
+    ("📲 Jogar esta value bet",         "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),
+    ("🔥 Garantir esta aposta",         "https://dashboard.onetwoaffiliates.com/click?campaign_id=796&ref_id=370"),
+    ("✅ Ver odds e apostar",            "https://track.affshares.com/visit/?bta=657658&nci=5653"),
+    ("📈 Capitalizar este valor",       "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),
+    ("🏆 Apostar com vantagem",         "https://dashboard.onetwoaffiliates.com/click?campaign_id=796&ref_id=370"),
+    ("💡 Aproveitar esta oportunidade", "https://track.affshares.com/visit/?bta=657658&nci=5653"),
+]
+_tg_cta_counter = 0
+_tg_cta_lock = threading.Lock()
+
+def _next_cta() -> str:
+    """Return the next CTA as an HTML hyperlink, cycling through _TG_CTAS."""
+    global _tg_cta_counter
+    with _tg_cta_lock:
+        idx = _tg_cta_counter % len(_TG_CTAS)
+        _tg_cta_counter += 1
+    text, url = _TG_CTAS[idx]
+    return f'<a href="{url}">{text}</a>'
 
 _COUNTRY_FLAGS = {
     "england": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "spain": "🇪🇸", "italy": "🇮🇹", "germany": "🇩🇪",
@@ -141,6 +166,7 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
     market_icons = {"1X2": "🎯", "HCP": "⚖️"}
     mkt_icon = market_icons.get(market, "📊")
 
+    cta = _next_cta()
     return (
         f"🔔 <b>NOVA PICK</b>\n"
         f"\n"
@@ -153,7 +179,10 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
         f"💰 Odds: <b>{odds:.2f}</b>\n"
         f"\n"
         f"📊 Modelo: <b>{model_p:.0f}%</b> | Mercado: <b>{blend_p:.0f}%</b>\n"
-        f"📈 Edge: <b>+{edge:.1f}%</b>"
+        f"📈 Edge: <b>+{edge:.1f}%</b>\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{cta}"
     )
 
 _TG_WELCOME = (
@@ -326,9 +355,6 @@ TOURNAMENT_TO_SPORT_KEY = {
     # Chile
     "primera división de chile":        "soccer_chile_campeonato",
     "campeonato nacional":              "soccer_chile_campeonato",
-    # China
-    "chinese super league":             "soccer_china_superleague",
-    "csl":                              "soccer_china_superleague",
     # League of Ireland
     "league of ireland":                "soccer_league_of_ireland",
     "sse airtricity league":            "soccer_league_of_ireland",
@@ -851,9 +877,9 @@ def xg_to_probabilities(home_xg, away_xg, home_goals, away_goals, minute,
     if minute is None or minute <= 0:
         minute = 45   # fallback seguro: assume que estamos a meio do jogo
 
-    # Duração efetiva: 90 min (tempo regulamentar) ou 120 (prolongamento)
-    # Para minutos > 90 (prolongamento) usamos a duração total real
-    full_duration = 120 if minute > 90 else 90
+    # Duração efetiva: 95 min (tempo regulamentar + ~5 min compensação) ou 125 (prolongamento + comp.)
+    # Estimar tempo de jogo real é importante para projeção de xG remanescente.
+    full_duration = 125 if minute > 90 else 95
     elapsed = min(minute, full_duration)
     remaining = max(full_duration - elapsed, 1)
 
@@ -952,7 +978,7 @@ def calculate_benter_value(model_probs, bookie_novig, bookie_odds, minute):
             "impliedOdds": round(1 / blended, 3) if blended > 0 else None,
             "bookieOdds": odds,
             "value": round(value, 4),
-            "isValue": value > 0.10,   # >10% edge required
+            "isValue": value * 100 >= get_setting("min_edge_pct", 10.0),
             "edge": round(value * 100, 2),
         }
 
@@ -2005,7 +2031,7 @@ MONITORED_SPORT_KEYS = {
     "soccer_conmebol_copa_libertadores", "soccer_conmebol_copa_sudamericana",
     "soccer_conmebol_copa_america",
     # Asia
-    "soccer_japan_j_league", "soccer_china_superleague",
+    "soccer_japan_j_league",
 }
 
 BG_INTERVAL   = 120   # seconds between cycles (2 minutes)
@@ -2067,6 +2093,21 @@ def _init_db():
             subscribed_at INTEGER NOT NULL,
             active        INTEGER DEFAULT 1
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at INTEGER,
+            updated_by TEXT
+        );
+        CREATE TABLE IF NOT EXISTS competitions (
+            sport_key       TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            country         TEXT,
+            priority        INTEGER DEFAULT 99,
+            active_algo     INTEGER DEFAULT 1,
+            active_frontend INTEGER DEFAULT 1,
+            updated_at      INTEGER
+        );
         """)
     # Migration: add edge_entry column to existing DBs
     with _db() as conn:
@@ -2111,6 +2152,75 @@ def _init_db():
             log.info("DB migration: tips table rebuilt with composite PK")
     log.info(f"DB ready: {DB_PATH}")
 
+# ════════════════════════════════════════════════════════════
+#  DYNAMIC SETTINGS — read from DB, cached, hot-reloadable
+# ════════════════════════════════════════════════════════════
+
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "liveedge-admin-2024")
+SETTINGS_RELOAD_INTERVAL = 30  # seconds — short so admin changes apply quickly
+
+_settings_cache: dict = {}
+_settings_last_load = 0.0
+_settings_lock = threading.Lock()
+
+# Defaults — used when key not present in DB
+_SETTINGS_DEFAULTS = {
+    "min_odds":              1.40,
+    "max_odds":              4.00,
+    "min_edge_pct":          10.0,   # value > 0.10 → edge >= 10%
+    "stake_per_bet":         100.0,
+    "min_minute_for_tips":   25,
+    "max_minute_for_tips":   85,
+    "goal_cooldown_minutes": 4,
+    "hcp_min_gap_minutes":   8,
+    "odds_max_age_seconds":  120,
+    "bg_interval_seconds":   120,
+}
+
+def _coerce_setting(key: str, raw: str):
+    """Convert string from DB to int/float based on the default's type."""
+    default = _SETTINGS_DEFAULTS.get(key)
+    if isinstance(default, int) and not isinstance(default, bool):
+        try: return int(float(raw))
+        except: return default
+    if isinstance(default, float):
+        try: return float(raw)
+        except: return default
+    return raw
+
+def _load_settings(force: bool = False) -> dict:
+    """Load settings from DB into cache. Refreshes every SETTINGS_RELOAD_INTERVAL seconds."""
+    global _settings_cache, _settings_last_load
+    now = time.time()
+    with _settings_lock:
+        if force or (now - _settings_last_load) > SETTINGS_RELOAD_INTERVAL:
+            try:
+                with _db() as conn:
+                    rows = conn.execute("SELECT key, value FROM settings").fetchall()
+                    _settings_cache = {r["key"]: _coerce_setting(r["key"], r["value"]) for r in rows}
+                _settings_last_load = now
+            except Exception as e:
+                log.warning(f"settings load error: {e}")
+        return _settings_cache
+
+def get_setting(key: str, default=None):
+    """Get a setting value. Falls back to _SETTINGS_DEFAULTS, then provided default."""
+    settings = _load_settings()
+    if key in settings:
+        return settings[key]
+    if key in _SETTINGS_DEFAULTS:
+        return _SETTINGS_DEFAULTS[key]
+    return default
+
+def _check_admin_auth() -> bool:
+    """Validate Bearer token matches ADMIN_SECRET."""
+    auth = flask_request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        return token == ADMIN_SECRET
+    return False
+
+
 def _upsert_game(match: dict):
     """Insert or update a game record."""
     with _db() as conn:
@@ -2135,11 +2245,12 @@ def _upsert_game(match: dict):
                 (int(time.time()), match["id"])
             )
 
-GOAL_COOLDOWN_MINUTES = 4  # block new tips for this many minutes after a goal
-HCP_MIN_GAP_MINUTES   = 8  # minimum minutes between HCP tips for the same team
-MIN_MINUTE_FOR_TIPS   = 25 # minimum match minute before tips can be generated
-MAX_MINUTE_FOR_TIPS   = 85 # maximum match minute before tips can be generated (avoid late-game chaos)
-MAX_TIPS_PER_GAME     = 6  # hard cap on tips per game
+GOAL_COOLDOWN_MINUTES = 4   # block new tips for this many minutes after a goal
+HCP_MIN_GAP_MINUTES   = 8   # minimum minutes between HCP tips for the same team
+MIN_MINUTE_FOR_TIPS   = 25  # minimum match minute before tips can be generated
+MAX_MINUTE_FOR_TIPS   = 85  # maximum match minute before tips can be generated (avoid late-game chaos)
+MAX_TIPS_PER_GAME     = 6   # hard cap on tips per game
+ODDS_MAX_AGE_SECONDS  = 120 # block picks if odds lastUpdate is older than this (2 minutes)
 
 def _hcp_canonical(label: str) -> str:
     """Normalise HCP label for dedup: strip trailing .0, lowercase team prefix."""
@@ -2192,7 +2303,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
         and minute is not None
         and minute > 0  # only check if we have a real minute value
         and (minute - last_goal_minute) >= 0  # goal was in past (same or earlier minute)
-        and (minute - last_goal_minute) < GOAL_COOLDOWN_MINUTES
+        and (minute - last_goal_minute) < get_setting("goal_cooldown_minutes", 4)
     )
     if in_cooldown:
         log.info(f"[{_tag_summary}] match {match_id}: goal cooldown active (goal@{last_goal_minute}', now@{minute}') — new picks will be blocked")
@@ -2208,14 +2319,23 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
         existing_hcp_canonical = {_hcp_canonical(r["label"]) for r in existing_hcp_rows}
         existing_1x2_rows  = [r for r in existing_all if r["market"] == "1X2"]
 
-        # O/U conflict index: line → set of directions already stored ("over"/"under")
-        existing_ou = {}
+        # O/U conflict index — track Over/Under lines as numeric values for cross-line check.
+        # Cross-line rule: Over X.5 contradicts Under Y.5 iff Y <= X
+        #   e.g. Over 2.5 (3+ goals) contradicts Under 2.5 (≤2) and Under 1.5 (≤1) but NOT Under 3.5 (≤3, overlap)
+        existing_overs  = []   # list of float(X) for stored "Over X.5"
+        existing_unders = []   # list of float(Y) for stored "Under Y.5"
         for r in existing_all:
             if r["market"].startswith("O/U"):
                 m_ou = _re.match(r'^(Over|Under)\s+([\d.]+)$', r["label"], _re.IGNORECASE)
                 if m_ou:
-                    line = m_ou.group(2)
-                    existing_ou.setdefault(line, set()).add(m_ou.group(1).lower())
+                    try:
+                        line_val = float(m_ou.group(2))
+                    except ValueError:
+                        continue
+                    if m_ou.group(1).lower() == "over":
+                        existing_overs.append(line_val)
+                    else:
+                        existing_unders.append(line_val)
 
         total_tips = len(existing_all)
 
@@ -2312,25 +2432,40 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                 continue
 
             # Minimum minute threshold
-            if minute is not None and minute < MIN_MINUTE_FOR_TIPS:
-                _reject(p, f"below MIN_MINUTE_FOR_TIPS (minute={minute} < {MIN_MINUTE_FOR_TIPS})")
+            _min_min = get_setting("min_minute_for_tips", 25)
+            if minute is not None and minute < _min_min:
+                _reject(p, f"below MIN_MINUTE_FOR_TIPS (minute={minute} < {_min_min})")
                 continue
 
             # Maximum minute threshold (avoid late-game chaos)
-            if minute is not None and minute > MAX_MINUTE_FOR_TIPS:
-                _reject(p, f"above MAX_MINUTE_FOR_TIPS (minute={minute} > {MAX_MINUTE_FOR_TIPS})")
+            _max_min = get_setting("max_minute_for_tips", 85)
+            if minute is not None and minute > _max_min:
+                _reject(p, f"above MAX_MINUTE_FOR_TIPS (minute={minute} > {_max_min})")
                 continue
 
-            # O/U conflict: block opposite direction on same line
+            # O/U conflict: block any contradictory line, not only the same one.
+            # Over X.5 ⇄ Under Y.5 are contradictory iff Y <= X (no overlap of viable totals).
             if p["market"].startswith("O/U"):
                 m_ou = _re.match(r'^(Over|Under)\s+([\d.]+)$', p["label"], _re.IGNORECASE)
                 if m_ou:
-                    direction = m_ou.group(1).lower()
-                    line      = m_ou.group(2)
-                    opposite  = "under" if direction == "over" else "over"
-                    if opposite in existing_ou.get(line, set()):
-                        _reject(p, f"O/U opposite direction already stored (line {line}, existing={opposite})")
-                        continue
+                    try:
+                        new_line = float(m_ou.group(2))
+                    except ValueError:
+                        new_line = None
+                    if new_line is not None:
+                        direction = m_ou.group(1).lower()
+                        if direction == "over":
+                            # Over X.5 conflicts with any Under Y.5 stored where Y <= X
+                            conflicts = [y for y in existing_unders if y <= new_line]
+                            if conflicts:
+                                _reject(p, f"O/U cross-line conflict: Over {new_line} contradicts existing Under {min(conflicts)}")
+                                continue
+                        else:
+                            # Under Y.5 conflicts with any Over X.5 stored where X >= Y
+                            conflicts = [x for x in existing_overs if x >= new_line]
+                            if conflicts:
+                                _reject(p, f"O/U cross-line conflict: Under {new_line} contradicts existing Over {max(conflicts)}")
+                                continue
 
             # 1X2 ↔ HCP conflict: same team, same phase (no goal between them)
             phase_cutoff = (last_goal_minute or 0)
@@ -2369,8 +2504,9 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                              if _re.search(r'([+-][\d.]+)$', r["label"]) else ""
                         if rt == team_part and r["minute_entry"] is not None:
                             gap = (minute or 0) - r["minute_entry"]
-                            if 0 <= gap < HCP_MIN_GAP_MINUTES:
-                                _reject(p, f"HCP gap too small (same team '{team_part}' tipped {gap}' ago, min={HCP_MIN_GAP_MINUTES}')")
+                            _hcp_gap = get_setting("hcp_min_gap_minutes", 8)
+                            if 0 <= gap < _hcp_gap:
+                                _reject(p, f"HCP gap too small (same team '{team_part}' tipped {gap}' ago, min={_hcp_gap}')")
                                 skip_due_to_gap = True
                                 break
                     if skip_due_to_gap:
@@ -2410,7 +2546,14 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
             if p["market"].startswith("O/U"):
                 m_ou = _re.match(r'^(Over|Under)\s+([\d.]+)$', p["label"], _re.IGNORECASE)
                 if m_ou:
-                    existing_ou.setdefault(m_ou.group(2), set()).add(m_ou.group(1).lower())
+                    try:
+                        new_line_acc = float(m_ou.group(2))
+                        if m_ou.group(1).lower() == "over":
+                            existing_overs.append(new_line_acc)
+                        else:
+                            existing_unders.append(new_line_acc)
+                    except ValueError:
+                        pass
 
         # DIAG: summary line per cycle (only when there were candidates)
         if _decision_log:
@@ -2487,6 +2630,39 @@ def _auto_resolve_db(match_id: int, match: dict, inc: dict):
                     (new_result, t["tip_key"], match_id)
                 )
 
+def _odds_are_stale(odds: dict) -> tuple:
+    """Return (is_stale, age_seconds) based on the most recent lastUpdate across all markets.
+
+    Picks should be blocked when odds are older than ODDS_MAX_AGE_SECONDS (default 120s).
+    Returns (False, None) when odds are unavailable or have no timestamps (non-blocking).
+    """
+    if not odds or not odds.get("available"):
+        return False, None  # no odds → upstream already handles this
+
+    now = datetime.now(timezone.utc)
+    latest_ts = None
+
+    for market_key in ("h2h", "totals", "spreads"):
+        mkt = odds.get(market_key)
+        if not mkt:
+            continue
+        lu = mkt.get("lastUpdate")
+        if not lu:
+            continue
+        try:
+            lu_dt = datetime.fromisoformat(lu.replace("Z", "+00:00"))
+            if latest_ts is None or lu_dt > latest_ts:
+                latest_ts = lu_dt
+        except Exception:
+            pass
+
+    if latest_ts is None:
+        return False, None  # no timestamps available — assume fresh to avoid false blocks
+
+    age = (now - latest_ts).total_seconds()
+    return age > get_setting("odds_max_age_seconds", 120), round(age, 1)
+
+
 def _extract_picks_from_odds(odds: dict, match: dict) -> list:
     """Extract value picks from pre-computed odds dict (mirrors frontend logic)."""
     picks = []
@@ -2495,7 +2671,7 @@ def _extract_picks_from_odds(odds: dict, match: dict) -> list:
 
     def valid_odds(o):
         od = o.get("bookieOdds", 0) or 0
-        return ODDS_MIN_PICK <= od <= ODDS_MAX_PICK
+        return get_setting("min_odds", 1.40) <= od <= get_setting("max_odds", 4.00)
 
     benter = odds.get("benter") or {}
 
@@ -2624,9 +2800,16 @@ def _run_background_cycle():
             # Suppress new picks when there's a red card — superioridade numérica
             # invalida o modelo (regra também mostrada na UI).
             red_cards = incidents.get("redCards", 0) if incidents else 0
+            odds_stale, odds_age = _odds_are_stale(odds)
             if red_cards > 0:
                 picks = []
                 log.info(f"BG: Skipping picks for match {mid} — {red_cards} red card(s) invalidate model")
+            elif odds_stale:
+                picks = []
+                log.warning(
+                    f"BG: Skipping picks for match {mid} — odds are {odds_age:.0f}s old "
+                    f"(>{ODDS_MAX_AGE_SECONDS}s threshold)"
+                )
             else:
                 picks = _extract_picks_from_odds(odds, m) if odds else []
             last_goal_minute = incidents.get("lastGoalMinute") if incidents else None
@@ -2896,7 +3079,6 @@ _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "liga portugal 2",                            # Portuguese 2nd division
     "laliga 2", "la liga 2",                      # Spanish 2nd division (no live xG from Sofascore)
     "j1 league",                                  # Japanese J1 (no live xG from Sofascore)
-    "chinese super league",                       # China (no live xG from Sofascore)
     "damallsvenskan",                             # Swedish women's league (no live xG from Sofascore)
     "northern premier",                           # English amateur pyramid (all divisions)
     "amateur",                                    # Any amateur competition
@@ -3029,7 +3211,7 @@ def r_state_tips():
             gd = dict(g)
             tips_rows = conn.execute(
                 "SELECT * FROM tips WHERE match_id = ? AND (minute_entry IS NULL OR minute_entry <= ?) ORDER BY wall_ts",
-                (g["id"], MAX_MINUTE_FOR_TIPS)
+                (g["id"], get_setting("max_minute_for_tips", 85))
             ).fetchall()
             gd["tips"] = [dict(t) for t in tips_rows]
             result.append(gd)
@@ -3252,6 +3434,134 @@ def r_admin_resolve():
         "still_pending_tips": len(still_pending_rows),
         "pending_detail": [dict(r) for r in still_pending_rows],
         "ok": True
+    })
+
+
+# ════════════════════════════════════════════════════════════
+#  ADMIN PANEL ENDPOINTS — used by Lovable backend sync
+# ════════════════════════════════════════════════════════════
+
+@app.route("/api/admin/settings", methods=["GET", "POST"])
+def r_admin_settings():
+    """
+    GET  → returns current settings (merged with defaults)
+    POST → upserts settings from admin panel. Body: {key: value, ...}
+           Auth: Bearer {ADMIN_SECRET}
+    """
+    if flask_request.method == "GET":
+        merged = dict(_SETTINGS_DEFAULTS)
+        merged.update(_load_settings(force=True))
+        return jsonify({"ok": True, "settings": merged, "defaults": _SETTINGS_DEFAULTS})
+
+    # POST
+    if not _check_admin_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Body must be JSON object"}), 400
+
+    updated_by = flask_request.headers.get("X-Admin-User", "admin")
+    now_ts = int(time.time())
+    saved = []
+    with _db() as conn:
+        for k, v in data.items():
+            if k not in _SETTINGS_DEFAULTS:
+                continue  # ignore unknown keys
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+                (k, str(v), now_ts, updated_by)
+            )
+            saved.append(k)
+
+    # Force reload of cache
+    _load_settings(force=True)
+    log.info(f"[admin] settings updated by {updated_by}: {saved}")
+    return jsonify({"ok": True, "saved": saved, "settings": _load_settings(force=True)})
+
+
+@app.route("/api/admin/competitions", methods=["GET", "POST"])
+def r_admin_competitions():
+    """
+    GET  → returns all competitions in DB
+    POST → bulk replace. Body: {competitions: [{sport_key, name, country, priority, active_algo, active_frontend}, ...]}
+    """
+    if flask_request.method == "GET":
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT sport_key, name, country, priority, active_algo, active_frontend, updated_at "
+                "FROM competitions ORDER BY priority ASC, name ASC"
+            ).fetchall()
+        return jsonify({"ok": True, "competitions": [dict(r) for r in rows]})
+
+    if not _check_admin_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.get_json(silent=True) or {}
+    comps = data.get("competitions", [])
+    if not isinstance(comps, list):
+        return jsonify({"error": "competitions must be a list"}), 400
+
+    now_ts = int(time.time())
+    with _db() as conn:
+        # Replace strategy: clear and reinsert
+        conn.execute("DELETE FROM competitions")
+        for c in comps:
+            sk = (c.get("sport_key") or "").strip()
+            if not sk:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO competitions "
+                "(sport_key, name, country, priority, active_algo, active_frontend, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sk, c.get("name", sk), c.get("country", ""),
+                 int(c.get("priority", 99)),
+                 1 if c.get("active_algo", True) else 0,
+                 1 if c.get("active_frontend", True) else 0,
+                 now_ts)
+            )
+    log.info(f"[admin] competitions replaced: {len(comps)} entries")
+    return jsonify({"ok": True, "count": len(comps)})
+
+
+@app.route("/api/admin/cache/clear", methods=["POST"])
+def r_admin_cache_clear():
+    """Clear the in-memory odds cache and live state. Body optional: {scope: 'odds'|'state'|'all'}"""
+    if not _check_admin_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.get_json(silent=True) or {}
+    scope = data.get("scope", "all")
+    cleared = []
+
+    try:
+        if scope in ("odds", "all"):
+            globals().get("_odds_cache", {}).clear()
+            cleared.append("odds")
+    except Exception as e:
+        log.warning(f"clear odds cache error: {e}")
+
+    try:
+        if scope in ("state", "all"):
+            with _state_lock:
+                _live_state.clear()
+            cleared.append("state")
+    except Exception as e:
+        log.warning(f"clear state error: {e}")
+
+    log.info(f"[admin] cache cleared: {cleared}")
+    return jsonify({"ok": True, "cleared": cleared})
+
+
+@app.route("/api/admin/health", methods=["GET"])
+def r_admin_health():
+    """Quick ping endpoint for the admin panel to verify backend connectivity."""
+    return jsonify({
+        "ok": True,
+        "ts": int(time.time()),
+        "settings_loaded": len(_load_settings()),
+        "auth_required_for_writes": True,
     })
 
 
