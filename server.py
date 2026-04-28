@@ -1722,6 +1722,7 @@ def r_odds_quota():
 
     # If null (e.g. after server restart with no BG cycles yet), fetch live from API
     if rem is None and effective_key:
+        global _api_requests_remaining
         try:
             import requests as _req
             r = _req.get(
@@ -1733,7 +1734,6 @@ def r_odds_quota():
             used_hdr = r.headers.get("x-requests-used")
             if remaining_hdr is not None:
                 rem = int(remaining_hdr)
-                global _api_requests_remaining
                 _api_requests_remaining = rem
                 _api_quotas[effective_key] = rem
                 log.info(f"Quota probe [{effective_key[:8]}…] — remaining: {rem}, used: {used_hdr}")
