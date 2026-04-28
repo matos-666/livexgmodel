@@ -143,16 +143,17 @@ def _get_algorithm_results() -> dict:
                 }
 
             total = len(all_tips)
-            wins = sum(1 for r, _ in all_tips if r == "win")
-            losses = sum(1 for r, _ in all_tips if r == "loss")
+            # Map database values: "green" (win), "red" (loss), "void" (void/cancelled)
+            wins = sum(1 for r, _ in all_tips if r in ("win", "green"))
+            losses = sum(1 for r, _ in all_tips if r in ("loss", "red"))
             pending = sum(1 for r, _ in all_tips if r is None)
 
             # Calculate P&L: sum of (odd - 1) for wins minus 1 unit lost per loss
             pnl = 0
             for result, odd_entry in all_tips:
-                if result == "win" and odd_entry:
+                if result in ("win", "green") and odd_entry:
                     pnl += (odd_entry - 1)  # profit on this bet
-                elif result == "loss":
+                elif result in ("loss", "red"):
                     pnl -= 1  # loss of 1 unit
 
             roi = (pnl / total * 100) if total > 0 else 0
