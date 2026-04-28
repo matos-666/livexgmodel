@@ -1719,6 +1719,27 @@ def r_odds_quota():
     api_key = flask_request.args.get("apiKey", "").strip() or None
     effective_key = api_key or ODDS_API_KEY
     rem = _api_quotas.get(effective_key, _api_requests_remaining)
+
+    # If null (e.g. after server restart with no BG cycles yet), fetch live from API
+    if rem is None and effective_key:
+        try:
+            import requests as _req
+            r = _req.get(
+                f"{ODDS_API_BASE}/sports",
+                params={"apiKey": effective_key},
+                timeout=5
+            )
+            remaining_hdr = r.headers.get("x-requests-remaining")
+            used_hdr = r.headers.get("x-requests-used")
+            if remaining_hdr is not None:
+                rem = int(remaining_hdr)
+                global _api_requests_remaining
+                _api_requests_remaining = rem
+                _api_quotas[effective_key] = rem
+                log.info(f"Quota probe [{effective_key[:8]}…] — remaining: {rem}, used: {used_hdr}")
+        except Exception as e:
+            log.warning(f"Quota probe failed: {e}")
+
     return jsonify({"remaining": rem, "key": effective_key[:8] + "…" if effective_key else None})
 
 
