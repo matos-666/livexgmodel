@@ -300,14 +300,30 @@ def telegram_webhook():
         if stats["total"] == 0:
             msg = "📊 Sem dados ainda.\n\nEspera pelo primeiro resultado."
         else:
+            # Convert P&L from units to $ (assuming $100 per bet)
+            pnl_dollars = stats['pnl'] * 100
+            roi = stats['roi']
+
+            # Dynamic message based on performance
+            if pnl_dollars > 0:
+                emoji_prefix = "🚀" if pnl_dollars > 500 else "📈" if pnl_dollars > 100 else "✅"
+                title = f"{emoji_prefix} <b>Resultados do Algoritmo</b> 💰"
+                pnl_text = f"<b>P&L Total:</b> ${pnl_dollars:,.0f} 💵"
+            elif pnl_dollars < 0:
+                title = f"📉 <b>Resultados do Algoritmo</b>"
+                pnl_text = f"<b>P&L Total:</b> -${abs(pnl_dollars):,.0f} ⚠️"
+            else:
+                title = f"➖ <b>Resultados do Algoritmo</b>"
+                pnl_text = f"<b>P&L Total:</b> $0 (breakeven)"
+
             msg = (
-                f"📊 <b>Resultados do Algoritmo</b>\n\n"
-                f"<b>Picks:</b> {stats['total']}\n"
-                f"<b>Vitorias:</b> {stats['wins']} ✅\n"
-                f"<b>Derrotas:</b> {stats['losses']} ❌\n"
-                f"<b>Pendentes:</b> {stats['pending']} ⏳\n\n"
-                f"<b>P&L Total:</b> {stats['pnl']}\n"
-                f"<b>ROI:</b> {stats['roi']}%"
+                f"{title}\n\n"
+                f"<b>Total Picks:</b> {stats['total']} 🎯\n"
+                f"<b>Wins:</b> {stats['wins']} ✅\n"
+                f"<b>Losses:</b> {stats['losses']} ❌\n"
+                f"<b>Pending:</b> {stats['pending']} ⏳\n\n"
+                f"{pnl_text}\n"
+                f"<b>ROI:</b> {roi:+.1f}% {'🔥' if roi > 10 else '📊' if roi > 0 else '📉'}"
             )
         _send_telegram(msg, chat_id=chat_id)
 
