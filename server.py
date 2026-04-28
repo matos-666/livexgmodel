@@ -125,6 +125,50 @@ def _tg_unsubscribe(chat_id: int):
             "UPDATE tg_subscribers SET active = 0 WHERE chat_id = ?", (chat_id,)
         )
 
+def _get_algorithm_results() -> dict:
+    """Calculate overall algorithm statistics from tips database."""
+    try:
+        with _db() as conn:
+            # Count picks by result
+            all_tips = conn.execute("SELECT result, odd_entry FROM tips").fetchall()
+
+            if not all_tips:
+                return {
+                    "total": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "pending": 0,
+                    "pnl": 0,
+                    "roi": 0
+                }
+
+            total = len(all_tips)
+            wins = sum(1 for r, _ in all_tips if r == "win")
+            losses = sum(1 for r, _ in all_tips if r == "loss")
+            pending = sum(1 for r, _ in all_tips if r is None)
+
+            # Calculate P&L: sum of (odd - 1) for wins minus 1 unit lost per loss
+            pnl = 0
+            for result, odd_entry in all_tips:
+                if result == "win" and odd_entry:
+                    pnl += (odd_entry - 1)  # profit on this bet
+                elif result == "loss":
+                    pnl -= 1  # loss of 1 unit
+
+            roi = (pnl / total * 100) if total > 0 else 0
+
+            return {
+                "total": total,
+                "wins": wins,
+                "losses": losses,
+                "pending": pending,
+                "pnl": round(pnl, 2),
+                "roi": round(roi, 1)
+            }
+    except Exception as e:
+        log.error(f"Error calculating algorithm results: {e}")
+        return {"total": 0, "wins": 0, "losses": 0, "pending": 0, "pnl": 0, "roi": 0}
+
 def _send_telegram(text: str, chat_id=None):
     """Send a message via Telegram Bot API. If chat_id is None, sends to all subscribers."""
     if not TELEGRAM_BOT_TOKEN:
@@ -249,6 +293,22 @@ def telegram_webhook():
             _send_telegram("✅ Estás inscrito e a receber picks em tempo real.", chat_id=chat_id)
         else:
             _send_telegram("⚠️ Não estás inscrito. Envia /start para receber picks.", chat_id=chat_id)
+
+    elif text.startswith("/results"):
+        stats = _get_algorithm_results()
+        if stats["total"] == 0:
+            msg = "📊 Sem dados ainda.\n\nEspera pelo primeiro resultado."
+        else:
+            msg = (
+                f"📊 <b>Resultados do Algoritmo</b>\n\n"
+                f"<b>Picks:</b> {stats['total']}\n"
+                f"<b>Vitorias:</b> {stats['wins']} ✅\n"
+                f"<b>Derrotas:</b> {stats['losses']} ❌\n"
+                f"<b>Pendentes:</b> {stats['pending']} ⏳\n\n"
+                f"<b>P&L Total:</b> {stats['pnl']}\n"
+                f"<b>ROI:</b> {stats['roi']}%"
+            )
+        _send_telegram(msg, chat_id=chat_id)
 
     return "", 200
 
@@ -658,7 +718,7 @@ def _learn_alias(sofascore_name, odds_api_name):
 _odds_cache = {}
 _odds_cache_lock = threading.Lock()
 ODDS_CACHE_TTL = 120         # 2 min — used when there are LIVE monitored games for this sport
-ODDS_CACHE_TTL_IDLE = 1800   # 30 min — used when NO live games (saves quota for client-side polling)
+ODDS_CACHE_TTL_IDLE = 7200   # 2 hours — used when NO live games (saves quota for client-side polling)
 _api_requests_remaining = None
 _api_quotas = {}   # api_key → remaining (tracks quota per key independently)
 
@@ -3623,6 +3683,221 @@ def r_admin_health():
         "settings_loaded": len(_load_settings()),
         "auth_required_for_writes": True,
     })
+
+
+# ════════════════════════════════════════════════════════════
+#  SEO PRERENDER — Dynamic meta tags for crawlers & social bots
+#  Cloudflare Worker routes bots here; humans go to Lovable SPA
+# ════════════════════════════════════════════════════════════
+
+SUPABASE_URL  = os.environ.get("SUPABASE_URL", "https://lcugjwhcmtpdoernjgei.supabase.co")
+SUPABASE_ANON = os.environ.get("SUPABASE_ANON_KEY", "")
+SITE_URL      = os.environ.get("SITE_URL", "https://webpronos.com")
+SITE_NAME     = "WebPronos"
+
+# Cache the base Lovable HTML for 10 min to avoid hammering their CDN
+_base_html_cache: dict = {"html": None, "ts": 0}
+_BASE_HTML_TTL = 600  # seconds
+
+
+def _get_base_html() -> str:
+    """Fetch and cache the Lovable index.html (the SPA shell)."""
+    now = time.time()
+    if _base_html_cache["html"] and now - _base_html_cache["ts"] < _BASE_HTML_TTL:
+        return _base_html_cache["html"]
+    try:
+        import urllib.request as _ur
+        req = _ur.Request(SITE_URL, headers={"User-Agent": "WebPronosSEO/1.0"})
+        with _ur.urlopen(req, timeout=5) as r:
+            html = r.read().decode("utf-8")
+        _base_html_cache["html"] = html
+        _base_html_cache["ts"] = now
+        return html
+    except Exception as e:
+        log.warning(f"[prerender] Could not fetch base HTML: {e}")
+        return ""
+
+
+def _supabase_get_seo_override(match_id: int) -> dict | None:
+    """Check Supabase for a manual SEO override for this match. Returns None if not found."""
+    if not SUPABASE_ANON:
+        return None
+    try:
+        import urllib.request as _ur, urllib.parse as _up
+        url = (
+            f"{SUPABASE_URL}/rest/v1/seo_overrides"
+            f"?match_id=eq.{match_id}&select=meta_title,meta_description,og_image&limit=1"
+        )
+        req = _ur.Request(url, headers={
+            "apikey":        SUPABASE_ANON,
+            "Authorization": f"Bearer {SUPABASE_ANON}",
+        })
+        with _ur.urlopen(req, timeout=3) as r:
+            rows = json.loads(r.read())
+            return rows[0] if rows else None
+    except Exception as e:
+        log.debug(f"[prerender] Supabase seo_overrides lookup failed: {e}")
+        return None
+
+
+def _build_meta_tags(match: dict, odds: dict | None, override: dict | None) -> dict:
+    """Generate SEO meta fields for a match page."""
+    home   = match.get("homeTeam", "Home")
+    away   = match.get("awayTeam", "Away")
+    tourn  = match.get("tournament", "")
+    status = match.get("statusType", "notstarted")
+    h_gls  = match.get("homeGoals", 0) or 0
+    a_gls  = match.get("awayGoals", 0) or 0
+
+    # Build title
+    if override and override.get("meta_title"):
+        title = override["meta_title"]
+    elif status == "inprogress":
+        title = f"{home} {h_gls}–{a_gls} {away} AO VIVO – Previsões xG | {SITE_NAME}"
+    elif status == "finished":
+        title = f"{home} {h_gls}–{a_gls} {away} – Análise xG Final | {SITE_NAME}"
+    else:
+        title = f"{home} vs {away} – Previsões xG ao Vivo | {SITE_NAME}"
+        if tourn:
+            title = f"{home} vs {away} ({tourn}) – Previsões xG | {SITE_NAME}"
+
+    # Build description
+    if override and override.get("meta_description"):
+        desc = override["meta_description"]
+    else:
+        if status == "inprogress":
+            desc = (
+                f"Acompanha {home} vs {away} em tempo real. "
+                f"Placar atual: {h_gls}–{a_gls}. Probabilidades e previsões xG atualizadas ao minuto."
+            )
+        elif status == "finished":
+            desc = (
+                f"Análise completa de {home} {h_gls}–{a_gls} {away}. "
+                f"xG, probabilidades e value bets geradas pelo algoritmo WebPronos."
+            )
+        else:
+            desc = (
+                f"Previsões xG em tempo real para {home} vs {away}"
+                + (f" – {tourn}" if tourn else "")
+                + f". Probabilidades, value bets e análise ao vivo no {SITE_NAME}."
+            )
+
+    # Append live odds snippet if available
+    if odds and odds.get("h2h") and odds["h2h"].get("outcomes") and not (override and override.get("meta_description")):
+        try:
+            oc = {o["name"]: o["price"] for o in odds["h2h"]["outcomes"]}
+            # Try to match team names roughly to h2h outcomes
+            h_price = next((v for k, v in oc.items() if home.split()[0].lower() in k.lower()), None)
+            a_price = next((v for k, v in oc.items() if away.split()[0].lower() in k.lower()), None)
+            if h_price and a_price:
+                desc += f" Odds: {home} @{h_price} | {away} @{a_price}."
+        except Exception:
+            pass
+
+    og_image = (override or {}).get("og_image") or "https://webpronos.com/og-default.png"
+
+    return {"title": title, "description": desc, "og_image": og_image}
+
+
+def _inject_meta(html: str, meta: dict, canonical: str) -> str:
+    """Replace/inject meta tags into the Lovable SPA index.html."""
+    import re
+
+    title_tag    = f'<title>{meta["title"]}</title>'
+    desc_content = meta["description"].replace('"', '&quot;')
+    og_image     = meta["og_image"]
+
+    new_head = (
+        f'{title_tag}\n'
+        f'    <meta name="description" content="{desc_content}">\n'
+        f'    <meta property="og:title" content="{meta["title"]}">\n'
+        f'    <meta property="og:description" content="{desc_content}">\n'
+        f'    <meta property="og:image" content="{og_image}">\n'
+        f'    <meta property="og:url" content="{canonical}">\n'
+        f'    <meta property="og:type" content="website">\n'
+        f'    <meta name="twitter:card" content="summary_large_image">\n'
+        f'    <meta name="twitter:title" content="{meta["title"]}">\n'
+        f'    <meta name="twitter:description" content="{desc_content}">\n'
+        f'    <meta name="twitter:image" content="{og_image}">\n'
+        f'    <link rel="canonical" href="{canonical}">'
+    )
+
+    # Replace existing title tag
+    html = re.sub(r'<title>[^<]*</title>', title_tag, html)
+    # Replace existing meta description
+    html = re.sub(r'<meta\s+name=["\']description["\'][^>]*>', '', html)
+    # Replace og/twitter tags
+    html = re.sub(r'<meta\s+(?:property|name)=["\'](?:og:|twitter:)[^"\']*["\'][^>]*>', '', html)
+    html = re.sub(r'<link\s+rel=["\']canonical["\'][^>]*>', '', html)
+
+    # Inject everything right after <head>
+    html = html.replace('<head>', '<head>\n    ' + new_head, 1)
+
+    return html
+
+
+@app.route("/prerender/match/<int:match_id>")
+def prerender_match(match_id: int):
+    """
+    SEO prerender endpoint for match pages.
+    Called by the Cloudflare Worker when a bot (Googlebot, Twitterbot, etc.) requests /match/:id.
+    Returns the Lovable SPA shell with dynamic meta tags injected for the specific match.
+    """
+    try:
+        # 1. Fetch match data
+        event = get_event(match_id)
+        if not event:
+            return "Not found", 404
+
+        # 2. Fetch odds (best-effort, don't block on failure)
+        try:
+            from flask import g as _g
+            odds = get_full_odds_analysis(event, get_shotmap(match_id))
+        except Exception:
+            odds = None
+
+        # 3. Check for manual Supabase override
+        override = _supabase_get_seo_override(match_id)
+
+        # 4. Build meta
+        meta = _build_meta_tags(event, odds, override)
+        canonical = f"{SITE_URL}/match/{match_id}"
+
+        # 5. Fetch base HTML and inject meta
+        base_html = _get_base_html()
+        if base_html:
+            rendered = _inject_meta(base_html, meta, canonical)
+            return rendered, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+        # Fallback: minimal HTML if Lovable is unreachable
+        fallback = f"""<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{meta['title']}</title>
+  <meta name="description" content="{meta['description']}">
+  <meta property="og:title" content="{meta['title']}">
+  <meta property="og:description" content="{meta['description']}">
+  <meta property="og:image" content="{meta['og_image']}">
+  <meta property="og:url" content="{canonical}">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{meta['title']}">
+  <meta name="twitter:description" content="{meta['description']}">
+  <link rel="canonical" href="{canonical}">
+  <meta http-equiv="refresh" content="0;url={canonical}">
+</head>
+<body>
+  <h1>{meta['title']}</h1>
+  <p>{meta['description']}</p>
+</body>
+</html>"""
+        return fallback, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    except Exception as e:
+        log.exception(f"[prerender] Error for match {match_id}: {e}")
+        return "Internal error", 500
 
 
 if __name__ == "__main__":
