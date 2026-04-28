@@ -1716,13 +1716,13 @@ def r_odds_sport(sport_key):
 @app.route("/api/odds/quota")
 def r_odds_quota():
     """Check remaining Odds API quota — per key if ?apiKey= provided."""
+    global _api_requests_remaining  # must be at top before any use
     api_key = flask_request.args.get("apiKey", "").strip() or None
     effective_key = api_key or ODDS_API_KEY
     rem = _api_quotas.get(effective_key, _api_requests_remaining)
 
     # If null (e.g. after server restart with no BG cycles yet), fetch live from API
     if rem is None and effective_key:
-        global _api_requests_remaining
         try:
             import requests as _req
             r = _req.get(
