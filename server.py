@@ -50,7 +50,7 @@ _session = None
 #  THE ODDS API — Configuration
 # ════════════════════════════════════════════════════════════
 
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "52e6d0bb0daaa9934550b4dc72614f0e")
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "1c0ef0a7986dd583c9eb8fe1a25f7815")
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 # ════════════════════════════════════════════════════════════
