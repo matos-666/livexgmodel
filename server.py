@@ -2946,12 +2946,29 @@ def _run_background_cycle():
                     "SELECT * FROM tips WHERE match_id = ? ORDER BY wall_ts", (mid,)
                 ).fetchall()]
 
+            # ── livePicks: ONLY picks that have value AT THIS MOMENT ──
+            # These are computed from the current live odds + current model probabilities.
+            # If a tip's value disappeared (odds moved against us), it won't appear here,
+            # even if it's still stored in `tips` (for historical track record).
+            live_picks = []
+            for p in picks:
+                live_picks.append({
+                    "market":     p.get("market"),
+                    "label":      p.get("label"),
+                    "odds":       p.get("odds"),       # current live bookmaker odds
+                    "edge":       p.get("edge", 0),    # current edge (positive by definition)
+                    "blend":      p.get("blend", 0),
+                    "model":      p.get("model", 0),
+                    "minute":     minute,
+                })
+
             new_state[mid] = {
                 "match":     m,
                 "shots":     shots,
                 "incidents": incidents,
                 "odds":      odds,
-                "tips":      tips,
+                "tips":      tips,        # all historical tips (for track record)
+                "livePicks": live_picks,  # only currently-valid picks (for "ANÁLISE · VALUE")
                 "ts":        datetime.now(timezone.utc).isoformat(),
             }
         except Exception as e:
