@@ -3807,9 +3807,15 @@ def _inject_meta(html: str, meta: dict, canonical: str) -> str:
     desc_content = meta["description"].replace('"', '&quot;')
     og_image     = meta["og_image"]
 
-    new_head = (
-        f'{title_tag}\n'
-        f'    <meta name="description" content="{desc_content}">\n'
+    # 1. Replace/strip existing tags in <head>
+    html = re.sub(r'<title>[^<]*</title>', title_tag, html)
+    html = re.sub(r'<meta\s+name=["\']description["\'][^>]*/?>', '', html)
+    html = re.sub(r'<meta\s+(?:property|name)=["\'](?:og:|twitter:)[^"\']*["\'][^>]*/?>', '', html)
+    html = re.sub(r'<link\s+rel=["\']canonical["\'][^>]*/?>',  '', html)
+
+    # 2. Build the block of new tags (title already replaced above, so not repeated)
+    new_tags = (
+        f'<meta name="description" content="{desc_content}">\n'
         f'    <meta property="og:title" content="{meta["title"]}">\n'
         f'    <meta property="og:description" content="{desc_content}">\n'
         f'    <meta property="og:image" content="{og_image}">\n'
@@ -3822,16 +3828,13 @@ def _inject_meta(html: str, meta: dict, canonical: str) -> str:
         f'    <link rel="canonical" href="{canonical}">'
     )
 
-    # Replace existing title tag
-    html = re.sub(r'<title>[^<]*</title>', title_tag, html)
-    # Replace existing meta description
-    html = re.sub(r'<meta\s+name=["\']description["\'][^>]*>', '', html)
-    # Replace og/twitter tags
-    html = re.sub(r'<meta\s+(?:property|name)=["\'](?:og:|twitter:)[^"\']*["\'][^>]*>', '', html)
-    html = re.sub(r'<link\s+rel=["\']canonical["\'][^>]*>', '', html)
-
-    # Inject everything right after <head>
-    html = html.replace('<head>', '<head>\n    ' + new_head, 1)
+    # 3. Inject right after <title>...</title>
+    html = re.sub(
+        r'(<title>[^<]*</title>)',
+        r'\1\n    ' + new_tags,
+        html,
+        count=1,
+    )
 
     return html
 
