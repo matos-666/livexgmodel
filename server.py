@@ -2460,7 +2460,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     return "home"
                 if away and (away.split()[0] in lbl or lbl in away):
                     return "away"
-                return "draw" if "empate" in lbl else None
+                return "draw" if "empate" in lbl or "draw" in lbl else None
             if mkt == "HCP":
                 hm = _re.search(r'([+-][\d.]+)$', p["label"])
                 if not hm:
@@ -2712,7 +2712,7 @@ def _auto_resolve_db(match_id: int, match: dict, inc: dict):
             # 1X2 — only at FT
             if mkt == "1X2" and finished:
                 ft = "home" if hg > ag else ("draw" if hg == ag else "away")
-                out_map = {"home": match.get("homeTeam",""), "draw": "Empate", "away": match.get("awayTeam","")}
+                out_map = {"home": match.get("homeTeam",""), "draw": "Draw", "away": match.get("awayTeam","")}
                 for side, name in out_map.items():
                     if lbl.lower() in name.lower() or (len(lbl) > 3 and name.lower().startswith(lbl[:4].lower())):
                         new_result = "green" if side == ft else "red"
@@ -2787,7 +2787,7 @@ def _extract_picks_from_odds(odds: dict, match: dict) -> list:
     if bh and bh.get("outcomes"):
         out_lbls = {
             "home": match.get("homeTeam", "Casa"),
-            "draw": "Empate",
+            "draw": "Draw",
             "away": match.get("awayTeam", "Fora"),
         }
         h2x = [(k, o) for k, o in bh["outcomes"].items() if o.get("isValue") and valid_odds(o)]
@@ -3036,7 +3036,7 @@ def _resolve_finished_tips():
                     new_result = "red" if total > line else "green"
                 elif mkt == "1X2":
                     ft = "home" if hg > ag else ("draw" if hg == ag else "away")
-                    out_map = {"home": r["home_team"], "draw": "Empate", "away": r["away_team"]}
+                    out_map = {"home": r["home_team"], "draw": "Draw", "away": r["away_team"]}
                     for side, name in out_map.items():
                         if lbl.lower() in name.lower() or (len(lbl) > 3 and name.lower().startswith(lbl[:4].lower())):
                             new_result = "green" if side == ft else "red"
