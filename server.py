@@ -657,7 +657,8 @@ def _learn_alias(sofascore_name, odds_api_name):
 
 _odds_cache = {}
 _odds_cache_lock = threading.Lock()
-ODDS_CACHE_TTL = 120   # 2 min server-side cache per sport key + api key
+ODDS_CACHE_TTL = 120         # 2 min — used when there are LIVE monitored games for this sport
+ODDS_CACHE_TTL_IDLE = 1800   # 30 min — used when NO live games (saves quota for client-side polling)
 _api_requests_remaining = None
 _api_quotas = {}   # api_key → remaining (tracks quota per key independently)
 
@@ -698,6 +699,21 @@ def _get_odds_api(url, params=None, api_key=None):
         return None
 
 
+def _has_live_for_sport(sport_key) -> bool:
+    """Check if there's any live game in _live_state matching this sport_key."""
+    try:
+        with _state_lock:
+            for entry in _live_state.values():
+                m = entry.get("match", {})
+                tourn = m.get("tournament", "")
+                country = m.get("country", "")
+                if _resolve_sport_key(tourn, country) == sport_key:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def get_odds_for_sport(sport_key, force=False, api_key=None):
     now = time.time()
     # Normalize cache key by effective API key (resolved), so background cycle
@@ -705,10 +721,17 @@ def get_odds_for_sport(sport_key, force=False, api_key=None):
     effective_key = api_key or ODDS_API_KEY or "default"
     cache_key = f"{sport_key}:{effective_key}"
 
+    # Adaptive TTL: when no live game exists for this sport, use long TTL
+    # to prevent burning quota on idle client-side polling (frontend opening
+    # match detail pages for games that haven't started yet).
+    has_live = _has_live_for_sport(sport_key)
+    effective_ttl = ODDS_CACHE_TTL if has_live else ODDS_CACHE_TTL_IDLE
+
     with _odds_cache_lock:
         cached = _odds_cache.get(cache_key)
-        if cached and not force and (now - cached["ts"]) <= ODDS_CACHE_TTL:
-            log.info(f"Odds cache HIT for {cache_key} ({now - cached['ts']:.0f}s old)")
+        if cached and not force and (now - cached["ts"]) <= effective_ttl:
+            mode = "LIVE" if has_live else "IDLE"
+            log.info(f"Odds cache HIT [{mode}] for {cache_key} ({now - cached['ts']:.0f}s old, ttl={effective_ttl}s)")
             return cached["data"]
 
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
