@@ -3864,7 +3864,9 @@ def prerender_match(match_id: int):
 
         # 4. Build meta
         meta = _build_meta_tags(event, odds, override)
-        canonical = f"{SITE_URL}/match/{match_id}"
+        # Use slug in canonical URL if available (better SEO)
+        slug = event.get("slug", "")
+        canonical = f"{SITE_URL}/match/{match_id}/{slug}" if slug else f"{SITE_URL}/match/{match_id}"
 
         # 5. Fetch base HTML and inject meta
         base_html = _get_base_html()
