@@ -981,6 +981,261 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
         f"{cta}"
     )
 
+def _get_banner_stats() -> dict:
+    """
+    Smart stat picker for the welcome banner — NEVER shows losses.
+    Priority:
+      1. Today's P&L   → show if positive
+      2. Best win today → show if any win exists today
+      3. Week P&L       → show if positive
+      4. All-time P&L   → show if positive
+      5. Neutral fallback: algorithm active
+    Returns dict: {label, value, sub, emoji}
+    """
+    try:
+        STAKE   = get_setting("stake_per_bet", 100.0)
+        now_ts  = int(time.time())
+        from datetime import datetime, timezone, timedelta
+        now_utc = datetime.now(timezone.utc)
+        day_start  = int(datetime(now_utc.year, now_utc.month, now_utc.day,
+                                  tzinfo=timezone.utc).timestamp())
+        week_start = int((now_utc - timedelta(days=7)).timestamp())
+
+        with _db() as conn:
+            # ── Today's picks ────────────────────────────────────────────────
+            today_tips = conn.execute(
+                "SELECT result, odd_entry FROM tips WHERE wall_ts >= ? AND result IS NOT NULL",
+                (day_start,)
+            ).fetchall()
+
+            today_pnl  = 0.0
+            today_wins = 0
+            best_odd_today = 0.0
+            for t in today_tips:
+                if t["result"] in ("win", "green") and t["odd_entry"]:
+                    today_pnl += (t["odd_entry"] - 1) * STAKE
+                    today_wins += 1
+                    best_odd_today = max(best_odd_today, t["odd_entry"])
+                elif t["result"] in ("loss", "red"):
+                    today_pnl -= STAKE
+
+            if today_pnl > 0:
+                return {
+                    "label": "Lucro Hoje",
+                    "value": f"+€{today_pnl:.0f}",
+                    "sub":   f"{today_wins} pick{'s' if today_wins != 1 else ''} verde{'s' if today_wins != 1 else ''}",
+                    "emoji": "💰",
+                    "color": "green",
+                }
+
+            if best_odd_today > 0:
+                return {
+                    "label": "Melhor Pick Hoje",
+                    "value": f"@{best_odd_today:.2f}",
+                    "sub":   "Odd ganha hoje ✅",
+                    "emoji": "🏆",
+                    "color": "green",
+                }
+
+            # ── Week ─────────────────────────────────────────────────────────
+            week_tips = conn.execute(
+                "SELECT result, odd_entry FROM tips WHERE wall_ts >= ? AND result IS NOT NULL",
+                (week_start,)
+            ).fetchall()
+            week_pnl  = 0.0
+            week_wins = 0
+            for t in week_tips:
+                if t["result"] in ("win", "green") and t["odd_entry"]:
+                    week_pnl += (t["odd_entry"] - 1) * STAKE
+                    week_wins += 1
+                elif t["result"] in ("loss", "red"):
+                    week_pnl -= STAKE
+            if week_pnl > 0:
+                return {
+                    "label": "Lucro 7 Dias",
+                    "value": f"+€{week_pnl:.0f}",
+                    "sub":   f"{week_wins} pick{'s' if week_wins != 1 else ''} verde{'s' if week_wins != 1 else ''}",
+                    "emoji": "📈",
+                    "color": "green",
+                }
+
+            # ── All-time ─────────────────────────────────────────────────────
+            all_tips = conn.execute(
+                "SELECT result, odd_entry FROM tips WHERE result IS NOT NULL"
+            ).fetchall()
+            all_pnl  = 0.0
+            all_wins = 0
+            for t in all_tips:
+                if t["result"] in ("win", "green") and t["odd_entry"]:
+                    all_pnl += (t["odd_entry"] - 1) * STAKE
+                    all_wins += 1
+                elif t["result"] in ("loss", "red"):
+                    all_pnl -= STAKE
+            if all_pnl > 0:
+                return {
+                    "label": "Lucro Total",
+                    "value": f"+€{all_pnl:.0f}",
+                    "sub":   f"{all_wins} picks vencedoras",
+                    "emoji": "📊",
+                    "color": "green",
+                }
+    except Exception:
+        pass
+
+    return {
+        "label": "Algoritmo Ativo",
+        "value": "LIVE",
+        "sub":   "Picks em análise • Aguarda alertas",
+        "emoji": "📡",
+        "color": "neutral",
+    }
+
+
+def _build_welcome_banner() -> bytes:
+    """
+    Gera banner PNG 1080x600 para a welcome message do /start.
+    Design: logo esquerda | divisoria verde | stats + tagline direita.
+    Requires: Pillow (pip install Pillow)
+    Logo: static/logo.png (fundo transparente ou preto)
+    Fonts: DejaVu (Docker/Fly.io) or Arial (macOS fallback)
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import io, os
+
+        W, H = 1080, 600
+
+        # ── Paleta ───────────────────────────────────────────────────────────
+        BG         = (0, 0, 0)         # preto puro
+        GREEN_NEON = (57, 255, 20)     # verde neon (#39FF14)
+        GREEN_DIM  = (16, 185, 129)    # emerald (#10b981)
+        WHITE      = (255, 255, 255)
+        GRAY       = (190, 190, 190)
+        GRAY_DIM   = (85, 85, 85)
+        DARK_CARD  = (10, 10, 10)
+
+        img  = Image.new("RGB", (W, H), BG)
+        draw = ImageDraw.Draw(img)
+
+        # ── Fonts (DejaVu no Docker; Arial no macOS) ─────────────────────────
+        FONT_DIRS = [
+            "/usr/share/fonts/truetype/dejavu",   # Fly.io / Debian
+            "/usr/share/fonts/dejavu",
+            "/usr/share/fonts/truetype",
+            "/System/Library/Fonts/Supplemental", # macOS
+            "/Library/Fonts",
+        ]
+        def _load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+            candidates = (
+                ["DejaVuSans-Bold.ttf", "Arial Bold.ttf", "Arial Black.ttf"]
+                if bold else
+                ["DejaVuSans.ttf", "Arial.ttf"]
+            )
+            for d in FONT_DIRS:
+                for n in candidates:
+                    p = os.path.join(d, n)
+                    if os.path.exists(p):
+                        return ImageFont.truetype(p, size)
+            try:
+                return ImageFont.load_default(size=size)
+            except TypeError:
+                return ImageFont.load_default()
+
+        fnt_eyebrow = _load_font(22)
+        fnt_tag     = _load_font(21)
+        fnt_tiny    = _load_font(18)
+        fnt_sub     = _load_font(19)
+        fnt_label   = _load_font(19)
+        fnt_large   = _load_font(52, bold=True)
+        fnt_xlarge  = _load_font(82, bold=True)
+
+        # ── Logo ─────────────────────────────────────────────────────────────
+        logo_col_w = 390
+        BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+        LOGO_PATH  = os.path.join(BASE_DIR, "static", "logo.png")
+        if os.path.exists(LOGO_PATH):
+            try:
+                logo = Image.open(LOGO_PATH).convert("RGBA")
+                logo.thumbnail((340, 400), Image.LANCZOS)
+                lx = (logo_col_w - logo.width) // 2
+                ly = (H - logo.height) // 2
+                bg_p = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                bg_p.paste(logo, (lx, ly))
+                img  = Image.alpha_composite(img.convert("RGBA"), bg_p).convert("RGB")
+                draw = ImageDraw.Draw(img)
+            except Exception:
+                pass
+
+        # ── Divisoria ────────────────────────────────────────────────────────
+        div_x = logo_col_w + 8
+        draw.line([(div_x - 1, 40), (div_x - 1, H - 40)], fill=(10, 80, 60),   width=1)
+        draw.line([(div_x,     40), (div_x,     H - 40)], fill=GREEN_DIM,       width=1)
+        draw.line([(div_x + 1, 40), (div_x + 1, H - 40)], fill=(10, 80, 60),   width=1)
+
+        # ── Coluna direita ───────────────────────────────────────────────────
+        rx = div_x + 50
+        cy = 52
+        rw = W - rx - 36
+
+        # Eyebrow: "* BetRadar AI" (sem emoji — DejaVu nao suporta bem)
+        dot_r = 5
+        draw.ellipse([(rx, cy + 8), (rx + dot_r * 2, cy + 8 + dot_r * 2)],
+                     fill=GREEN_DIM)
+        draw.text((rx + dot_r * 2 + 10, cy), "BetRadar AI", font=fnt_eyebrow, fill=GREEN_DIM)
+        cy += 46
+
+        # Titulo
+        draw.text((rx, cy), "LIVE AI", font=fnt_xlarge, fill=WHITE)
+        cy += 88
+        draw.text((rx, cy), "GENERATED PICKS", font=fnt_large, fill=GREEN_NEON)
+        cy += 66
+
+        # Subtitulo
+        draw.text((rx, cy), "Real-time football value bets powered by xG model",
+                  font=fnt_tag, fill=GRAY)
+        cy += 40
+
+        # Separador
+        draw.line([(rx, cy), (rx + rw, cy)], fill=GRAY_DIM, width=1)
+        cy += 22
+
+        # ── Stats card ───────────────────────────────────────────────────────
+        stat   = _get_banner_stats()
+        card_h = 134
+        card_r = [rx, cy, rx + rw, cy + card_h]
+        draw.rounded_rectangle(card_r, radius=14, fill=DARK_CARD)
+        draw.rounded_rectangle(card_r, radius=14, outline=GREEN_DIM, width=1)
+
+        # Indicador verde (bola) + label
+        sx, sy = rx + 24, cy + 14
+        draw.ellipse([(sx, sy + 4), (sx + 8, sy + 12)], fill=GREEN_NEON)
+        draw.text((sx + 16, sy), stat["label"].upper(), font=fnt_label, fill=GRAY)
+        sy += 32
+
+        # Valor principal
+        val_color = GREEN_NEON if stat["color"] == "green" else GRAY
+        draw.text((sx, sy), stat["value"], font=fnt_large, fill=val_color)
+        sy += 58
+
+        # Sub-texto
+        draw.text((sx, sy), stat["sub"], font=fnt_sub, fill=GRAY)
+
+        cy += card_h + 18
+
+        # Rodape
+        draw.text((rx, cy), "t.me/BetRadarAI_bot  |  webpronos.com",
+                  font=fnt_tiny, fill=GRAY_DIM)
+
+        # ── Export ────────────────────────────────────────────────────────────
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    except Exception as e:
+        log.warning(f"_build_welcome_banner failed: {e}")
+        return b""  # fallback silencioso — welcome text enviado na mesma
+
+
 def _build_welcome(first_name: str | None = None) -> str:
     """Personalised welcome — BetRadar AI brand with all-time engagement stats."""
     name_part = f", {first_name}" if first_name else ""
@@ -1231,6 +1486,10 @@ def telegram_webhook():
         start_param = parts[1].strip() if len(parts) > 1 else None
         _tg_log_start(chat_id, username, first_name, start_param)
         _tg_subscribe(chat_id, username=username, first_name=first_name)
+        # Send engaging banner first, then welcome text + menu
+        banner = _build_welcome_banner()
+        if banner:
+            _send_telegram_photo(chat_id, banner)
         _send_telegram_buttons(_build_welcome(first_name), chat_id, _build_main_menu())
 
     elif text.startswith("/whoami"):
