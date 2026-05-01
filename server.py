@@ -20,7 +20,7 @@ import threading
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
-from flask import Flask, jsonify, request as flask_request
+from flask import Flask, jsonify, request as flask_request, Response
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -50,14 +50,91 @@ _session = None
 #  THE ODDS API — Configuration
 # ════════════════════════════════════════════════════════════
 
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "1c0ef0a7986dd583c9eb8fe1a25f7815")
+# ── API keys: prioritized list (first entry = highest priority) ─────────────
+# Override via env var ODDS_API_KEYS (comma-separated). The list is consumed
+# top-down: each key is used until its remaining requests drop below
+# ODDS_API_KEY_THRESHOLD, at which point the next key takes over.
+_DEFAULT_ODDS_KEYS = [
+    "fc5ffe1ae61f015bd565fca2241a75c9",
+    "d7660835556393ef648d3fd44400a105",
+    "ee0c7f34fc6c582778e591ca6fa46ab7",
+    "5270d56caf490ee0643c7291a1b9fc56",
+    "52e6d0bb0daaa9934550b4dc72614f0e",
+    "09bc0566f02e87b93872930c42de1291",
+    "8b7efbd1ffa865b6c9fe536ebcb9c6b7",
+    "415046f2c4c0225f6baa278c9b10bba9",
+    "8b00b28cc1004ed9726fb34309bdbdb3",
+    "05eb21f6d1bdb27eb5f34e72ff0cb9f5",
+    "827f8bdfce132211875593112498d659",
+    "a6aebdd942dafbbe3a227bbc29bf7611",
+    "cce963dbb03009752097869c7852b661",
+    "50a2955658b6807a541115f81d414a76",
+    "bff58f986dca45ba7308dd05ea8ee539",
+    "532b6697ae8a3de4e3ead16d298cf34c",
+    "c9794c676f842fa06aea5aa6c000e0bf",
+    "1c0ef0a7986dd583c9eb8fe1a25f7815",
+    "290e27c8a2b8c6989616812292957b32",
+    "4914cf81d4ad7d509c768a9cbfdcdea2",
+    "bbc2a6255721b666e6ee8b1b38542dfe",
+    "86431b2f6ef8a1dc431a253f018e10c3",
+    "313f5d07b1e7eecd09c596ba0604c83e",
+    "5a3c8142d4cf6fc67f41e0c7f1909893",
+]
+
+_env_keys = [k.strip() for k in os.environ.get("ODDS_API_KEYS", "").split(",") if k.strip()]
+ODDS_API_KEYS: list[str] = _env_keys if _env_keys else _DEFAULT_ODDS_KEYS
+
+# Back-compat: many places in the codebase still reference ODDS_API_KEY directly
+# (cache keys, quota endpoint default, log prefixes). Point it at the head of the
+# rotation list so behaviour stays consistent.
+ODDS_API_KEY = ODDS_API_KEYS[0] if ODDS_API_KEYS else os.environ.get("ODDS_API_KEY", "")
+
+# Legacy single-backup env var: append to the rotation list if present and not
+# already there (keeps older deployments working without a config flip).
+_env_backup = os.environ.get("ODDS_API_KEY_BACKUP", "").strip()
+if _env_backup and _env_backup not in ODDS_API_KEYS:
+    ODDS_API_KEYS.append(_env_backup)
+
+ODDS_API_KEY_THRESHOLD = 5    # rotate when remaining drops below this
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+
+def _active_odds_key() -> str:
+    """
+    Walk ODDS_API_KEYS top-down and return the first key that still has more
+    than ODDS_API_KEY_THRESHOLD requests remaining (or that hasn't been probed
+    yet — unprobed keys are assumed fresh and given a chance).
+
+    If every key in the list is exhausted, fall back to the last one so the
+    request still goes through (and surfaces a quota-exceeded error from the
+    upstream API rather than failing silently here).
+    """
+    if not ODDS_API_KEYS:
+        return ""
+    for key in ODDS_API_KEYS:
+        rem = _api_quotas.get(key)
+        # Unknown remaining → treat as fresh (probe will populate it on first use)
+        if rem is None or rem >= ODDS_API_KEY_THRESHOLD:
+            return key
+    # All keys exhausted — return the last one so the upstream error is exposed
+    return ODDS_API_KEYS[-1]
 
 # ════════════════════════════════════════════════════════════
 #  TELEGRAM BOT
 # ════════════════════════════════════════════════════════════
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+# Comma-separated list of Telegram chat_ids allowed to use /admin_stats.
+# Discover your own with the /whoami bot command, then:
+#   fly secrets set TELEGRAM_ADMIN_CHAT_IDS="123456789"
+TELEGRAM_ADMIN_CHAT_IDS: set[int] = {
+    int(x.strip()) for x in os.environ.get("TELEGRAM_ADMIN_CHAT_IDS", "").split(",")
+    if x.strip().lstrip("-").isdigit()
+}
+
+def _is_tg_admin(chat_id: int) -> bool:
+    return chat_id in TELEGRAM_ADMIN_CHAT_IDS
 
 # ── Affiliate CTAs — rotated on every pick alert ──────────────────────────
 # Each entry: (display_text, url)
@@ -125,6 +202,104 @@ def _tg_unsubscribe(chat_id: int):
             "UPDATE tg_subscribers SET active = 0 WHERE chat_id = ?", (chat_id,)
         )
 
+
+def _tg_log_start(chat_id: int, username: str | None, first_name: str | None,
+                  start_param: str | None):
+    """
+    Log every /start invocation (one row per call, even if same user starts multiple times).
+    `start_param` is the deep-link payload — e.g. when someone opens
+    https://t.me/YourBot?start=instagram_oct it arrives as "instagram_oct".
+    """
+    try:
+        with _db() as conn:
+            conn.execute("""
+                INSERT INTO tg_starts (chat_id, username, first_name, start_param, started_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (chat_id, username, first_name, start_param, int(time.time())))
+    except Exception as e:
+        log.warning(f"_tg_log_start failed for {chat_id}: {e}")
+
+
+def _tg_admin_stats() -> str:
+    """Build the /admin_stats reply text (HTML)."""
+    try:
+        now = int(time.time())
+        day_ago  = now - 86400
+        week_ago = now - 86400 * 7
+        with _db() as conn:
+            total_starts = conn.execute("SELECT COUNT(*) c FROM tg_starts").fetchone()["c"]
+            unique_users = conn.execute("SELECT COUNT(DISTINCT chat_id) c FROM tg_starts").fetchone()["c"]
+            starts_24h   = conn.execute("SELECT COUNT(*) c FROM tg_starts WHERE started_at >= ?", (day_ago,)).fetchone()["c"]
+            starts_7d    = conn.execute("SELECT COUNT(*) c FROM tg_starts WHERE started_at >= ?", (week_ago,)).fetchone()["c"]
+            new_users_24h = conn.execute("""
+                SELECT COUNT(*) c FROM (
+                    SELECT chat_id, MIN(started_at) first_ts
+                    FROM tg_starts GROUP BY chat_id
+                ) WHERE first_ts >= ?
+            """, (day_ago,)).fetchone()["c"]
+            new_users_7d = conn.execute("""
+                SELECT COUNT(*) c FROM (
+                    SELECT chat_id, MIN(started_at) first_ts
+                    FROM tg_starts GROUP BY chat_id
+                ) WHERE first_ts >= ?
+            """, (week_ago,)).fetchone()["c"]
+            active_subs = conn.execute(
+                "SELECT COUNT(*) c FROM tg_subscribers WHERE active = 1"
+            ).fetchone()["c"]
+            inactive_subs = conn.execute(
+                "SELECT COUNT(*) c FROM tg_subscribers WHERE active = 0"
+            ).fetchone()["c"]
+            top_params = conn.execute("""
+                SELECT COALESCE(NULLIF(start_param, ''), '(none)') src,
+                       COUNT(*) c,
+                       COUNT(DISTINCT chat_id) u
+                FROM tg_starts
+                GROUP BY src
+                ORDER BY c DESC
+                LIMIT 10
+            """).fetchall()
+            recent = conn.execute("""
+                SELECT chat_id, username, first_name, start_param, started_at
+                FROM tg_starts
+                ORDER BY started_at DESC
+                LIMIT 5
+            """).fetchall()
+
+        lines = [
+            "📊 <b>Admin Stats</b>",
+            "",
+            f"👥 <b>Users:</b> {unique_users} unique  ({active_subs} active subs · {inactive_subs} unsubscribed)",
+            f"🚀 <b>/start events:</b> {total_starts} total",
+            "",
+            f"📅 <b>Last 24h:</b>  {starts_24h} starts · {new_users_24h} new users",
+            f"📆 <b>Last 7d:</b>   {starts_7d} starts · {new_users_7d} new users",
+            "",
+            "🔗 <b>Top sources (start params):</b>",
+        ]
+        if top_params:
+            for r in top_params:
+                src = (r["src"] or "(none)")[:30]
+                lines.append(f"  • <code>{src}</code> — {r['c']} starts ({r['u']} users)")
+        else:
+            lines.append("  <i>(no /start events yet)</i>")
+
+        lines.append("")
+        lines.append("🆕 <b>Latest 5 /start events:</b>")
+        if recent:
+            for r in recent:
+                from datetime import datetime as _dt, timezone as _tz
+                ts = _dt.fromtimestamp(r["started_at"], tz=_tz.utc).strftime("%m-%d %H:%M")
+                uname = f"@{r['username']}" if r["username"] else (r["first_name"] or f"id:{r['chat_id']}")
+                param = f" [{r['start_param']}]" if r["start_param"] else ""
+                lines.append(f"  • {ts} — {uname}{param}")
+        else:
+            lines.append("  <i>(none)</i>")
+
+        return "\n".join(lines)
+    except Exception as e:
+        log.exception("_tg_admin_stats failed")
+        return f"❌ Erro ao gerar stats: {e}"
+
 def _get_algorithm_results() -> dict:
     """Calculate overall algorithm statistics from tips database."""
     try:
@@ -191,6 +366,582 @@ def _send_telegram(text: str, chat_id=None):
         except Exception as e:
             log.error(f"Telegram send failed to {cid}: {e}")
 
+def _send_telegram_buttons(text: str, chat_id: int, buttons: list):
+    """Send a message with inline keyboard buttons to a specific chat_id."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    import urllib.request as _urllib
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = json.dumps({
+            "chat_id": str(chat_id),
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": {"inline_keyboard": buttons},
+        }).encode()
+        req = _urllib.Request(url, data=payload,
+                              headers={"Content-Type": "application/json"})
+        _urllib.urlopen(req, timeout=10)
+    except Exception as e:
+        log.error(f"Telegram send_buttons failed to {chat_id}: {e}")
+
+def _tg_answer_callback(callback_id: str, text: str = ""):
+    """Answer a Telegram callback query to dismiss the loading spinner."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    import urllib.request as _urllib
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        payload = json.dumps({"callback_query_id": callback_id, "text": text}).encode()
+        req = _urllib.Request(url, data=payload,
+                              headers={"Content-Type": "application/json"})
+        _urllib.urlopen(req, timeout=5)
+    except Exception as e:
+        log.error(f"Telegram answer_callback failed: {e}")
+
+def _get_monthly_stats() -> dict:
+    """P&L em € este mês (€100/pick), odds médias, total picks liquidados."""
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        month_start_ts = int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp())
+        STAKE = get_setting("stake_per_bet", 100.0)
+        with _db() as conn:
+            tips = conn.execute(
+                "SELECT result, odd_entry, market FROM tips "
+                "WHERE wall_ts >= ? AND result IS NOT NULL",
+                (month_start_ts,)
+            ).fetchall()
+        if not tips:
+            return {"total": 0, "settled": 0, "pnl_eur": 0.0, "avg_odds": 0.0, "markets": {}}
+        pnl = 0.0
+        odds_sum = 0.0
+        settled = 0
+        markets: dict = {}
+        for tip in tips:
+            result, odd_entry, market = tip["result"], tip["odd_entry"], tip["market"]
+            mkt = market or "—"
+            markets[mkt] = markets.get(mkt, 0) + 1
+            if result in ("win", "green") and odd_entry:
+                pnl += (odd_entry - 1) * STAKE
+                odds_sum += odd_entry
+                settled += 1
+            elif result in ("loss", "red"):
+                pnl -= STAKE
+                odds_sum += (odd_entry or 0)
+                settled += 1
+        avg_odds = odds_sum / settled if settled > 0 else 0.0
+        return {
+            "total": len(tips),
+            "settled": settled,
+            "pnl_eur": round(pnl, 2),
+            "avg_odds": round(avg_odds, 2),
+            "markets": markets,
+        }
+    except Exception as e:
+        log.error(f"_get_monthly_stats error: {e}")
+        return {"total": 0, "settled": 0, "pnl_eur": 0.0, "avg_odds": 0.0, "markets": {}}
+
+
+def _period_start_ts(period: str) -> int | None:
+    """Return unix-ts cutoff for the given period, or None for 'alltime'."""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    if period == "month":
+        return int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp())
+    if period == "7d":
+        return int((now - timedelta(days=7)).timestamp())
+    return None  # alltime
+
+
+_PERIOD_LABEL = {
+    "alltime": ("♾ Geral",  "Geral"),
+    "month":   ("📅 Mês",   "Este Mês"),
+    "7d":      ("🗓 7 dias", "Últimos 7 dias"),
+}
+
+
+def _get_period_stats(period: str = "alltime") -> dict:
+    """Aggregate stats over a period: alltime, month, 7d."""
+    try:
+        STAKE = get_setting("stake_per_bet", 100.0)
+        cutoff = _period_start_ts(period)
+        where  = "WHERE result IS NOT NULL"
+        params: tuple = ()
+        if cutoff is not None:
+            where += " AND wall_ts >= ?"
+            params = (cutoff,)
+
+        with _db() as conn:
+            ordered = conn.execute(
+                f"SELECT result, odd_entry, market, wall_ts FROM tips {where} ORDER BY wall_ts ASC",
+                params
+            ).fetchall()
+
+        if not ordered:
+            return {"settled": 0, "wins": 0, "losses": 0, "winrate": 0.0,
+                    "pnl_eur": 0.0, "roi": 0.0, "avg_odds": 0.0,
+                    "best_streak": 0, "best_win_pnl": 0.0, "markets": {}}
+
+        wins = losses = 0
+        pnl  = 0.0
+        odds_sum = 0.0
+        best_win_pnl = 0.0
+        streak = best_streak = 0
+        markets: dict = {}
+
+        for tip in ordered:
+            result, odd, market = tip["result"], tip["odd_entry"], tip["market"]
+            mkt = market or "—"
+            markets[mkt] = markets.get(mkt, 0) + 1
+            if result in ("win", "green") and odd:
+                profit = (odd - 1) * STAKE
+                wins += 1; pnl += profit; odds_sum += odd
+                streak += 1
+                best_streak  = max(best_streak, streak)
+                best_win_pnl = max(best_win_pnl, profit)
+            elif result in ("loss", "red"):
+                losses += 1; pnl -= STAKE; odds_sum += (odd or 0)
+                streak = 0
+
+        settled = wins + losses
+        return {
+            "settled":      settled,
+            "wins":         wins,
+            "losses":       losses,
+            "winrate":      round((wins / settled * 100) if settled else 0.0, 1),
+            "pnl_eur":      round(pnl, 2),
+            "roi":          round((pnl / (settled * STAKE) * 100) if settled else 0.0, 1),
+            "avg_odds":     round((odds_sum / settled) if settled else 0.0, 2),
+            "best_streak":  best_streak,
+            "best_win_pnl": round(best_win_pnl, 2),
+            "markets":      markets,
+        }
+    except Exception as e:
+        log.error(f"_get_period_stats({period}) error: {e}")
+        return {"settled": 0, "wins": 0, "losses": 0, "winrate": 0.0,
+                "pnl_eur": 0.0, "roi": 0.0, "avg_odds": 0.0,
+                "best_streak": 0, "best_win_pnl": 0.0, "markets": {}}
+
+
+def _get_biggest_green(period: str = "alltime") -> dict | None:
+    """
+    Find the highest-odd winning pick in the period — extra engagement hook.
+    Returns {"odd", "profit", "match", "market", "label", "ts"} or None.
+    """
+    try:
+        STAKE = get_setting("stake_per_bet", 100.0)
+        cutoff = _period_start_ts(period)
+        where = "WHERE t.result IN ('win','green') AND t.odd_entry IS NOT NULL"
+        params: tuple = ()
+        if cutoff is not None:
+            where += " AND t.wall_ts >= ?"
+            params = (cutoff,)
+
+        with _db() as conn:
+            row = conn.execute(f"""
+                SELECT t.odd_entry odd, t.market, t.label, t.wall_ts ts,
+                       g.home_team, g.away_team
+                FROM tips t
+                LEFT JOIN games g ON g.id = t.match_id
+                {where}
+                ORDER BY t.odd_entry DESC LIMIT 1
+            """, params).fetchone()
+
+        if not row or not row["odd"]:
+            return None
+        return {
+            "odd":    round(row["odd"], 2),
+            "profit": round((row["odd"] - 1) * STAKE, 2),
+            "match":  f"{row['home_team']} vs {row['away_team']}" if row["home_team"] else "—",
+            "market": row["market"] or "—",
+            "label":  row["label"] or "",
+            "ts":     row["ts"],
+        }
+    except Exception as e:
+        log.error(f"_get_biggest_green({period}) error: {e}")
+        return None
+
+
+# Back-compat alias kept for older callers
+def _get_alltime_stats() -> dict:
+    """All-time aggregate stats across every settled pick in the DB."""
+    try:
+        STAKE = get_setting("stake_per_bet", 100.0)
+        with _db() as conn:
+            tips = conn.execute(
+                "SELECT result, odd_entry, market FROM tips WHERE result IS NOT NULL"
+            ).fetchall()
+            total_picks = conn.execute("SELECT COUNT(*) c FROM tips").fetchone()["c"]
+
+        if not tips:
+            return {
+                "total": total_picks, "settled": 0, "wins": 0, "losses": 0,
+                "winrate": 0.0, "pnl_eur": 0.0, "roi": 0.0, "avg_odds": 0.0,
+                "best_streak": 0, "best_win_pnl": 0.0,
+            }
+
+        wins = losses = 0
+        pnl  = 0.0
+        odds_sum = 0.0
+        best_win_pnl = 0.0
+        # Streak tracking (chronological)
+        streak = best_streak = 0
+
+        # Re-fetch ordered for streak calculation
+        with _db() as conn:
+            ordered = conn.execute(
+                "SELECT result, odd_entry FROM tips WHERE result IS NOT NULL ORDER BY wall_ts ASC"
+            ).fetchall()
+
+        for tip in ordered:
+            result, odd = tip["result"], tip["odd_entry"]
+            if result in ("win", "green") and odd:
+                profit = (odd - 1) * STAKE
+                wins += 1
+                pnl  += profit
+                odds_sum += odd
+                streak += 1
+                best_streak = max(best_streak, streak)
+                best_win_pnl = max(best_win_pnl, profit)
+            elif result in ("loss", "red"):
+                losses += 1
+                pnl -= STAKE
+                odds_sum += (odd or 0)
+                streak = 0
+
+        settled = wins + losses
+        winrate = (wins / settled * 100) if settled else 0.0
+        avg_odds = (odds_sum / settled) if settled else 0.0
+        roi = (pnl / (settled * STAKE) * 100) if settled else 0.0
+
+        return {
+            "total":        total_picks,
+            "settled":      settled,
+            "wins":         wins,
+            "losses":       losses,
+            "winrate":      round(winrate, 1),
+            "pnl_eur":      round(pnl, 2),
+            "roi":          round(roi, 1),
+            "avg_odds":     round(avg_odds, 2),
+            "best_streak":  best_streak,
+            "best_win_pnl": round(best_win_pnl, 2),
+        }
+    except Exception as e:
+        log.error(f"_get_alltime_stats error: {e}")
+        return {
+            "total": 0, "settled": 0, "wins": 0, "losses": 0,
+            "winrate": 0.0, "pnl_eur": 0.0, "roi": 0.0, "avg_odds": 0.0,
+            "best_streak": 0, "best_win_pnl": 0.0,
+        }
+
+
+def _generate_chart(period: str = "alltime") -> bytes | None:
+    """
+    Generate professional P&L chart for the given period.
+      - "alltime": daily aggregation since first pick
+      - "month":   day-of-month aggregation
+      - "7d":      day-by-day for the last 7 days
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+        import io
+        from datetime import datetime, timezone, timedelta
+
+        now    = datetime.now(timezone.utc)
+        STAKE  = get_setting("stake_per_bet", 100.0)
+        cutoff = _period_start_ts(period)
+
+        where  = "WHERE result IS NOT NULL"
+        params: tuple = ()
+        if cutoff is not None:
+            where += " AND wall_ts >= ?"
+            params = (cutoff,)
+
+        with _db() as conn:
+            tips = conn.execute(
+                f"SELECT result, odd_entry, wall_ts FROM tips {where} ORDER BY wall_ts ASC",
+                params
+            ).fetchall()
+
+        if not tips:
+            return None
+
+        # Date-key formatting per period
+        if period == "month":
+            keyfmt = "%-d"            # day-of-month
+        elif period == "7d":
+            keyfmt = "%a %d"          # "Mon 05"
+        else:
+            keyfmt = "%b %-d"         # "Apr 28" — alltime can span months
+
+        daily: dict[str, float] = {}
+        order_keys: list[str] = []     # preserve chronological order
+        for tip in tips:
+            result, odd_entry, wall_ts = tip["result"], tip["odd_entry"], tip["wall_ts"]
+            day = datetime.fromtimestamp(wall_ts, tz=timezone.utc).strftime(keyfmt)
+            if day not in daily:
+                order_keys.append(day)
+                daily[day] = 0.0
+            if result in ("win", "green") and odd_entry:
+                daily[day] += (odd_entry - 1) * STAKE
+            elif result in ("loss", "red"):
+                daily[day] -= STAKE
+
+        if not daily:
+            return None
+
+        days   = order_keys
+        values = [daily[d] for d in days]
+        cumul, total = [], 0.0
+        for v in values:
+            total += v
+            cumul.append(round(total, 2))
+
+        # Professional dark palette
+        BG, PANEL = "#0a0e27", "#1a1f3a"
+        GREEN, RED = "#10b981", "#ef5350"
+        GRAY, WHITE = "#4b5563", "#e8f0f7"
+
+        colors    = [GREEN if v >= 0 else RED for v in values]
+        cum_color = GREEN if cumul[-1] >= 0 else RED
+        period_label = {
+            "alltime": "Geral",
+            "month":   now.strftime("%B %Y"),
+            "7d":      "Últimos 7 dias",
+        }.get(period, "Geral")
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), facecolor=BG)
+        fig.suptitle(f"🤖 BetRadar AI — P&L {period_label}",
+                     color=WHITE, fontsize=16, fontweight="bold", y=0.98)
+
+        # ── Top: daily bars ──
+        ax1.set_facecolor(PANEL)
+        bars = ax1.bar(days, values, color=colors, alpha=0.85, edgecolor=WHITE, linewidth=0.5, zorder=2)
+        ax1.axhline(0, color=GRAY, linewidth=1, zorder=1, linestyle="-", alpha=0.6)
+        ax1.grid(axis="y", color=GRAY, alpha=0.15, linestyle="--", linewidth=0.5, zorder=0)
+        ax1.set_title("Daily P&L (€ per day)", color=WHITE, fontsize=11, fontweight="600", pad=10)
+        ax1.tick_params(colors=WHITE, labelsize=9)
+        ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"€{x:+.0f}"))
+        ax1.yaxis.set_label_position("right")
+        ax1.yaxis.tick_right()
+        # Rotate x labels when there are many days (alltime / wide-period)
+        if len(days) > 12:
+            for lbl in ax1.get_xticklabels():
+                lbl.set_rotation(45); lbl.set_ha("right")
+
+        for spine in ax1.spines.values():
+            spine.set_color(GRAY)
+            spine.set_linewidth(0.8)
+        ax1.spines["top"].set_visible(False)
+        ax1.spines["left"].set_visible(False)
+        ax1.set_xlim(-0.6, len(days) - 0.4)
+
+        # ── Bottom: cumulative line ──
+        xs = range(len(days))
+        ax2.set_facecolor(PANEL)
+        ax2.fill_between(xs, cumul, 0, alpha=0.15, color=cum_color, zorder=2)
+        ax2.plot(xs, cumul, color=cum_color, linewidth=2.5, marker="o",
+                 markersize=5, zorder=3, markerfacecolor=cum_color, markeredgecolor=WHITE, markeredgewidth=1)
+        ax2.axhline(0, color=GRAY, linewidth=1, zorder=1, linestyle="-", alpha=0.6)
+        ax2.grid(axis="y", color=GRAY, alpha=0.15, linestyle="--", linewidth=0.5, zorder=0)
+        ax2.set_title("Cumulative P&L (€ running total)", color=WHITE, fontsize=11, fontweight="600", pad=10)
+        ax2.tick_params(colors=WHITE, labelsize=9)
+        ax2.set_xticks(list(xs))
+        ax2.set_xticklabels(days)
+        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"€{x:+.0f}"))
+        ax2.yaxis.set_label_position("right")
+        ax2.yaxis.tick_right()
+        if len(days) > 12:
+            for lbl in ax2.get_xticklabels():
+                lbl.set_rotation(45); lbl.set_ha("right")
+
+        for spine in ax2.spines.values():
+            spine.set_color(GRAY)
+            spine.set_linewidth(0.8)
+        ax2.spines["top"].set_visible(False)
+        ax2.spines["left"].set_visible(False)
+        ax2.set_xlim(-0.4, len(days) - 0.6)
+
+        # Total P&L annotation with better styling
+        final_value = cumul[-1]
+        ax2.annotate(f"Total: €{final_value:+.2f}",
+                     xy=(len(days) - 1, final_value),
+                     xytext=(-15, 15), textcoords="offset points",
+                     color=cum_color, fontsize=11, fontweight="bold",
+                     ha="right",
+                     bbox=dict(boxstyle="round,pad=0.5", facecolor=PANEL, edgecolor=cum_color,
+                               linewidth=1.5, alpha=0.9),
+                     arrowprops=dict(arrowstyle="->", color=cum_color, lw=1, alpha=0.7))
+
+        # Stake info at the bottom
+        fig.text(0.5, 0.01, f"Stake: €{STAKE:.0f}/pick  •  Total picks: {len(tips)}  •  Win rate: {sum(1 for v in values if v > 0)}/{len(days)} days",
+                 ha="center", color=GRAY, fontsize=9, style="italic")
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=150, facecolor=BG, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        log.error(f"_generate_chart({period}) error: {e}")
+        return None
+
+
+def _generate_monthly_chart() -> bytes | None:
+    """Back-compat shim — prefer _generate_chart('month') directly."""
+    return _generate_chart("month")
+
+
+def _send_telegram_photo(chat_id: int, photo_bytes: bytes,
+                          caption: str = "", buttons: list | None = None):
+    """Envia foto (PNG) via Telegram sendPhoto com multipart/form-data."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    import urllib.request as _urllib
+    try:
+        boundary = "TGBotBoundary7x3k"
+        CRLF = b"\r\n"
+
+        def field(name: str, value: str) -> bytes:
+            return (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}"
+            ).encode() + CRLF
+
+        body = (
+            field("chat_id", str(chat_id))
+            + field("parse_mode", "HTML")
+        )
+        if caption:
+            body += field("caption", caption)
+        if buttons:
+            body += field("reply_markup", json.dumps({"inline_keyboard": buttons}))
+        # Photo part
+        body += (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="photo"; filename="chart.png"\r\n'
+            f"Content-Type: image/png\r\n\r\n"
+        ).encode() + photo_bytes + CRLF
+        body += f"--{boundary}--\r\n".encode()
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        req = _urllib.Request(url, data=body,
+                              headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        _urllib.urlopen(req, timeout=30)
+    except Exception as e:
+        log.error(f"Telegram send_photo failed to {chat_id}: {e}")
+
+
+def _get_live_grouped() -> str:
+    """Live games grouped by tournament, with clickable links for games with picks."""
+    try:
+        with _state_lock:
+            by_tourn: dict[str, list] = {}
+            for entry in _live_state.values():
+                m = entry.get("match", {})
+                if m.get("statusType") != "inprogress":
+                    continue
+                flag   = _country_flag(m.get("country", ""))
+                tourn  = m.get("tournament", "Desconhecida")
+                home   = m.get("homeTeam", "")
+                away   = m.get("awayTeam", "")
+                hg     = m.get("homeGoals", 0) or 0
+                ag     = m.get("awayGoals", 0) or 0
+                mins   = m.get("currentMinute") or m.get("statusTime") or "?"
+                n_tips = len(entry.get("tips", []))
+                match_id = m.get("id")
+
+                # Format score with better readability
+                score = f"<b>{hg}–{ag}</b>"
+                time_str = f"{mins}'" if mins != "?" else "?"
+
+                # Build game line with optional link
+                if n_tips > 0 and match_id:
+                    # Game with picks → add clickable link to webpronos
+                    home_slug = _slug(home)
+                    away_slug = _slug(away)
+                    url = f"https://webpronos.com/match/{match_id}/{home_slug}-{away_slug}"
+                    pick_icon = "🎯" if n_tips == 1 else f"🎯×{n_tips}"
+                    line = f"  <a href=\"{url}\">⚽ {home} {score} {away}</a> | {time_str} | {pick_icon}"
+                else:
+                    # Game without picks → plain text
+                    line = f"  ⚽ {home} {score} {away} | {time_str}"
+
+                key = f"{flag} <b>{tourn}</b>"
+                by_tourn.setdefault(key, []).append(line)
+
+        if not by_tourn:
+            return "Sem jogos live de momento 😴"
+
+        parts = []
+        for tourn_header, matches in by_tourn.items():
+            parts.append(tourn_header)
+            parts.extend(matches)
+            parts.append("")  # blank line between tournaments
+        return "\n".join(parts).rstrip()
+    except Exception as e:
+        log.error(f"Error in _get_live_grouped: {e}")
+        return "Erro ao obter jogos live."
+
+def _get_live_summary() -> str:
+    """Short (max 6 lines) summary of in-progress games for the welcome message."""
+    try:
+        with _state_lock:
+            lines = []
+            for entry in _live_state.values():
+                m = entry.get("match", {})
+                if m.get("statusType") == "inprogress":
+                    flag = _country_flag(m.get("country", ""))
+                    home = m.get("homeTeam", "")
+                    away = m.get("awayTeam", "")
+                    hg   = m.get("homeGoals", 0) or 0
+                    ag   = m.get("awayGoals", 0) or 0
+                    mins = m.get("currentMinute") or m.get("statusTime") or "?"
+                    n_tips = len(entry.get("tips", []))
+                    tip_badge = f" 🎯" if n_tips > 0 else ""
+                    lines.append(f"  {flag} {home} <b>{hg}–{ag}</b> {away} <i>({mins}')</i>{tip_badge}")
+        if not lines:
+            return "Sem jogos live de momento 😴"
+        shown = lines[:6]
+        if len(lines) > 6:
+            shown.append(f"  <i>... e mais {len(lines) - 6} jogos</i>")
+        return "\n".join(shown)
+    except Exception:
+        return "Erro ao obter jogos live."
+
+def _build_main_menu() -> list:
+    """Inline keyboard for the main menu."""
+    return [
+        [
+            {"text": "📊 Resultados",         "callback_data": "cb_stats"},
+            {"text": "🔴 Live Agora",         "callback_data": "cb_live"},
+        ],
+        [
+            {"text": "📐 Como Funciona",      "callback_data": "cb_howto"},
+            {"text": "🛑 Cancelar Picks",     "callback_data": "cb_stop"},
+        ],
+    ]
+
+
+def _build_stats_period_menu(active: str = "alltime") -> list:
+    """Inline keyboard with period toggles + main-menu shortcut."""
+    def b(period: str) -> dict:
+        label, _ = _PERIOD_LABEL[period]
+        # Active period gets a checkmark prefix to make selection obvious
+        prefix = "✅ " if period == active else ""
+        return {"text": f"{prefix}{label}", "callback_data": f"cb_stats_{period}"}
+    return [
+        [b("alltime"), b("month"), b("7d")],
+        [{"text": "↩️ Menu", "callback_data": "cb_menu"}],
+    ]
+
 def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> str:
     """Build the Telegram message for a new pick."""
     flag        = _country_flag(match.get("country", ""))
@@ -206,9 +957,9 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
     odds        = pick.get("odds") or 0
     edge        = pick.get("edge") or 0
     model_p     = (pick.get("model") or 0) * 100
-    blend_p     = (pick.get("blend") or 0) * 100
+    market_p    = (1 / odds * 100) if odds > 0 else 0
 
-    market_icons = {"1X2": "🎯", "HCP": "⚖️"}
+    market_icons = {"1X2": "🎯", "Handicap": "⚖️"}
     mkt_icon = market_icons.get(market, "📊")
 
     cta = _next_cta()
@@ -223,49 +974,246 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
         f"{mkt_icon} Mercado: <b>{market} → {label}</b>\n"
         f"💰 Odds: <b>{odds:.2f}</b>\n"
         f"\n"
-        f"📊 Modelo: <b>{model_p:.0f}%</b> | Mercado: <b>{blend_p:.0f}%</b>\n"
+        f"📊 Modelo: <b>{model_p:.0f}%</b> | Mercado: <b>{market_p:.0f}%</b>\n"
         f"📈 Edge: <b>+{edge:.1f}%</b>\n"
         f"\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{cta}"
     )
 
-_TG_WELCOME = (
-    "👋 <b>Bem-vindo ao xG Live Bot</b>\n"
-    "\n"
-    "Ficaste inscrito e vais receber em tempo real as picks geradas pelo nosso algoritmo de <b>value betting</b> baseado em <b>Expected Goals (xG)</b>.\n"
-    "\n"
-    "━━━━━━━━━━━━━━━━━━\n"
-    "📐 <b>Como funciona?</b>\n"
-    "Enquanto o jogo decorre, o modelo analisa continuamente:\n"
-    "• O xG acumulado de cada equipa (via Sofascore)\n"
-    "• As odds ao vivo das casas de apostas\n"
-    "• A probabilidade blended pelo modelo Benter\n"
-    "\n"
-    "━━━━━━━━━━━━━━━━━━\n"
-    "📌 <b>Porque temos vantagem?</b>\n"
-    "As casas de apostas são lentas a ajustar as odds ao fluxo real do jogo. "
-    "O nosso modelo deteta quando a probabilidade calculada pelos xG diverge significativamente das odds do mercado. "
-    "Essa diferença é o <b>edge</b> — e é onde está o valor.\n"
-    "\n"
-    "━━━━━━━━━━━━━━━━━━\n"
-    "✅ <b>Filtros de qualidade</b>\n"
-    "Só receberes picks quando:\n"
-    "• ⏱ Jogo com mais de 25 minutos\n"
-    "• 🚫 Sem golo nos últimos 4 minutos\n"
-    "• 📈 Edge positivo e significativo\n"
-    "• 💰 Odds entre 1.40 e 4.00\n"
-    "\n"
-    "━━━━━━━━━━━━━━━━━━\n"
-    "Para cancelar as notificações envia /stop\n"
-    "\n"
-    "Boa sorte 🎯"
-)
+def _build_welcome(first_name: str | None = None) -> str:
+    """Personalised welcome — BetRadar AI brand with all-time engagement stats."""
+    name_part = f", {first_name}" if first_name else ""
+    stats = _get_alltime_stats()
+    live  = _get_live_summary()
+
+    # ── Performance block (all-time, high engagement) ─────────────────────────
+    if stats["settled"] > 0:
+        sign = "+" if stats["pnl_eur"] >= 0 else ""
+        roi_sign = "+" if stats["roi"] >= 0 else ""
+        roi_emoji = "🟢" if stats["roi"] >= 0 else "🔴"
+
+        perf_lines = [
+            f"💰 <b>Lucro total:</b> {sign}{stats['pnl_eur']:.0f}€  ({stats['settled']} picks)",
+            f"{roi_emoji} <b>ROI:</b> {roi_sign}{stats['roi']:.1f}%  ·  <b>Win rate:</b> {stats['winrate']:.1f}%",
+            f"📊 <b>Odds médias:</b> {stats['avg_odds']:.2f}  ·  <b>Maior streak:</b> {stats['best_streak']} 🔥",
+            f"🏆 <b>Maior win:</b> +{stats['best_win_pnl']:.0f}€",
+        ]
+        perf_block = "\n".join(perf_lines)
+    else:
+        perf_block = "💰 <i>O algoritmo ainda está a aquecer — picks resolvidas em breve!</i>"
+
+    # ── Live block ────────────────────────────────────────────────────────────
+    live_block = live if live else "<i>Sem jogos live de momento 😴</i>"
+
+    return (
+        f"🤖 <b>BetRadar AI</b> — bem-vindo{name_part}! 🎯\n"
+        f"\n"
+        f"O bot inteligente que deteta <b>value bets</b> em tempo real durante "
+        f"jogos de futebol, usando o modelo de <b>Expected Goals (xG)</b> "
+        f"combinado com odds ao vivo das melhores casas. 100% gratuito. ⚡\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>Resultados Globais</b>\n"
+        f"{perf_block}\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔴 <b>Live agora</b>\n"
+        f"{live_block}\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <b>Como funciona?</b>\n"
+        f"A cada pick, o BetRadar AI compara a probabilidade real do modelo "
+        f"com as odds da casa. Quando há <b>edge ≥ 5%</b>, recebes alerta. "
+        f"Não inventamos — só te dizemos quando a matemática está do nosso lado.\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Usa o menu abaixo para começar 👇"
+    )
+
+# ════════════════════════════════════════════════════════════
+#  SERVER-SENT EVENTS (SSE) — Real-time picks stream
+# ════════════════════════════════════════════════════════════
+
+from queue import Queue, Empty
+import threading as _threading
+
+_sse_clients: set[Queue] = set()
+_sse_lock = _threading.Lock()
+
+def _broadcast_pick(match: dict, pick: dict, minute: int | None):
+    """Broadcast a new pick to all SSE clients."""
+    try:
+        flag = _country_flag(match.get("country", ""))
+        home = match.get("homeTeam", "")
+        away = match.get("awayTeam", "")
+        tournament = match.get("tournament", "")
+        market = pick.get("market", "")
+        label = pick.get("label", "")
+        odds = pick.get("odds") or 0
+        edge = pick.get("edge") or 0
+        model_p = (pick.get("model") or 0) * 100
+        market_p = (1 / odds * 100) if odds > 0 else 0
+        match_id = match.get("id") or match.get("match_id")
+
+        msg = json.dumps({
+            "type": "new_pick",
+            "match_id": match_id,
+            "flag": flag,
+            "tournament": tournament,
+            "home": home,
+            "away": away,
+            "minute": minute,
+            "market": market,
+            "label": label,
+            "odds": round(odds, 2),
+            "edge": round(edge, 1),
+            "model_p": round(model_p, 0),
+            "market_p": round(market_p, 0),
+            "timestamp": int(time.time()),
+        })
+
+        with _sse_lock:
+            dead_clients = []
+            for client_q in _sse_clients:
+                try:
+                    client_q.put_nowait(msg)
+                except Exception:
+                    dead_clients.append(client_q)
+            for client in dead_clients:
+                _sse_clients.discard(client)
+    except Exception as e:
+        log.error(f"_broadcast_pick error: {e}")
+
+
+def _handle_tg_callback(callback_id: str, chat_id: int, data_str: str,
+                         username: str | None, first_name: str | None):
+    """Dispatch an inline button callback."""
+    _tg_answer_callback(callback_id)  # clear the spinner
+
+    if data_str == "cb_stats" or data_str.startswith("cb_stats_"):
+        # Default view = all-time. Sub-callbacks override the period.
+        period = "alltime"
+        if data_str.startswith("cb_stats_"):
+            requested = data_str.replace("cb_stats_", "", 1)
+            if requested in _PERIOD_LABEL:
+                period = requested
+
+        _, period_title = _PERIOD_LABEL[period]
+        stake = get_setting("stake_per_bet", 100.0)
+        ps    = _get_period_stats(period)
+        big   = _get_biggest_green(period)
+
+        if ps["settled"] == 0:
+            caption = (
+                f"📊 <b>Resultados — {period_title}</b>\n\n"
+                f"<i>Ainda sem picks resolvidas neste período.</i>\n\n"
+                f"Escolhe outro intervalo abaixo 👇"
+            )
+            _send_telegram_buttons(caption, chat_id, _build_stats_period_menu(period))
+            return
+
+        sign     = "+" if ps["pnl_eur"] >= 0 else ""
+        roi_sign = "+" if ps["roi"]     >= 0 else ""
+        roi_emoji = "🟢" if ps["roi"] >= 0 else "🔴"
+
+        # Top markets
+        top_mkts = sorted(ps["markets"].items(), key=lambda x: -x[1])[:4]
+        mkt_lines = "\n".join(
+            f"  • <b>{m}</b>: {c} pick{'s' if c != 1 else ''}"
+            for m, c in top_mkts
+        )
+
+        # Biggest green hook
+        if big:
+            big_block = (
+                f"🏆 <b>Maior green</b> ({period_title.lower()}):\n"
+                f"  • {big['match']}\n"
+                f"  • <b>{big['market']}</b> @ <b>{big['odd']:.2f}</b>  →  <b>+{big['profit']:.0f}€</b>"
+            )
+        else:
+            big_block = "🏆 <i>Sem greens neste período… o próximo está a caminho! 🚀</i>"
+
+        caption = (
+            f"📊 <b>Resultados — {period_title}</b>\n"
+            f"\n"
+            f"💰 <b>Lucro:</b> {sign}{ps['pnl_eur']:.0f}€  <i>(€{stake:.0f}/pick)</i>\n"
+            f"{roi_emoji} <b>ROI:</b> {roi_sign}{ps['roi']:.1f}%  ·  "
+            f"<b>Win rate:</b> {ps['winrate']:.1f}%\n"
+            f"🎯 <b>Picks:</b> {ps['settled']}  "
+            f"(<b>{ps['wins']}</b>W / <b>{ps['losses']}</b>L)\n"
+            f"📈 <b>Odds médias:</b> {ps['avg_odds']:.2f}  "
+            f"·  <b>Streak:</b> {ps['best_streak']} 🔥\n"
+            f"\n"
+            f"{big_block}\n"
+        )
+        if mkt_lines:
+            caption += f"\n<b>Top mercados:</b>\n{mkt_lines}"
+
+        chart = _generate_chart(period)
+        if chart:
+            _send_telegram_photo(chat_id, chart, caption=caption,
+                                  buttons=_build_stats_period_menu(period))
+        else:
+            _send_telegram_buttons(caption, chat_id, _build_stats_period_menu(period))
+
+    elif data_str == "cb_menu":
+        _send_telegram_buttons("Menu principal 👇", chat_id, _build_main_menu())
+
+    elif data_str == "cb_live":
+        live = _get_live_grouped()
+        reply = f"🔴 <b>Live Agora</b>\n\n{live}"
+        _send_telegram_buttons(reply, chat_id, _build_main_menu())
+
+    elif data_str == "cb_howto":
+        reply = (
+            "📐 <b>Como funciona o modelo?</b>\n\n"
+            "Enquanto o jogo decorre, o modelo analisa a cada minuto:\n"
+            "• O xG acumulado de cada equipa\n"
+            "• As odds ao vivo das principais casas\n"
+            "• A probabilidade calculada pelo modelo Benter\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📌 <b>Onde está a vantagem?</b>\n"
+            "As bookmakers são lentas a ajustar odds ao fluxo real do jogo. "
+            "Quando a probabilidade do modelo diverge significativamente das odds, "
+            "esse <b>edge</b> é a nossa vantagem.\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "✅ <b>Filtros de qualidade</b>\n"
+            "• ⏱ Jogo com mais de 25 minutos\n"
+            "• 🚫 Sem golo nos últimos 4 minutos\n"
+            "• 📈 Edge positivo e significativo\n"
+            "• 💰 Odds entre 1.40 e 4.00"
+        )
+        _send_telegram_buttons(reply, chat_id, _build_main_menu())
+
+    elif data_str == "cb_stop":
+        _tg_unsubscribe(chat_id)
+        _send_telegram(
+            "🔕 <b>Notificações canceladas.</b>\n\nJá não receberás mais picks.\n"
+            "Para voltar envia /start.",
+            chat_id=chat_id
+        )
+
 
 @app.route("/telegram/webhook", methods=["POST"])
 def telegram_webhook():
-    """Handle incoming Telegram messages."""
-    data       = flask_request.get_json(silent=True) or {}
+    """Handle incoming Telegram messages and callback queries."""
+    data = flask_request.get_json(silent=True) or {}
+
+    # ── Inline button callback ──
+    cb = data.get("callback_query")
+    if cb:
+        cb_id      = cb.get("id", "")
+        cb_data    = cb.get("data", "")
+        cb_chat_id = (cb.get("message") or {}).get("chat", {}).get("id") or \
+                     (cb.get("from") or {}).get("id")
+        cb_user    = (cb.get("from") or {})
+        if cb_chat_id:
+            _handle_tg_callback(cb_id, cb_chat_id, cb_data,
+                                 cb_user.get("username"), cb_user.get("first_name"))
+        return "", 200
+
+    # ── Normal message ──
     msg        = data.get("message") or data.get("edited_message") or {}
     text       = (msg.get("text") or "").strip()
     chat_id    = (msg.get("chat") or {}).get("id")
@@ -278,54 +1226,62 @@ def telegram_webhook():
     log.info(f"Telegram: chat_id={chat_id} username={username}: {text[:60]}")
 
     if text.startswith("/start"):
+        # Parse deep-link payload: "/start instagram_oct" → "instagram_oct"
+        parts = text.split(maxsplit=1)
+        start_param = parts[1].strip() if len(parts) > 1 else None
+        _tg_log_start(chat_id, username, first_name, start_param)
         _tg_subscribe(chat_id, username=username, first_name=first_name)
-        _send_telegram(_TG_WELCOME, chat_id=chat_id)
+        _send_telegram_buttons(_build_welcome(first_name), chat_id, _build_main_menu())
+
+    elif text.startswith("/whoami"):
+        admin_tag = "  ✅ <i>(admin)</i>" if _is_tg_admin(chat_id) else ""
+        _send_telegram(
+            f"🆔 <b>Your IDs</b>\n\n"
+            f"chat_id: <code>{chat_id}</code>{admin_tag}\n"
+            f"username: @{username or '—'}\n"
+            f"first_name: {first_name or '—'}",
+            chat_id=chat_id
+        )
+
+    elif text.startswith("/admin_stats"):
+        if _is_tg_admin(chat_id):
+            _send_telegram(_tg_admin_stats(), chat_id=chat_id)
+        else:
+            _send_telegram(
+                "🚫 Comando restrito.\n"
+                f"Pede ao admin para adicionar <code>{chat_id}</code> a TELEGRAM_ADMIN_CHAT_IDS.",
+                chat_id=chat_id
+            )
 
     elif text.startswith("/stop"):
         _tg_unsubscribe(chat_id)
         _send_telegram(
-            "🔕 Notificações canceladas.\nPara voltar a receber picks envia /start.",
+            "🔕 <b>Notificações canceladas.</b>\n\nJá não receberás mais picks.\n"
+            "Para voltar envia /start.",
             chat_id=chat_id
         )
 
     elif text.startswith("/status"):
         subs = _tg_subscribers()
         if str(chat_id) in subs:
-            _send_telegram("✅ Estás inscrito e a receber picks em tempo real.", chat_id=chat_id)
-        else:
-            _send_telegram("⚠️ Não estás inscrito. Envia /start para receber picks.", chat_id=chat_id)
-
-    elif text.startswith("/results"):
-        stats = _get_algorithm_results()
-        if stats["total"] == 0:
-            msg = "📊 Sem dados ainda.\n\nEspera pelo primeiro resultado."
-        else:
-            # Convert P&L from units to $ (assuming $100 per bet)
-            pnl_dollars = stats['pnl'] * 100
-            roi = stats['roi']
-
-            # Dynamic message based on performance
-            if pnl_dollars > 0:
-                emoji_prefix = "🚀" if pnl_dollars > 500 else "📈" if pnl_dollars > 100 else "✅"
-                title = f"{emoji_prefix} <b>Resultados do Algoritmo</b> 💰"
-                pnl_text = f"<b>P&L Total:</b> ${pnl_dollars:,.0f} 💵"
-            elif pnl_dollars < 0:
-                title = f"📉 <b>Resultados do Algoritmo</b>"
-                pnl_text = f"<b>P&L Total:</b> -${abs(pnl_dollars):,.0f} ⚠️"
-            else:
-                title = f"➖ <b>Resultados do Algoritmo</b>"
-                pnl_text = f"<b>P&L Total:</b> $0 (breakeven)"
-
-            msg = (
-                f"{title}\n\n"
-                f"<b>Total Picks:</b> {stats['total']} 🎯\n"
-                f"<b>Wins:</b> {stats['wins']} ✅\n"
-                f"<b>Losses:</b> {stats['losses']} ❌\n"
-                f"<b>Pending:</b> {stats['pending']} ⏳\n\n"
-                f"{pnl_text}\n"
-                f"<b>ROI:</b> {roi:+.1f}% {'🔥' if roi > 10 else '📊' if roi > 0 else '📉'}"
+            _send_telegram_buttons(
+                "✅ Estás inscrito e a receber picks em tempo real.",
+                chat_id, _build_main_menu()
             )
-        _send_telegram(msg, chat_id=chat_id)
+        else:
+            _send_telegram(
+                "⚠️ Não estás inscrito. Envia /start para receber picks.",
+                chat_id=chat_id
+            )
+
+    elif text.startswith("/stats") or text.startswith("/results"):
+        _handle_tg_callback("", chat_id, "cb_stats", username, first_name)
+
+    elif text.startswith("/live"):
+        _handle_tg_callback("", chat_id, "cb_live", username, first_name)
+
+    elif text.startswith("/menu"):
+        _send_telegram_buttons("Menu principal 👇", chat_id, _build_main_menu())
 
     return "", 200
 
@@ -744,7 +1700,7 @@ def _get_odds_api(url, params=None, api_key=None):
     global _api_requests_remaining
     import requests as req
 
-    effective_key = api_key or ODDS_API_KEY
+    effective_key = api_key or _active_odds_key()
     if params is None:
         params = {}
     params["apiKey"] = effective_key
@@ -795,7 +1751,7 @@ def get_odds_for_sport(sport_key, force=False, api_key=None):
     now = time.time()
     # Normalize cache key by effective API key (resolved), so background cycle
     # and frontend requests using the same key share the same cache entry.
-    effective_key = api_key or ODDS_API_KEY or "default"
+    effective_key = api_key or _active_odds_key() or "default"
     cache_key = f"{sport_key}:{effective_key}"
 
     # Adaptive TTL: when no live game exists for this sport, use long TTL
@@ -1350,7 +2306,7 @@ def get_full_odds_analysis(match, shots, api_key=None):
                     {"home": raw_sp.get("home", 0), "away": raw_sp.get("away", 0)},
                     minute
                 )
-                benter_spreads["market"] = "HCP"
+                benter_spreads["market"] = "Handicap"
                 benter_spreads["homePoint"] = home_pt
                 benter_spreads["awayPoint"] = away_pt
                 benter_spreads["bookmaker"] = spreads_data.get("bookmakerTitle", "")
@@ -1813,34 +2769,76 @@ def r_odds_sport(sport_key):
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 
+def _probe_key(key: str) -> int | None:
+    """Probe a single API key against /sports endpoint and update _api_quotas."""
+    global _api_requests_remaining
+    if not key:
+        return None
+    try:
+        import requests as _req
+        r = _req.get(f"{ODDS_API_BASE}/sports", params={"apiKey": key}, timeout=5)
+        remaining_hdr = r.headers.get("x-requests-remaining")
+        used_hdr = r.headers.get("x-requests-used")
+        if remaining_hdr is not None:
+            rem = int(remaining_hdr)
+            _api_quotas[key] = rem
+            if key == ODDS_API_KEY:
+                _api_requests_remaining = rem
+            log.info(f"Quota probe [{key[:8]}…] — remaining: {rem}, used: {used_hdr}")
+            return rem
+    except Exception as e:
+        log.warning(f"Quota probe failed for [{key[:8]}…]: {e}")
+    return None
+
+
 @app.route("/api/odds/quota")
 def r_odds_quota():
-    """Check remaining Odds API quota — per key if ?apiKey= provided."""
-    global _api_requests_remaining  # must be at top before any use
-    api_key = flask_request.args.get("apiKey", "").strip() or None
-    effective_key = api_key or ODDS_API_KEY
-    rem = _api_quotas.get(effective_key, _api_requests_remaining)
+    """
+    Check remaining Odds API quota.
+    - No params           → returns full rotation status (all keys + active one).
+    - ?apiKey=...         → returns quota for that specific key.
+    - ?probe=1            → also probe every cached-as-None key (uses 1 request per probed key).
+    """
+    global _api_requests_remaining
+    api_key  = flask_request.args.get("apiKey", "").strip() or None
+    do_probe = flask_request.args.get("probe", "").strip() in ("1", "true", "yes")
 
-    # If null (e.g. after server restart with no BG cycles yet), fetch live from API
-    if rem is None and effective_key:
-        try:
-            import requests as _req
-            r = _req.get(
-                f"{ODDS_API_BASE}/sports",
-                params={"apiKey": effective_key},
-                timeout=5
-            )
-            remaining_hdr = r.headers.get("x-requests-remaining")
-            used_hdr = r.headers.get("x-requests-used")
-            if remaining_hdr is not None:
-                rem = int(remaining_hdr)
-                _api_requests_remaining = rem
-                _api_quotas[effective_key] = rem
-                log.info(f"Quota probe [{effective_key[:8]}…] — remaining: {rem}, used: {used_hdr}")
-        except Exception as e:
-            log.warning(f"Quota probe failed: {e}")
+    # Specific key lookup
+    if api_key:
+        rem = _api_quotas.get(api_key)
+        if rem is None:
+            rem = _probe_key(api_key)
+        return jsonify({"remaining": rem, "key": api_key[:8] + "…"})
 
-    return jsonify({"remaining": rem, "key": effective_key[:8] + "…" if effective_key else None})
+    # Default: full rotation status
+    keys_status = []
+    for idx, k in enumerate(ODDS_API_KEYS):
+        rem = _api_quotas.get(k)
+        if rem is None and do_probe:
+            rem = _probe_key(k)
+        keys_status.append({
+            "index":     idx,
+            "key":       k[:8] + "…",
+            "remaining": rem,
+            "exhausted": rem is not None and rem < ODDS_API_KEY_THRESHOLD,
+        })
+
+    active_key = _active_odds_key()
+    active_idx = ODDS_API_KEYS.index(active_key) if active_key in ODDS_API_KEYS else -1
+    active_rem = _api_quotas.get(active_key)
+    if active_rem is None:
+        active_rem = _probe_key(active_key)
+
+    return jsonify({
+        # Back-compat fields (used by dashboard / older clients)
+        "remaining": active_rem,
+        "key":       (active_key or "")[:8] + "…" if active_key else None,
+        # Rotation summary
+        "active":    {"index": active_idx, "key": (active_key or "")[:8] + "…", "remaining": active_rem},
+        "keys":      keys_status,
+        "total":     len(ODDS_API_KEYS),
+        "threshold": ODDS_API_KEY_THRESHOLD,
+    })
 
 
 @app.route("/api/odds/cache")
@@ -2214,6 +3212,17 @@ def _init_db():
             subscribed_at INTEGER NOT NULL,
             active        INTEGER DEFAULT 1
         );
+        CREATE TABLE IF NOT EXISTS tg_starts (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id      INTEGER NOT NULL,
+            username     TEXT,
+            first_name   TEXT,
+            start_param  TEXT,
+            started_at   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tg_starts_chat ON tg_starts(chat_id);
+        CREATE INDEX IF NOT EXISTS idx_tg_starts_param ON tg_starts(start_param);
+        CREATE INDEX IF NOT EXISTS idx_tg_starts_ts ON tg_starts(started_at);
         CREATE TABLE IF NOT EXISTS settings (
             key        TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
@@ -2439,7 +3448,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
             (match_id,)
         ).fetchall()
         existing_keys      = {r["tip_key"] for r in existing_all}
-        existing_hcp_rows  = [r for r in existing_all if r["market"] == "HCP"]
+        existing_hcp_rows  = [r for r in existing_all if r["market"] == "Handicap"]
         existing_hcp_canonical = {_hcp_canonical(r["label"]) for r in existing_hcp_rows}
         existing_1x2_rows  = [r for r in existing_all if r["market"] == "1X2"]
 
@@ -2478,7 +3487,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                 if away and (away.split()[0] in lbl or lbl in away):
                     return "away"
                 return "draw" if "empate" in lbl or "draw" in lbl else None
-            if mkt == "HCP":
+            if mkt == "Handicap":
                 hm = _re.search(r'([+-][\d.]+)$', p["label"])
                 if not hm:
                     return None
@@ -2593,7 +3602,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
 
             # 1X2 ↔ HCP conflict: same team, same phase (no goal between them)
             phase_cutoff = (last_goal_minute or 0)
-            if p["market"] == "HCP":
+            if p["market"] == "Handicap":
                 hm_new = _re.search(r'([+-][\d.]+)$', p["label"])
                 if hm_new:
                     team_part = p["label"][:p["label"].rfind(hm_new.group(0))].strip().lower()
@@ -2612,7 +3621,7 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     continue
 
             # HCP dedup: same canonical value already stored
-            if p["market"] == "HCP":
+            if p["market"] == "Handicap":
                 canon = _hcp_canonical(p["label"])
                 if canon in existing_hcp_canonical:
                     _reject(p, f"duplicate HCP (canonical='{canon}' already stored)")
@@ -2646,6 +3655,12 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                 existing_keys.add(key)
                 total_tips += 1
                 _accept(p)
+                # SSE broadcast to web clients
+                if match:
+                    try:
+                        _broadcast_pick(match, p, minute)
+                    except Exception as sse_err:
+                        log.error(f"SSE broadcast failed: {sse_err}")
                 # Telegram notification for new tip
                 if match:
                     try:
@@ -2660,10 +3675,10 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                     log.warning(f"[{_tag_summary}] match {match_id}: UNIQUE collision for {key} — {e}")
                 else:
                     raise
-            if p["market"] == "HCP":
+            if p["market"] == "Handicap":
                 existing_hcp_canonical.add(_hcp_canonical(p["label"]))
                 existing_hcp_rows.append({"label": p["label"], "minute_entry": minute,
-                                          "market": "HCP", "tip_key": key})
+                                          "market": "Handicap", "tip_key": key})
             if p["market"] == "1X2":
                 existing_1x2_rows.append({"label": p["label"], "minute_entry": minute,
                                           "market": "1X2", "tip_key": key})
@@ -2736,7 +3751,7 @@ def _auto_resolve_db(match_id: int, match: dict, inc: dict):
                         break
 
             # HCP — only at FT
-            if mkt == "HCP" and finished and new_result is None:
+            if mkt == "Handicap" and finished and new_result is None:
                 hm = _re.search(r'([+-][\d.]+)$', lbl)
                 if hm:
                     hcp = float(hm.group(1))
@@ -2852,7 +3867,7 @@ def _extract_picks_from_odds(odds: dict, match: dict) -> list:
         for k, o in bs["outcomes"].items():
             if o.get("isValue") and valid_odds(o):
                 picks.append({
-                    "market": "HCP", "label": sp_lbl.get(k, k),
+                    "market": "Handicap", "label": sp_lbl.get(k, k),
                     "odds": o.get("bookieOdds"), "edge": o.get("edge", 0),
                     "blend": o.get("blendedProb", 0), "model": o.get("modelProb", 0),
                 })
@@ -3075,7 +4090,7 @@ def _resolve_finished_tips():
                         if lbl.lower() in name.lower() or (len(lbl) > 3 and name.lower().startswith(lbl[:4].lower())):
                             new_result = "green" if side == ft else "red"
                             break
-                elif mkt == "HCP":
+                elif mkt == "Handicap":
                     # HCP: "Team +X.X" or "Team -X.X"
                     hm = _re.search(r'([+-][\d.]+)$', lbl)
                     if hm:
@@ -3419,18 +4434,44 @@ _LOGOS_SHEET = (
     "1tDUlWmZZcJKXHd0Nlr5QIm1V15OMsvkOgfhXUuPI9_M/"
     "gviz/tq?tqx=out:csv&sheet=footballstats+team+logo"
 )
-_logos_cache: dict = {}   # name → url
+_logos_cache: dict = {}        # original_name → url
+_logos_norm_cache: dict = {}   # normalized_name → url  (for fuzzy lookup)
 _logos_ts: float  = 0.0
-_LOGOS_TTL = 86400         # refresh every 24 h
+_LOGOS_TTL = 600               # refresh every 10 min
+
+# Words to strip when normalizing team names for matching
+_NOISE_WORDS = {"fc", "cf", "sc", "ac", "as", "afc", "fk", "sk", "bk", "1fc",
+                "club", "calcio", "united", "city", "town", "rovers", "wanderers",
+                "athletic", "athletics", "real", "sporting", "de", "du", "the"}
+
+def _normalize_team_for_logo(name: str) -> str:
+    """
+    Normalize a team name for LOGO fuzzy matching only.
+    NOTE: separate from `_normalize_team()` used for odds matching, which strips
+    "SC "/"FC "/etc. prefixes — those are needed when comparing Odds API names
+    but would corrupt logo lookups.
+      'Atlético de Madrid' → 'atletico de madrid'
+      'Manchester Utd'     → 'manchester utd'
+    """
+    import unicodedata, re as _re
+    # strip accents
+    nfkd = unicodedata.normalize("NFD", name)
+    ascii_name = "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
+    # lowercase, keep alphanumeric + spaces
+    cleaned = _re.sub(r"[^a-z0-9 ]", " ", ascii_name.lower())
+    # collapse whitespace
+    cleaned = " ".join(cleaned.split())
+    return cleaned
 
 def _load_logos():
-    global _logos_cache, _logos_ts
+    global _logos_cache, _logos_norm_cache, _logos_ts
     import csv, io
     try:
         resp = _session.get(_LOGOS_SHEET, timeout=30)
         resp.raise_for_status()
         reader = csv.reader(io.StringIO(resp.text))
         logos = {}
+        logos_norm = {}
         for row in reader:
             # Two paired columns: (col0=name, col1=url) and (col3=name, col5=url)
             for name_i, url_i in [(0, 1), (3, 5)]:
@@ -3439,9 +4480,14 @@ def _load_logos():
                     url  = row[url_i].strip()
                     if name and url.startswith("http"):
                         logos[name] = url
-        _logos_cache = logos
-        _logos_ts    = time.time()
-        log.info(f"Team logos loaded: {len(logos)} entries")
+                        # also index by normalized key for fuzzy lookups
+                        nkey = _normalize_team_for_logo(name)
+                        if nkey and nkey not in logos_norm:
+                            logos_norm[nkey] = url
+        _logos_cache      = logos
+        _logos_norm_cache = logos_norm
+        _logos_ts         = time.time()
+        log.info(f"Team logos loaded: {len(logos)} entries ({len(logos_norm)} normalized)")
     except Exception as e:
         log.error(f"Failed to load team logos: {e}")
 
@@ -3450,9 +4496,249 @@ def _get_logos():
         _load_logos()
     return _logos_cache
 
+def _fuzzy_logo(name: str, threshold: float = 0.72) -> str | None:
+    """
+    Return a logo URL for *name* using a tiered lookup:
+      1. Exact match  (original keys)
+      2. Normalized exact match
+      3. Best fuzzy match via SequenceMatcher (above threshold)
+    Returns None when no acceptable match is found.
+    """
+    logos = _get_logos()
+
+    # 1. exact
+    if name in logos:
+        return logos[name]
+
+    # 2. normalized exact
+    norm_cache = _logos_norm_cache
+    nkey = _normalize_team_for_logo(name)
+    if nkey in norm_cache:
+        return norm_cache[nkey]
+
+    # 3. fuzzy over normalized keys
+    best_score = 0.0
+    best_url   = None
+    for stored_norm, url in norm_cache.items():
+        score = SequenceMatcher(None, nkey, stored_norm).ratio()
+        if score > best_score:
+            best_score = score
+            best_url   = url
+    if best_score >= threshold:
+        log.debug(f"Fuzzy logo match '{name}' → score={best_score:.2f}")
+        return best_url
+
+    return None
+
+
 @app.route("/api/team_logos")
 def r_team_logos():
     return jsonify({"teams": _get_logos(), "count": len(_logos_cache)})
+
+@app.route("/api/team_logo/<path:name>")
+def r_team_logo_lookup(name: str):
+    """
+    Fuzzy logo lookup for a single team name.
+    GET /api/team_logo/Manchester%20Utd
+    → {"name": "Manchester Utd", "url": "https://...", "matched": true}
+    """
+    url = _fuzzy_logo(name)
+    if url:
+        return jsonify({"name": name, "url": url, "matched": True})
+    return jsonify({"name": name, "url": None, "matched": False}), 404
+
+@app.route("/api/team_logos/batch", methods=["POST"])
+def r_team_logos_batch():
+    """
+    Resolve logos for many teams in one request.
+    POST JSON: {"teams": ["Manchester Utd", "Real Betis", ...]}
+    → {"results": {"Manchester Utd": "https://...", "Real Betis": null}}
+    """
+    data  = flask_request.get_json(force=True, silent=True) or {}
+    names = data.get("teams", [])
+    results = {}
+    for n in names[:200]:   # cap at 200 per call
+        results[n] = _fuzzy_logo(n)
+    return jsonify({"results": results, "resolved": sum(1 for v in results.values() if v)})
+
+@app.route("/api/team_logos/refresh", methods=["POST", "GET"])
+def r_team_logos_refresh():
+    """Force immediate reload of team logos from Google Sheets."""
+    global _logos_ts
+    _logos_ts = 0.0  # Expire cache immediately
+    _load_logos()
+    return jsonify({"ok": True, "count": len(_logos_cache), "message": f"Loaded {len(_logos_cache)} logos from Google Sheets"})
+
+
+# ─── Sitemap helpers ───────────────────────────────────────────────────────────
+
+def _slug(text: str) -> str:
+    """Convert team name to URL-friendly slug: 'Sporting CP' → 'sporting-cp'."""
+    import unicodedata, re as _re
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")  # strip accents
+    text = text.lower().strip()
+    text = _re.sub(r"[^\w\s-]", "", text)
+    text = _re.sub(r"[\s_]+", "-", text)
+    return text.strip("-")
+
+
+@app.route("/sitemap.xml")
+def r_sitemap():
+    """
+    Dynamic XML sitemap for webpronos.com.
+    Includes ONLY accessible pages:
+      - Homepage
+      - Live matches (in progress right now)
+      - Scheduled matches (not yet started, start_ts in the next 48h)
+    Finished matches are excluded — their pages are no longer accessible.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    now_ts = int(now.timestamp())
+    next_48h = now_ts + 48 * 3600
+
+    # ── 1. Live games from _live_state ─────────────────────────────────────────
+    live_ids: dict[int, dict] = {}
+    try:
+        with _state_lock:
+            for entry in _live_state.values():
+                m = entry.get("match", {})
+                mid = m.get("id")
+                if mid and m.get("statusType") == "inprogress":
+                    live_ids[mid] = m
+    except Exception:
+        pass
+
+    # ── 2. Scheduled matches from DB (not yet started, within next 48h) ────────
+    try:
+        with _db() as conn:
+            scheduled_rows = conn.execute(
+                """
+                SELECT id, home_team, away_team, start_ts
+                FROM games
+                WHERE is_finished = 0
+                  AND start_ts > ?
+                  AND start_ts <= ?
+                ORDER BY start_ts ASC
+                LIMIT 200
+                """,
+                (now_ts, next_48h)
+            ).fetchall()
+    except Exception:
+        scheduled_rows = []
+
+    # ── 3. Build match URL list ────────────────────────────────────────────────
+    match_urls: list[tuple] = []
+
+    # Live games (highest priority)
+    for mid, m in live_ids.items():
+        slug_part = f"{_slug(m.get('homeTeam', 'home'))}-{_slug(m.get('awayTeam', 'away'))}"
+        match_urls.append((
+            f"{SITE_URL}/match/{mid}/{slug_part}",
+            now.strftime("%Y-%m-%d"),
+            "always",
+            "0.9",
+        ))
+
+    # Scheduled games
+    seen_live = set(live_ids.keys())
+    for r in scheduled_rows:
+        if r["id"] in seen_live:
+            continue
+        slug_part = f"{_slug(r['home_team'])}-{_slug(r['away_team'])}"
+        match_urls.append((
+            f"{SITE_URL}/match/{r['id']}/{slug_part}",
+            now.strftime("%Y-%m-%d"),
+            "daily",
+            "0.7",
+        ))
+
+    # ── 3. Build XML ───────────────────────────────────────────────────────────
+    static_pages = [
+        (SITE_URL + "/",           now.strftime("%Y-%m-%d"), "daily",  "1.0"),
+    ]
+
+    def url_block(loc, lastmod, changefreq, priority):
+        return (
+            f"  <url>\n"
+            f"    <loc>{loc}</loc>\n"
+            f"    <lastmod>{lastmod}</lastmod>\n"
+            f"    <changefreq>{changefreq}</changefreq>\n"
+            f"    <priority>{priority}</priority>\n"
+            f"  </url>"
+        )
+
+    all_urls = static_pages + match_urls
+    url_blocks = "\n".join(url_block(*u) for u in all_urls)
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"{url_blocks}\n"
+        "</urlset>"
+    )
+
+    return Response(
+        xml,
+        mimetype="application/xml",
+        headers={
+            "Cache-Control": "public, max-age=600, s-maxage=600",
+            "X-Sitemap-Urls": str(len(all_urls)),
+        },
+    )
+
+
+@app.route("/api/live/picks-stream")
+def r_picks_stream():
+    """
+    Server-Sent Events (SSE) endpoint for real-time pick notifications.
+    Clients connect and receive a stream of new picks as they are generated.
+
+    Usage:
+      const evtSource = new EventSource('/api/live/picks-stream');
+      evtSource.onmessage = (e) => {
+        const pick = JSON.parse(e.data);
+        console.log('New pick:', pick);
+      };
+
+    Returns events with:
+      type: "new_pick"
+      match_id, flag, tournament, home, away, minute
+      market, label, odds, edge, model_p, market_p, timestamp
+    """
+    def event_stream():
+        client_q: Queue = Queue(maxsize=50)
+        with _sse_lock:
+            _sse_clients.add(client_q)
+
+        try:
+            # Send connected message
+            yield 'data: {"type":"connected"}\n\n'
+
+            # Stream events until client disconnects
+            while True:
+                try:
+                    msg = client_q.get(timeout=25)  # 25s heartbeat (avoid Cloudflare/proxy timeouts)
+                    yield f'data: {msg}\n\n'
+                except Empty:
+                    # Send heartbeat comment (won't trigger onmessage)
+                    yield ': heartbeat\n\n'
+        except GeneratorExit:
+            pass
+        finally:
+            with _sse_lock:
+                _sse_clients.discard(client_q)
+
+    return Response(event_stream(),
+                    mimetype='text/event-stream',
+                    headers={
+                        'Cache-Control': 'no-cache, no-store, must-revalidate',
+                        'Pragma': 'no-cache',
+                        'Expires': '0',
+                        'X-Accel-Buffering': 'no',  # Disable Cloudflare buffering
+                    })
 
 
 @app.route("/api/admin/diag")
