@@ -138,27 +138,40 @@ def _is_tg_admin(chat_id: int) -> bool:
 
 # ── Affiliate CTAs — rotated on every pick alert ──────────────────────────
 # Each entry: (display_text, url)
+# Rotating CTAs (5 variations: #4, #9, #5, #2, and custom "Entrar nesta Pick")
 _TG_CTAS = [
-    ("🎯 Apostar nesta pick",          "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),
-    ("⚡ Colocar aposta agora",         "https://dashboard.onetwoaffiliates.com/click?campaign_id=796&ref_id=370"),
-    ("💰 Aproveitar o edge",            "https://track.affshares.com/visit/?bta=657658&nci=5653"),
-    ("📲 Jogar esta value bet",         "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),
-    ("🔥 Garantir esta aposta",         "https://dashboard.onetwoaffiliates.com/click?campaign_id=796&ref_id=370"),
-    ("✅ Ver odds e apostar",            "https://track.affshares.com/visit/?bta=657658&nci=5653"),
-    ("📈 Capitalizar este valor",       "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),
-    ("🏆 Apostar com vantagem",         "https://dashboard.onetwoaffiliates.com/click?campaign_id=796&ref_id=370"),
-    ("💡 Aproveitar esta oportunidade", "https://track.affshares.com/visit/?bta=657658&nci=5653"),
+    # #4: Ultra-energetic with dynamic potential gain (parametrized)
+    (None, "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),  # template
+    # #9: Cheeky/playful challenge
+    ("😉 Nem penses 2x, vai!", "https://track.affshares.com/visit/?bta=657658&nci=5653"),
+    # #5: Direct/minimal
+    ("▶️ Próximo Passo: Clicar", "https://dashboard.onetwoaffiliates.com/click?campaign_id=796&ref_id=370"),
+    # #2: Cool/gaming language
+    ("💎 Entrar na Play", "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),
+    # Custom: Trust builder
+    ("🎯 Entrar nesta Pick", "https://track.affshares.com/visit/?bta=657658&nci=5653"),
 ]
 _tg_cta_counter = 0
 _tg_cta_lock = threading.Lock()
 
-def _next_cta() -> str:
-    """Return the next CTA as an HTML hyperlink, cycling through _TG_CTAS."""
+def _next_cta(odds: float = None, stake: float = 100.0) -> str:
+    """
+    Return the next CTA as an HTML hyperlink, cycling through _TG_CTAS.
+    For CTA #4 (index 0), calculate dynamic potential gain:
+      potential_gain = (odds - 1) * stake
+    """
     global _tg_cta_counter
     with _tg_cta_lock:
         idx = _tg_cta_counter % len(_TG_CTAS)
         _tg_cta_counter += 1
+
     text, url = _TG_CTAS[idx]
+
+    # Special handling for #4 (index 0): dynamic gain calculation
+    if idx == 0 and odds and odds > 0:
+        potential_gain = (odds - 1) * stake
+        text = f"🔥 AGORA! Ganhar +€{potential_gain:.0f} (odds {odds:.2f})!"
+
     return f'<a href="{url}">{text}</a>'
 
 _COUNTRY_FLAGS = {
@@ -962,7 +975,8 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
     market_icons = {"1X2": "🎯", "Handicap": "⚖️"}
     mkt_icon = market_icons.get(market, "📊")
 
-    cta = _next_cta()
+    stake = get_setting("stake_per_bet", 100.0)
+    cta = _next_cta(odds=odds, stake=stake)
     return (
         f"🔔 <b>NOVA PICK</b>\n"
         f"\n"

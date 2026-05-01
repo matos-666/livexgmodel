@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential curl ca-certificates \
+    libfreetype6-dev libpng-dev fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,4 +21,4 @@ ENV PORT=8080 \
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "gunicorn server:app --bind 0.0.0.0:${PORT} --workers 1 --timeout 60"]
+CMD ["sh", "-c", "gunicorn server:app --bind 0.0.0.0:${PORT} --workers 1 --threads 16 --worker-class gthread --timeout 600 --keep-alive 75 --graceful-timeout 30"]
