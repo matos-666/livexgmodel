@@ -915,7 +915,7 @@ const LEAGUE_PRIORITY = [
   'primeira liga','eredivisie','jupiler','ekstraklasa','super lig','süper lig',
   'allsvenskan','eliteserien','superligaen','veikkausliiga',
   'mls','liga mx','brasileirão','serie b',
-  'saudi pro league','roshn saudi league','j1 league','chinese super league',
+  'saudi pro league','roshn saudi league','j1 league',
   'copa libertadores','copa sudamericana',
   'nations league','world cup','european championship',
 ];
@@ -1330,6 +1330,7 @@ const _SRV_HCP_MIN_GAP_MINUTES   = 8;
 const _SRV_MIN_MINUTE_FOR_TIPS   = 25;
 const _SRV_MAX_MINUTE_FOR_TIPS   = 85;
 const _SRV_MAX_TIPS_PER_GAME     = 6;
+const _SRV_ODDS_MAX_AGE_MS       = 120_000; // 2 minutes — block picks if odds lastUpdate older than this
 
 // Mirror of server's _pick_direction — returns 'home'|'away'|'draw'|null
 function _tipDirection(p, match) {
@@ -1409,7 +1410,9 @@ function syncTips(matchId, picks, minute, match, inc) {
   }
 
   // ── Build conflict indices from existing tips ──
-  const existingOu = {};         // line → Set<'over'|'under'>
+  // Cross-line O/U: Over X.5 contradicts Under Y.5 iff Y <= X (no overlap of viable totals)
+  const existingOvers  = [];     // numeric X for stored Over X.5
+  const existingUnders = [];     // numeric Y for stored Under Y.5
   const existingHcpCanonical = new Set();
   const existing1x2 = [];
   const existingHcp = [];
@@ -1417,9 +1420,11 @@ function syncTips(matchId, picks, minute, match, inc) {
     if ((t.market || '').startsWith('O/U')) {
       const m_ou = (t.label || '').match(/^(Over|Under)\s+([\d.]+)$/i);
       if (m_ou) {
-        const line = m_ou[2];
-        if (!existingOu[line]) existingOu[line] = new Set();
-        existingOu[line].add(m_ou[1].toLowerCase());
+        const lineVal = parseFloat(m_ou[2]);
+        if (!isNaN(lineVal)) {
+          if (m_ou[1].toLowerCase() === 'over') existingOvers.push(lineVal);
+          else existingUnders.push(lineVal);
+        }
       }
     }
     if (t.market === '1X2') existing1x2.push(t);
@@ -1450,14 +1455,22 @@ function syncTips(matchId, picks, minute, match, inc) {
     if (minute !== null && minute !== undefined && minute < _SRV_MIN_MINUTE_FOR_TIPS) continue;
     if (minute !== null && minute !== undefined && minute > _SRV_MAX_MINUTE_FOR_TIPS) continue;
 
-    // O/U opposite direction conflict
+    // O/U cross-line conflict — block any contradictory line, not only same-line opposite.
+    // Over X.5 ⇄ Under Y.5 contradictórias se Y <= X (sem overlap de totais viáveis).
     if ((p.market || '').startsWith('O/U')) {
       const m_ou = normLabel.match(/^(Over|Under)\s+([\d.]+)$/i);
       if (m_ou) {
-        const dir = m_ou[1].toLowerCase();
-        const line = m_ou[2];
-        const opposite = dir === 'over' ? 'under' : 'over';
-        if (existingOu[line]?.has(opposite)) continue;
+        const newLine = parseFloat(m_ou[2]);
+        if (!isNaN(newLine)) {
+          const dir = m_ou[1].toLowerCase();
+          if (dir === 'over') {
+            // Over X.5 conflita com qualquer Under Y.5 onde Y <= X
+            if (existingUnders.some(y => y <= newLine)) continue;
+          } else {
+            // Under Y.5 conflita com qualquer Over X.5 onde X >= Y
+            if (existingOvers.some(x => x >= newLine)) continue;
+          }
+        }
       }
     }
 
@@ -1531,9 +1544,11 @@ function syncTips(matchId, picks, minute, match, inc) {
     if ((p.market || '').startsWith('O/U')) {
       const m_ou = normLabel.match(/^(Over|Under)\s+([\d.]+)$/i);
       if (m_ou) {
-        const line = m_ou[2];
-        if (!existingOu[line]) existingOu[line] = new Set();
-        existingOu[line].add(m_ou[1].toLowerCase());
+        const lineVal = parseFloat(m_ou[2]);
+        if (!isNaN(lineVal)) {
+          if (m_ou[1].toLowerCase() === 'over') existingOvers.push(lineVal);
+          else existingUnders.push(lineVal);
+        }
       }
     }
   }
@@ -1715,6 +1730,25 @@ function buildAnalysisCard(m, shots, inc, odds) {
         odds: o.bookieOdds, edge: o.edge,
         blend: o.blendedProb, model: o.modelProb,
       });
+    }
+  }
+
+  // ── Odds staleness check — block picks if lastUpdate > 2 min old ──
+  // Mirrors server.py _odds_are_stale() / ODDS_MAX_AGE_SECONDS = 120
+  if (odds?.available) {
+    const nowMs = Date.now();
+    let latestUpdateMs = null;
+    for (const mkt of [odds.h2h, odds.totals, odds.spreads]) {
+      if (!mkt?.lastUpdate) continue;
+      const ts = new Date(mkt.lastUpdate).getTime();
+      if (!isNaN(ts) && (latestUpdateMs === null || ts > latestUpdateMs)) latestUpdateMs = ts;
+    }
+    if (latestUpdateMs !== null) {
+      const ageMs = nowMs - latestUpdateMs;
+      if (ageMs > _SRV_ODDS_MAX_AGE_MS) {
+        const ageMin = (ageMs / 60000).toFixed(1);
+        warnings.push({ icon: '⏰', text: `Odds desatualizadas (${ageMin}m) — picks bloqueadas até atualização` });
+      }
     }
   }
 
@@ -2199,7 +2233,7 @@ function injectManualOdds(odds, match, shots) {
 
   // Remaining xG = total xG + any xG already converted to goals (simple proxy)
   const intervalAdj = minute > 75 ? 1.48 : minute > 60 ? 1.21 : minute > 45 ? 1.10 : minute > 30 ? 1.15 : minute > 15 ? 1.10 : 1.0;
-  const fullDur = minute > 90 ? 120 : 90;
+  const fullDur = minute > 90 ? 125 : 95;  // 90 reg + ~5 comp (mesma lógica do servidor)
   const elapsed = Math.min(minute, fullDur);
   const remMin = Math.max(fullDur - elapsed, 1);
   // Taxa por minuto baseada no xG acumulado até agora
