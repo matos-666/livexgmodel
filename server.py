@@ -1736,6 +1736,7 @@ TOURNAMENT_TO_SPORT_KEY = {
     "armenian premier league":       "soccer_armenia_na",
     "kazakh premier league":         "soccer_kazakhstan_na",
     "ukrainian premier league":      "soccer_ukraine_na",
+    "premier league ukraine":        "soccer_ukraine_na",  # explicit block
     "upl":                           "soccer_ukraine_na",
     "scottish championship": "soccer_scotland_championship",
     # Norway / Finland
@@ -4434,7 +4435,7 @@ def _background_loop():
 # Used for strict matching in the "today" filter
 _MONITORED_LEAGUE_STRICT_KEYWORDS = {
     # England
-    "premier league": {"england", "english", "uk"},
+    "premier league": {"england", "english"},  # "uk" removed — substring matches "ukraine"
     "championship": {"england", "english"},
     "efl": {"england", "english"},
     # Spain
@@ -4567,12 +4568,18 @@ def _is_monitored_league_strict(tournament, country):
         if frag in raw:
             return False
     # Check against strict keyword map
+    # Use word-boundary matching for country to prevent "uk" matching "ukraine" etc.
+    def _country_match(ac: str, country_str: str, tourn_str: str) -> bool:
+        import re as _re2
+        pat = _re2.compile(r'\b' + _re2.escape(ac) + r'\b')
+        return bool(pat.search(country_str) or pat.search(tourn_str))
+
     for kw, allowed_countries in sorted(_MONITORED_LEAGUE_STRICT_KEYWORDS.items(), key=lambda x: -len(x[0])):
         if kw in t:
             if allowed_countries is None:
                 return True
             for ac in allowed_countries:
-                if ac in c or ac in t:
+                if _country_match(ac, c, t):
                     return True
             return False  # keyword found but country doesn't match
     return False
