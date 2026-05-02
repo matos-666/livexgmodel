@@ -1120,16 +1120,44 @@ def _build_welcome_banner() -> bytes:
         W, H = 1080, 600
 
         # ── Paleta ───────────────────────────────────────────────────────────
-        BG         = (0, 0, 0)         # preto puro
         GREEN_NEON = (57, 255, 20)     # verde neon (#39FF14)
         GREEN_DIM  = (16, 185, 129)    # emerald (#10b981)
         WHITE      = (255, 255, 255)
         GRAY       = (190, 190, 190)
-        GRAY_DIM   = (85, 85, 85)
-        DARK_CARD  = (10, 10, 10)
+        GRAY_DIM   = (70, 70, 70)
+        DARK_CARD  = (8, 14, 10)
 
-        img  = Image.new("RGB", (W, H), BG)
+        # ── Gradient background ───────────────────────────────────────────────
+        # Diagonal gradient: top-right corner glows dark emerald, rest near-black
+        # Use a small 3×2 seed image scaled with bilinear for smooth result
+        seed = Image.new("RGB", (3, 2))
+        seed.putdata([
+            (6,  12,  8),   # top-left:    very dark
+            (7,  14,  9),   # top-center:  very dark
+            (14, 44, 22),   # top-right:   dark emerald glow
+            (5,   8,  6),   # bottom-left: darkest
+            (5,   9,  6),   # bottom-center
+            (9,  24, 12),   # bottom-right: faint green
+        ])
+        img  = seed.resize((W, H), Image.BILINEAR)
         draw = ImageDraw.Draw(img)
+
+        # ── Subtle diagonal line texture (tech/data feel) ─────────────────────
+        for x_off in range(-H, W + H, 70):
+            draw.line([(x_off, 0), (x_off + H, H)], fill=(14, 26, 17), width=1)
+
+        # ── Dot grid ─────────────────────────────────────────────────────────
+        for gy in range(0, H, 30):
+            for gx in range(0, W, 30):
+                draw.ellipse([(gx - 1, gy - 1), (gx + 1, gy + 1)],
+                             fill=(18, 34, 22))
+
+        # ── Neon border (top + bottom edge lines) ────────────────────────────
+        draw.line([(0, 0), (W, 0)],     fill=GREEN_NEON, width=3)
+        draw.line([(0, 2), (W, 2)],     fill=(24, 110, 45), width=1)
+        draw.line([(0, 3), (W, 3)],     fill=(10, 50, 20),  width=1)
+        draw.line([(0, H - 1), (W, H - 1)], fill=GREEN_NEON,     width=2)
+        draw.line([(0, H - 3), (W, H - 3)], fill=(10, 50, 20),   width=1)
 
         # ── Fonts (DejaVu no Docker; Arial no macOS) ─────────────────────────
         FONT_DIRS = [
@@ -1237,7 +1265,7 @@ def _build_welcome_banner() -> bytes:
         cy += card_h + 18
 
         # Rodape
-        draw.text((rx, cy), "t.me/BetRadarAI_bot  |  webpronos.com",
+        draw.text((rx, cy), "t.me/BetRadarAI_bot",
                   font=fnt_tiny, fill=GRAY_DIM)
 
         # ── Export ────────────────────────────────────────────────────────────
