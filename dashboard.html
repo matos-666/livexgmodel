@@ -630,9 +630,10 @@ async function loadOddsDetail(match){
     wrap.innerHTML=`<div class="oerr"><div style="color:var(--amber);margin-bottom:5px">Jogo não encontrado</div><div style="font-size:11px;color:var(--text3)">${match.homeTeam} vs ${match.awayTeam} não foi encontrado nos eventos da Odds API para "${sport}".<br>O jogo pode não ter odds disponíveis de momento.</div></div>`;
     return;
   }
-  S.oddsMap[match.id]=ev.bookmakers.filter(b=>b.key!=='pinnacle');
-  trackHistory(match.id,ev.bookmakers);
-  renderOdds(match,ev,sport);
+  const filteredBks=ev.bookmakers.filter(b=>b.key!=='pinnacle');
+  S.oddsMap[match.id]=filteredBks;
+  trackHistory(match.id,filteredBks);
+  renderOdds(match,{...ev,bookmakers:filteredBks},sport);
   if(S.tab==='algo') renderAlgo(match);
   renderMatchList();
 }
