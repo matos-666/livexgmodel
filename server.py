@@ -696,12 +696,13 @@ def _get_alltime_stats() -> dict:
         }
 
 
-def _send_daily_summary(days_back: int = 0):
+def _send_daily_summary(days_back: int = 0, force_send: bool = False):
     """
     Calculate daily P&L and send summary to all Telegram subscribers.
-    Only sends if daily profit > €25.
+    Only sends if daily profit > €25 (unless force_send=True).
     Includes: lucro €, odds médias, ROI, maior odd with match info, and encouragement text.
     days_back: 0 = today, 1 = yesterday, etc.
+    force_send: if True, send even if lucro <= €25
     """
     try:
         from datetime import datetime, timezone, timedelta
@@ -754,9 +755,9 @@ def _send_daily_summary(days_back: int = 0):
 
         settled = wins + losses
 
-        # Only send if lucro > €25
-        if lucro <= 25:
-            log.info(f"_send_daily_summary: lucro €{lucro:.2f} below threshold (€25) for {days_back} day(s) ago")
+        # Only send if lucro > €25 (unless force_send)
+        if not force_send and lucro <= 25:
+            log.info(f"_send_daily_summary: lucro €{lucro:.2f} below threshold (€25) for {days_back} day(s) ago (use force_send=True to override)")
             return
 
         # Calculate average odds and ROI
@@ -6009,7 +6010,9 @@ def r_admin_send_daily_summary():
     try:
         # Get days_back from query param (0=today, 1=yesterday, etc.)
         days_back = flask_request.args.get("days_back", 1, type=int)
-        _send_daily_summary(days_back=days_back)
+        force = flask_request.args.get("force", "false").lower() == "true"  # bypass threshold
+
+        _send_daily_summary(days_back=days_back, force_send=force)
 
         from datetime import datetime, timezone, timedelta
         lisbon_tz = pytz.timezone('Europe/Lisbon')
@@ -6022,6 +6025,93 @@ def r_admin_send_daily_summary():
         })
     except Exception as e:
         log.error(f"r_admin_send_daily_summary error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/admin/debug-daily-summary", methods=["GET"])
+def r_admin_debug_daily_summary():
+    """Debug endpoint to see what would be sent for a day."""
+    if not _check_admin_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        from datetime import datetime, timezone, timedelta
+
+        # Use Lisbon timezone to determine the target day
+        lisbon_tz = pytz.timezone('Europe/Lisbon')
+        now_lisbon = datetime.now(lisbon_tz)
+        days_back = flask_request.args.get("days_back", 1, type=int)
+
+        target_date = now_lisbon - timedelta(days=days_back)
+        target_start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=lisbon_tz)
+        target_end = target_start + timedelta(days=1)
+
+        # Convert to UTC timestamps
+        target_start_ts = int(target_start.timestamp())
+        target_end_ts = int(target_end.timestamp())
+
+        STAKE = get_setting("stake_per_bet", 100.0)
+
+        with _db() as conn:
+            # Get all settled tips from the target day
+            tips = conn.execute(
+                "SELECT t.result, t.odd_entry, t.label, t.market, t.match_id, "
+                "       g.home_team, g.away_team "
+                "FROM tips t "
+                "LEFT JOIN games g ON g.id = t.match_id "
+                "WHERE t.wall_ts >= ? AND t.wall_ts < ? AND t.result IS NOT NULL "
+                "ORDER BY t.odd_entry DESC",
+                (target_start_ts, target_end_ts)
+            ).fetchall()
+
+            subs = conn.execute("SELECT COUNT(*) c FROM tg_subscribers WHERE active = 1").fetchone()["c"]
+
+        if not tips:
+            return jsonify({
+                "ok": False,
+                "reason": "No settled tips this day",
+                "tips_count": 0,
+                "subscribers_active": subs,
+                "day": target_start.strftime("%d/%m/%Y")
+            })
+
+        # Calculate stats
+        lucro = 0.0
+        odds_sum = 0.0
+        wins = 0
+        losses = 0
+
+        for tip in tips:
+            result, odd_entry = tip["result"], tip["odd_entry"]
+            if result in ("win", "green") and odd_entry:
+                lucro += (odd_entry - 1) * STAKE
+                odds_sum += odd_entry
+                wins += 1
+            elif result in ("loss", "red"):
+                lucro -= STAKE
+                odds_sum += (odd_entry or 0)
+                losses += 1
+
+        settled = wins + losses
+        avg_odds = odds_sum / settled if settled > 0 else 0.0
+        roi = (lucro / (settled * STAKE) * 100) if settled > 0 else 0.0
+
+        return jsonify({
+            "ok": True,
+            "day": target_start.strftime("%d/%m/%Y"),
+            "tips_count": len(tips),
+            "settled": settled,
+            "wins": wins,
+            "losses": losses,
+            "lucro_eur": round(lucro, 2),
+            "avg_odds": round(avg_odds, 2),
+            "roi_percent": round(roi, 1),
+            "will_send": lucro > 25,
+            "threshold_eur": 25,
+            "subscribers_active": subs
+        })
+    except Exception as e:
+        log.error(f"r_admin_debug_daily_summary error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
