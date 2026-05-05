@@ -5652,8 +5652,14 @@ def r_sitemap():
 
     # ── 4. Build XML ───────────────────────────────────────────────────────────
     static_pages = [
-        (SITE_URL + "/",      now.strftime("%Y-%m-%d"), "daily",   "1.0"),
-        (SITE_URL + "/blog",  now.strftime("%Y-%m-%d"), "weekly",  "0.8"),
+        (SITE_URL + "/",                     now.strftime("%Y-%m-%d"), "daily",   "1.0"),
+        (SITE_URL + "/tomorrow",             now.strftime("%Y-%m-%d"), "daily",   "0.9"),
+        (SITE_URL + "/history",              now.strftime("%Y-%m-%d"), "daily",   "0.8"),
+        (SITE_URL + "/blog",                 now.strftime("%Y-%m-%d"), "weekly",  "0.8"),
+        (SITE_URL + "/about",                now.strftime("%Y-%m-%d"), "monthly", "0.5"),
+        (SITE_URL + "/responsible-gambling", now.strftime("%Y-%m-%d"), "yearly",  "0.3"),
+        (SITE_URL + "/terms",                now.strftime("%Y-%m-%d"), "yearly",  "0.3"),
+        (SITE_URL + "/privacy",              now.strftime("%Y-%m-%d"), "yearly",  "0.3"),
     ]
 
     def url_block(loc, lastmod, changefreq, priority):
