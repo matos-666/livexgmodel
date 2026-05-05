@@ -696,38 +696,43 @@ def _get_alltime_stats() -> dict:
         }
 
 
-def _send_daily_summary():
+def _send_daily_summary(days_back: int = 0):
     """
     Calculate daily P&L and send summary to all Telegram subscribers.
     Only sends if daily profit > €25.
-    Includes: lucro €, odds médias, ROI, maior odd, and which bet had the highest odd.
+    Includes: lucro €, odds médias, ROI, maior odd with match info, and encouragement text.
+    days_back: 0 = today, 1 = yesterday, etc.
     """
     try:
         from datetime import datetime, timezone, timedelta
 
-        # Use Lisbon timezone to determine "today"
+        # Use Lisbon timezone to determine the target day
         lisbon_tz = pytz.timezone('Europe/Lisbon')
         now_lisbon = datetime.now(lisbon_tz)
-        today_start = datetime(now_lisbon.year, now_lisbon.month, now_lisbon.day, 0, 0, 0, tzinfo=lisbon_tz)
-        tomorrow_start = today_start + timedelta(days=1)
+        target_date = now_lisbon - timedelta(days=days_back)
+        target_start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=lisbon_tz)
+        target_end = target_start + timedelta(days=1)
 
         # Convert to UTC timestamps
-        today_start_ts = int(today_start.timestamp())
-        tomorrow_start_ts = int(tomorrow_start.timestamp())
+        target_start_ts = int(target_start.timestamp())
+        target_end_ts = int(target_end.timestamp())
 
         STAKE = get_setting("stake_per_bet", 100.0)
 
         with _db() as conn:
-            # Get all settled tips from today
+            # Get all settled tips from the target day, with match info
             tips = conn.execute(
-                "SELECT result, odd_entry, label, market FROM tips "
-                "WHERE wall_ts >= ? AND wall_ts < ? AND result IS NOT NULL "
-                "ORDER BY odd_entry DESC",
-                (today_start_ts, tomorrow_start_ts)
+                "SELECT t.result, t.odd_entry, t.label, t.market, t.match_id, "
+                "       g.home_team, g.away_team "
+                "FROM tips t "
+                "LEFT JOIN games g ON g.id = t.match_id "
+                "WHERE t.wall_ts >= ? AND t.wall_ts < ? AND t.result IS NOT NULL "
+                "ORDER BY t.odd_entry DESC",
+                (target_start_ts, target_end_ts)
             ).fetchall()
 
         if not tips:
-            log.info("_send_daily_summary: no tips settled today")
+            log.info(f"_send_daily_summary: no tips settled {days_back} day(s) ago")
             return
 
         # Calculate stats
@@ -751,33 +756,50 @@ def _send_daily_summary():
 
         # Only send if lucro > €25
         if lucro <= 25:
-            log.info(f"_send_daily_summary: lucro €{lucro:.2f} below threshold (€25)")
+            log.info(f"_send_daily_summary: lucro €{lucro:.2f} below threshold (€25) for {days_back} day(s) ago")
             return
 
         # Calculate average odds and ROI
         avg_odds = odds_sum / settled if settled > 0 else 0.0
         roi = (lucro / (settled * STAKE) * 100) if settled > 0 else 0.0
 
-        # Find the bet with the highest odd
+        # Find the bet with the highest odd, with match info
         max_odd_tip = max(tips, key=lambda t: t["odd_entry"] or 0)
         maior_odd = max_odd_tip["odd_entry"]
-        bet_with_maior_odd = f"{max_odd_tip.get('label', '?')} ({max_odd_tip.get('market', '?')})" if max_odd_tip.get("label") else max_odd_tip.get("market", "?")
+        bet_label = max_odd_tip.get('label', '?')
+        bet_market = max_odd_tip.get('market', '?')
+        home_team = max_odd_tip.get('home_team', '')
+        away_team = max_odd_tip.get('away_team', '')
 
-        # Format the message (no emojis, clean stats)
-        date_str = now_lisbon.strftime("%d/%m/%Y")
+        # Build match string
+        if home_team and away_team:
+            match_str = f"{home_team} vs {away_team}"
+        else:
+            match_str = "Match desconhecido"
+
+        bet_with_maior_odd = f"{bet_label} ({bet_market})"
+
+        # Format the message with match context and encouragement
+        date_str = target_start.strftime("%d/%m/%Y")
+        day_label = "Ontem" if days_back == 1 else ("Hoje" if days_back == 0 else f"{days_back}d atrás")
+
         msg_lines = [
-            f"<b>Resumo Diário — {date_str}</b>",
+            f"<b>Resumo Diário — {day_label} ({date_str})</b>",
             "",
             f"💶 <b>Lucro:</b> €{lucro:.2f}",
             f"📊 <b>Odds Médias:</b> {avg_odds:.2f}",
             f"📈 <b>ROI:</b> {roi:.1f}%",
-            f"🎯 <b>Maior Odd:</b> {maior_odd:.2f}",
-            f"   {bet_with_maior_odd}",
+            "",
+            f"🎯 <b>Maior Odd do Dia:</b> {maior_odd:.2f}",
+            f"   <i>{bet_with_maior_odd}</i>",
+            f"   <i>{match_str}</i>",
+            "",
+            f"<i>Mantém a vigilância nas entradas de amanhã — o edge está lá! 🚀</i>",
         ]
 
         msg = "\n".join(msg_lines)
 
-        log.info(f"_send_daily_summary: sending message for {date_str}, lucro €{lucro:.2f}")
+        log.info(f"_send_daily_summary: sending message for {day_label} ({date_str}), lucro €{lucro:.2f}")
         _send_telegram(msg)
 
     except Exception as e:
@@ -5976,6 +5998,31 @@ def r_admin_health():
         "settings_loaded": len(_load_settings()),
         "auth_required_for_writes": True,
     })
+
+
+@app.route("/api/admin/send-daily-summary", methods=["POST"])
+def r_admin_send_daily_summary():
+    """Send daily summary for a specific day (days_back parameter, default=1 for yesterday)."""
+    if not _check_admin_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        # Get days_back from query param (0=today, 1=yesterday, etc.)
+        days_back = flask_request.args.get("days_back", 1, type=int)
+        _send_daily_summary(days_back=days_back)
+
+        from datetime import datetime, timezone, timedelta
+        lisbon_tz = pytz.timezone('Europe/Lisbon')
+        now_lisbon = datetime.now(lisbon_tz)
+        target_date = (now_lisbon - timedelta(days=days_back)).strftime("%d/%m/%Y")
+
+        return jsonify({
+            "ok": True,
+            "message": f"Daily summary sent for {target_date} (days_back={days_back})"
+        })
+    except Exception as e:
+        log.error(f"r_admin_send_daily_summary error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════
