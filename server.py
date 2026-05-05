@@ -6596,41 +6596,673 @@ def prerender_match(match_id: int):
         slug = event.get("slug", "")
         canonical = f"{SITE_URL}/match/{match_id}/{slug}" if slug else f"{SITE_URL}/match/{match_id}"
 
-        # 5. Fetch base HTML and inject meta
-        base_html = _get_base_html()
-        if base_html:
-            rendered = _inject_meta(base_html, meta, canonical)
-            return rendered, 200, {"Content-Type": "text/html; charset=utf-8"}
+        # 5. Build the visible body content (NEW: full match info, not just meta)
+        body_html = _render_match_body(event, odds, match_id)
 
-        # Fallback: minimal HTML if Lovable is unreachable
-        fallback = f"""<!DOCTYPE html>
-<html lang="pt">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{meta['title']}</title>
-  <meta name="description" content="{meta['description']}">
-  <meta property="og:title" content="{meta['title']}">
-  <meta property="og:description" content="{meta['description']}">
-  <meta property="og:image" content="{meta['og_image']}">
-  <meta property="og:url" content="{canonical}">
-  <meta property="og:type" content="website">
-  <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="{meta['title']}">
-  <meta name="twitter:description" content="{meta['description']}">
-  <link rel="canonical" href="{canonical}">
-  <meta http-equiv="refresh" content="0;url={canonical}">
-</head>
-<body>
-  <h1>{meta['title']}</h1>
-  <p>{meta['description']}</p>
-</body>
-</html>"""
-        return fallback, 200, {"Content-Type": "text/html; charset=utf-8"}
+        # 6. SportsEvent JSON-LD for rich results
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            ts = event.get("startTimestamp", 0)
+            iso_start = _dt.fromtimestamp(ts, tz=_tz.utc).isoformat() if ts else ""
+            jsonld = json.dumps({
+                "@context":  "https://schema.org",
+                "@type":     "SportsEvent",
+                "name":      f"{event.get('homeTeam','')} vs {event.get('awayTeam','')}",
+                "startDate": iso_start,
+                "sport":     "Soccer",
+                "url":       canonical,
+                "homeTeam":  {"@type": "SportsTeam", "name": event.get('homeTeam', '')},
+                "awayTeam":  {"@type": "SportsTeam", "name": event.get('awayTeam', '')},
+                "location":  {"@type": "Place", "name": event.get('tournament', '')},
+            }, ensure_ascii=False)
+        except Exception:
+            jsonld = ""
+
+        # 7. Render with full meta + body
+        html = _build_html_page(
+            title       = meta["title"],
+            description = meta["description"],
+            canonical   = canonical,
+            body_html   = body_html,
+            jsonld      = jsonld,
+            og_image    = meta.get("og_image"),
+        )
+        return html, 200, {
+            "Content-Type":  "text/html; charset=utf-8",
+            "Cache-Control": "public, max-age=120",  # 2min — match data changes during games
+        }
 
     except Exception as e:
         log.exception(f"[prerender] Error for match {match_id}: {e}")
         return "Internal error", 500
+
+
+# ════════════════════════════════════════════════════════════
+#  UNIFIED PRERENDER — single entry point for all bot traffic
+#  /prerender?path=/blog → routes to the right renderer
+# ════════════════════════════════════════════════════════════
+
+# Shared inline styles for all prerendered pages — dark theme matching the SPA
+_PRERENDER_CSS = """
+<style>
+  body{margin:0;background:#0a0e27;color:#e8f0f7;font-family:system-ui,-apple-system,sans-serif;line-height:1.6}
+  .pr-wrap{max-width:1100px;margin:0 auto;padding:1.5rem 1rem}
+  .pr-nav{margin-bottom:1.5rem;font-size:.85rem;color:#9ca3af}
+  .pr-nav a{color:#10b981;text-decoration:none;margin-right:.5rem}
+  .pr-nav a:hover{text-decoration:underline}
+  .pr-h1{font-size:2rem;font-weight:800;margin:0 0 .5rem;color:#fff;line-height:1.2}
+  .pr-lead{font-size:1.05rem;color:#9ca3af;margin:0 0 2rem}
+  .pr-h2{font-size:1.4rem;font-weight:700;color:#fff;margin:2rem 0 1rem}
+  .pr-h3{font-size:1.1rem;font-weight:600;color:#fff;margin:1.5rem 0 .5rem}
+  .pr-card{background:#1a1f3a;border:1px solid #2a2f4a;border-radius:8px;padding:1rem;margin-bottom:.75rem}
+  .pr-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:1rem}
+  .pr-stat{display:inline-block;background:#1a1f3a;border:1px solid #2a2f4a;border-radius:6px;padding:.4rem .8rem;margin:0 .4rem .4rem 0;font-size:.85rem}
+  .pr-stat strong{color:#10b981;font-weight:700}
+  .pr-row{display:flex;justify-content:space-between;align-items:center;padding:.6rem 0;border-bottom:1px solid #2a2f4a}
+  .pr-row:last-child{border:0}
+  .pr-row a{color:#fff;text-decoration:none;font-weight:600;flex:1}
+  .pr-row a:hover{color:#10b981}
+  .pr-meta{font-size:.8rem;color:#9ca3af}
+  .pr-win{color:#10b981;font-weight:700}
+  .pr-lose{color:#ef4444;font-weight:700}
+  .pr-pending{color:#fbbf24;font-weight:700}
+  .pr-table{width:100%;border-collapse:collapse;margin:1rem 0}
+  .pr-table th,.pr-table td{text-align:left;padding:.5rem;border-bottom:1px solid #2a2f4a;font-size:.9rem}
+  .pr-table th{color:#9ca3af;font-weight:600;font-size:.75rem;text-transform:uppercase}
+  .pr-footer{margin-top:3rem;padding-top:1.5rem;border-top:1px solid #2a2f4a;font-size:.85rem;color:#9ca3af;text-align:center}
+  .pr-footer a{color:#10b981;text-decoration:none;margin:0 .5rem}
+  .pr-articles a{color:#fff;text-decoration:none}
+  .pr-articles h3{margin:0 0 .5rem;font-size:1.05rem}
+  .pr-articles p{margin:0;font-size:.9rem;color:#9ca3af}
+</style>
+"""
+
+
+def _build_html_page(title: str, description: str, canonical: str,
+                      body_html: str, jsonld: str = "",
+                      og_image: str | None = None) -> str:
+    """
+    Build a complete HTML page for prerender.
+    Tries to inject into the Lovable SPA shell so visual hydration still works
+    for users who somehow hit this endpoint. Falls back to standalone if needed.
+    """
+    import re
+    og_image = og_image or f"{SITE_URL}/og/default.png"
+    title_escaped = title.replace('<', '&lt;').replace('>', '&gt;')
+    desc_escaped  = description.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+
+    base_html = _get_base_html()
+    if not base_html:
+        # Standalone fallback
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="robots" content="index,follow">
+<title>{title_escaped}</title>
+<meta name="description" content="{desc_escaped}">
+<meta property="og:type" content="website">
+<meta property="og:title" content="{title_escaped}">
+<meta property="og:description" content="{desc_escaped}">
+<meta property="og:image" content="{og_image}">
+<meta property="og:url" content="{canonical}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{title_escaped}">
+<meta name="twitter:description" content="{desc_escaped}">
+<meta name="twitter:image" content="{og_image}">
+<link rel="canonical" href="{canonical}">
+{('<script type="application/ld+json">' + jsonld + '</script>') if jsonld else ''}
+{_PRERENDER_CSS}
+</head>
+<body>
+<div class="pr-wrap">{body_html}</div>
+</body>
+</html>"""
+
+    # Inject into Lovable SPA shell
+    html = base_html
+
+    # Strip react-helmet dynamic tags
+    html = re.sub(r'<meta\s+data-rh=["\']true["\'][^>]*/?>',  '', html)
+    html = re.sub(r'<link\s+data-rh=["\']true["\'][^>]*/?>',  '', html)
+    html = re.sub(r'<script\s+data-rh=["\']true["\'][^>]*>.*?</script>', '', html, flags=re.DOTALL)
+    # Replace title (may have data-rh)
+    html = re.sub(r'<title[^>]*>[^<]*</title>', f'<title>{title_escaped}</title>', html)
+    # Strip existing og/twitter/canonical/jsonld
+    html = re.sub(r'<meta\s+(?:property|name)=["\'](?:og:|twitter:)[^"\']*["\'][^>]*/?>', '', html)
+    html = re.sub(r'<meta\s+name=["\']description["\'][^>]*/?>', '', html)
+    html = re.sub(r'<link\s+rel=["\']canonical["\'][^>]*/?>',  '', html)
+    html = re.sub(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>.*?</script>', '', html, flags=re.DOTALL)
+
+    new_head = (
+        f'<meta name="description" content="{desc_escaped}">\n'
+        f'    <meta property="og:title" content="{title_escaped}">\n'
+        f'    <meta property="og:description" content="{desc_escaped}">\n'
+        f'    <meta property="og:image" content="{og_image}">\n'
+        f'    <meta property="og:url" content="{canonical}">\n'
+        f'    <meta property="og:type" content="website">\n'
+        f'    <meta name="twitter:card" content="summary_large_image">\n'
+        f'    <meta name="twitter:title" content="{title_escaped}">\n'
+        f'    <meta name="twitter:description" content="{desc_escaped}">\n'
+        f'    <meta name="twitter:image" content="{og_image}">\n'
+        f'    <link rel="canonical" href="{canonical}">\n'
+        + (f'    <script type="application/ld+json">{jsonld}</script>\n' if jsonld else '')
+        + f'    {_PRERENDER_CSS}'
+    )
+    html = re.sub(r'(<title>[^<]*</title>)', r'\1\n    ' + new_head, html, count=1)
+
+    # Replace #root with the body
+    new_root = f'<div id="root"><div class="pr-wrap">{body_html}</div></div>'
+    html = re.sub(r'<div id="root">.*?</div>', new_root, html, count=1, flags=re.DOTALL)
+
+    return html
+
+
+def _render_pr_footer() -> str:
+    return f"""
+    <div class="pr-footer">
+      <a href="{SITE_URL}/">Home</a> ·
+      <a href="{SITE_URL}/blog">Blog</a> ·
+      <a href="{SITE_URL}/history">History</a> ·
+      <a href="{SITE_URL}/tomorrow">Tomorrow</a> ·
+      <a href="{SITE_URL}/about">About</a>
+      <p style="margin-top:1rem;font-size:.75rem">WebPronos provides statistical predictions for informational purposes only. 18+ — please gamble responsibly.</p>
+    </div>
+    """
+
+
+# ── Blog listing ──────────────────────────────────────────────────────────
+def _supabase_get_all_blog_posts(limit: int = 50) -> list:
+    """Fetch all published blog posts (lightweight: title, slug, excerpt, date)."""
+    if not SUPABASE_ANON:
+        return []
+    try:
+        import urllib.request as _ur
+        url = (
+            f"{SUPABASE_URL}/rest/v1/blog_posts"
+            f"?select=*"
+            f"&order=published_at.desc"
+            f"&limit={limit}"
+        )
+        req = _ur.Request(url, headers={
+            "apikey":        SUPABASE_ANON,
+            "Authorization": f"Bearer {SUPABASE_ANON}",
+        })
+        with _ur.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        log.warning(f"[prerender/blog-list] Supabase fetch failed: {e}")
+        return []
+
+
+def _render_blog_listing() -> str:
+    """SSR for /blog — list of all articles."""
+    posts = _supabase_get_all_blog_posts(limit=50)
+
+    if not posts:
+        articles_html = '<p>No articles published yet. Check back soon.</p>'
+    else:
+        items = []
+        for p in posts:
+            slug   = p.get("slug", "")
+            title  = p.get("title", "Untitled")
+            excerpt = p.get("description") or p.get("excerpt") or ""
+            pub    = (p.get("published_at") or "")[:10]
+            author = p.get("author", "WebPronos")
+            items.append(f"""
+            <article class="pr-card pr-articles" itemscope itemtype="https://schema.org/BlogPosting">
+              <a href="{SITE_URL}/blog/{slug}" itemprop="url">
+                <h3 itemprop="headline">{title}</h3>
+                <p itemprop="description">{excerpt}</p>
+                <p class="pr-meta" style="margin-top:.5rem">
+                  <span itemprop="author">{author}</span> · <time itemprop="datePublished" datetime="{pub}">{pub}</time>
+                </p>
+              </a>
+            </article>""")
+        articles_html = "\n".join(items)
+
+    body = f"""
+    <nav class="pr-nav">
+      <a href="{SITE_URL}/">WebPronos</a> › Blog
+    </nav>
+    <h1 class="pr-h1">WebPronos Blog</h1>
+    <p class="pr-lead">In-depth guides on xG, live betting strategy, value detection and how AI improves football predictions. Updated regularly.</p>
+    <div class="pr-grid">
+      {articles_html}
+    </div>
+    {_render_pr_footer()}
+    """
+
+    # JSON-LD: ItemList of articles
+    items_jsonld = []
+    for i, p in enumerate(posts[:20]):
+        items_jsonld.append({
+            "@type": "ListItem",
+            "position": i + 1,
+            "url": f"{SITE_URL}/blog/{p.get('slug','')}",
+            "name": p.get("title", ""),
+        })
+    jsonld = json.dumps({
+        "@context": "https://schema.org",
+        "@type":    "Blog",
+        "name":     "WebPronos Blog",
+        "url":      f"{SITE_URL}/blog",
+        "description": "Guides on xG, live betting strategy and AI football predictions.",
+        "blogPost": items_jsonld,
+    }, ensure_ascii=False)
+
+    return _build_html_page(
+        title       = "Blog — Live Betting Strategy, xG & AI Predictions | WebPronos",
+        description = "Free in-depth guides on xG, live betting timing, value detection and edge calculation. Learn how the WebPronos AI model finds positive-EV bets.",
+        canonical   = f"{SITE_URL}/blog",
+        body_html   = body,
+        jsonld      = jsonld,
+    )
+
+
+# ── History ───────────────────────────────────────────────────────────────
+def _render_history() -> str:
+    """SSR for /history — last settled picks with results."""
+    try:
+        STAKE = get_setting("stake_per_bet", 100.0)
+        with _db() as conn:
+            rows = conn.execute("""
+                SELECT t.match_id, t.market, t.label, t.odd_entry, t.result, t.wall_ts,
+                       g.home_team, g.away_team, g.home_goals, g.away_goals,
+                       g.country, g.tournament
+                FROM tips t
+                LEFT JOIN games g ON g.id = t.match_id
+                WHERE t.result IS NOT NULL
+                ORDER BY t.wall_ts DESC
+                LIMIT 50
+            """).fetchall()
+
+            stats_row = conn.execute("""
+                SELECT COUNT(*) total,
+                       SUM(CASE WHEN result IN ('win','green') THEN 1 ELSE 0 END) wins,
+                       SUM(CASE WHEN result IN ('loss','red') THEN 1 ELSE 0 END) losses
+                FROM tips WHERE result IS NOT NULL
+            """).fetchone()
+
+        # Compute aggregate stats
+        total = stats_row["total"] or 0
+        wins  = stats_row["wins"] or 0
+        losses = stats_row["losses"] or 0
+        pnl   = 0.0
+        for r in rows:
+            if r["result"] in ("win","green") and r["odd_entry"]:
+                pnl += (r["odd_entry"] - 1) * STAKE
+            elif r["result"] in ("loss","red"):
+                pnl -= STAKE
+
+        winrate = (wins / total * 100) if total else 0
+        roi     = (pnl  / (total * STAKE) * 100) if total else 0
+
+        # Build table
+        table_rows = []
+        for r in rows[:30]:
+            from datetime import datetime, timezone
+            date_str = datetime.fromtimestamp(r["wall_ts"], tz=timezone.utc).strftime("%b %d")
+            won = r["result"] in ("win","green")
+            badge = '<span class="pr-win">✓ Won</span>' if won else '<span class="pr-lose">✗ Lost</span>'
+            score = f"{r['home_goals']}-{r['away_goals']}" if r["home_goals"] is not None else "—"
+            match = f"{r['home_team']} vs {r['away_team']}" if r["home_team"] else "—"
+            league = r["tournament"] or r["country"] or "—"
+            profit = ((r["odd_entry"] - 1) * STAKE) if won and r["odd_entry"] else (-STAKE if not won else 0)
+            profit_class = "pr-win" if profit > 0 else "pr-lose"
+
+            table_rows.append(f"""
+              <tr>
+                <td class="pr-meta">{date_str}</td>
+                <td class="pr-meta">{league}</td>
+                <td><a href="{SITE_URL}/match/{r['match_id']}" style="color:#fff">{match}</a></td>
+                <td class="pr-meta">{score}</td>
+                <td class="pr-meta">{r['market']} — {r['label']}</td>
+                <td class="pr-meta">@{r['odd_entry']:.2f}</td>
+                <td>{badge}</td>
+                <td class="{profit_class}">{'+' if profit > 0 else ''}{profit:.0f}€</td>
+              </tr>
+            """)
+
+        body = f"""
+        <nav class="pr-nav">
+          <a href="{SITE_URL}/">WebPronos</a> › History
+        </nav>
+        <h1 class="pr-h1">Historical Performance — Track Record</h1>
+        <p class="pr-lead">Every settled prediction by the WebPronos AI model is published openly. Audit the full track record below — no cherry-picking.</p>
+
+        <div style="margin:1.5rem 0">
+          <span class="pr-stat">Total picks: <strong>{total}</strong></span>
+          <span class="pr-stat">Wins / Losses: <strong>{wins} / {losses}</strong></span>
+          <span class="pr-stat">Win rate: <strong>{winrate:.1f}%</strong></span>
+          <span class="pr-stat">P&amp;L (€{STAKE:.0f}/pick): <strong>{'+' if pnl > 0 else ''}{pnl:.0f}€</strong></span>
+          <span class="pr-stat">ROI: <strong>{'+' if roi > 0 else ''}{roi:.1f}%</strong></span>
+        </div>
+
+        <h2 class="pr-h2">Last 30 settled picks</h2>
+        <table class="pr-table">
+          <thead>
+            <tr>
+              <th>Date</th><th>League</th><th>Match</th><th>Score</th>
+              <th>Pick</th><th>Odds</th><th>Result</th><th>P&amp;L</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(table_rows) if table_rows else '<tr><td colspan="8" style="text-align:center;padding:2rem">No settled picks yet.</td></tr>'}
+          </tbody>
+        </table>
+
+        <h2 class="pr-h2">How we measure performance</h2>
+        <p>Every pick is logged the moment our live model identifies a positive-EV bet. The recorded entry odds are the live bookmaker price at that exact second — never inflated post-result. P&amp;L assumes a flat €{STAKE:.0f} stake on every recommendation. ROI is calculated as total profit divided by total staked, expressed as a percentage.</p>
+
+        <h2 class="pr-h2">Why a public track record matters</h2>
+        <p>Most tipsters cherry-pick wins and hide losses. By publishing every single settled pick — including the bad ones — we let anyone audit our edge. If the long-term ROI stays positive, the model is genuinely beating the market. If it drops, we owe you transparency about why.</p>
+
+        {_render_pr_footer()}
+        """
+
+        jsonld = json.dumps({
+            "@context": "https://schema.org",
+            "@type":    "Dataset",
+            "name":     "WebPronos prediction track record",
+            "description": f"Public history of {total} AI-generated football predictions with results and P&L.",
+            "url":      f"{SITE_URL}/history",
+            "creator":  {"@type": "Organization", "name": "WebPronos", "url": SITE_URL},
+        }, ensure_ascii=False)
+
+        return _build_html_page(
+            title       = f"History — Track Record of {total} AI Football Predictions | WebPronos",
+            description = f"Public audit log of every prediction by the WebPronos AI model. {wins} wins, {losses} losses, {roi:+.1f}% ROI across {total} settled picks. No cherry-picking.",
+            canonical   = f"{SITE_URL}/history",
+            body_html   = body,
+            jsonld      = jsonld,
+        )
+    except Exception as e:
+        log.exception(f"[prerender/history] Error: {e}")
+        return _build_html_page(
+            title="History | WebPronos",
+            description="Public track record of AI football predictions.",
+            canonical=f"{SITE_URL}/history",
+            body_html=f'<h1>History</h1><p>Loading… {_render_pr_footer()}</p>',
+        )
+
+
+# ── Tomorrow's matches ────────────────────────────────────────────────────
+def _render_tomorrow() -> str:
+    """SSR for /tomorrow — list of matches scheduled for tomorrow."""
+    try:
+        from datetime import datetime, timezone, timedelta
+        # Reuse the upcoming endpoint logic — fetch tomorrow specifically
+        import urllib.request as _ur
+        try:
+            req = _ur.Request("http://127.0.0.1:8080/api/upcoming?days=2")
+            with _ur.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+        except Exception:
+            # Fallback to public URL
+            req = _ur.Request("https://livexgmodel-pt.fly.dev/api/upcoming?days=2")
+            with _ur.urlopen(req, timeout=8) as r:
+                data = json.loads(r.read())
+
+        # Get tomorrow's matches
+        tomorrow_day = next((d for d in data.get("days", []) if d.get("label", "").lower() == "tomorrow"), None)
+        if not tomorrow_day:
+            tomorrow_day = data["days"][1] if len(data.get("days", [])) > 1 else {"matches": [], "date": ""}
+
+        matches = tomorrow_day.get("matches", [])
+        date_str = tomorrow_day.get("date", "")
+
+        # Group by tournament
+        groups: dict = {}
+        for m in matches:
+            league = m.get("tournament") or m.get("country") or "Other"
+            groups.setdefault(league, []).append(m)
+
+        # Render groups
+        groups_html = []
+        for league, ms in sorted(groups.items()):
+            rows = []
+            for m in sorted(ms, key=lambda x: x.get("startTimestamp", 0)):
+                ts = m.get("startTimestamp", 0)
+                kickoff = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M") if ts else "—"
+                rows.append(f"""
+                  <div class="pr-row">
+                    <a href="{SITE_URL}/match/{m['id']}">{m['homeTeam']} <span class="pr-meta">vs</span> {m['awayTeam']}</a>
+                    <span class="pr-meta">{kickoff} UTC</span>
+                  </div>""")
+            groups_html.append(f"""
+            <div class="pr-card">
+              <h3 class="pr-h3" style="margin-top:0">{league}</h3>
+              {''.join(rows)}
+            </div>""")
+
+        # Format human date
+        try:
+            d_obj = datetime.strptime(date_str, "%Y-%m-%d") if date_str else datetime.now(timezone.utc) + timedelta(days=1)
+            date_human = d_obj.strftime("%A, %B %-d")
+        except Exception:
+            date_human = "Tomorrow"
+
+        body = f"""
+        <nav class="pr-nav">
+          <a href="{SITE_URL}/">WebPronos</a> › Tomorrow
+        </nav>
+        <h1 class="pr-h1">Tomorrow's Football Matches — {date_human}</h1>
+        <p class="pr-lead">Every match scheduled for tomorrow across the {len(groups)} competitions we cover. Click any fixture to open its dedicated live page — once kickoff happens, the AI model starts publishing in-play tips, value bets and updated odds.</p>
+
+        <div class="pr-grid">
+          {''.join(groups_html) if groups_html else '<p>No matches scheduled tomorrow.</p>'}
+        </div>
+
+        <h2 class="pr-h2">How tomorrow's preview works</h2>
+        <p>This is a preview of fixtures only — pre-match tips are deliberately not published. WebPronos only generates live tips, after kickoff, when the AI model can react to actual lineups, red cards, momentum swings and tactical decisions. Bookmark a fixture you care about and check back during the match.</p>
+
+        <h2 class="pr-h2">Why we don't bet pre-match</h2>
+        <p>Pre-match models guess. They don't know who is on the pitch, who got injured warming up, or which referee is calling cards generously today. Our model waits — when a match is live, every shot, every card and every substitution updates the win probabilities in real time. That's where the edge lives.</p>
+
+        {_render_pr_footer()}
+        """
+
+        # JSON-LD: SportsEvent list
+        events_jsonld = []
+        for m in matches[:25]:
+            ts = m.get("startTimestamp", 0)
+            iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else ""
+            events_jsonld.append({
+                "@type":     "SportsEvent",
+                "name":      f"{m['homeTeam']} vs {m['awayTeam']}",
+                "startDate": iso,
+                "sport":     "Soccer",
+                "url":       f"{SITE_URL}/match/{m['id']}",
+                "homeTeam":  {"@type": "SportsTeam", "name": m['homeTeam']},
+                "awayTeam":  {"@type": "SportsTeam", "name": m['awayTeam']},
+            })
+        jsonld = json.dumps({
+            "@context": "https://schema.org",
+            "@type":    "ItemList",
+            "name":     f"Tomorrow's football matches — {date_human}",
+            "numberOfItems": len(matches),
+            "itemListElement": [
+                {"@type": "ListItem", "position": i+1, "item": e}
+                for i, e in enumerate(events_jsonld)
+            ],
+        }, ensure_ascii=False)
+
+        return _build_html_page(
+            title       = f"Tomorrow's Football Matches — {date_human} | WebPronos",
+            description = f"Full preview of {len(matches)} football matches scheduled for {date_human}. Live AI tips will be published once kickoff happens.",
+            canonical   = f"{SITE_URL}/tomorrow",
+            body_html   = body,
+            jsonld      = jsonld,
+        )
+    except Exception as e:
+        log.exception(f"[prerender/tomorrow] Error: {e}")
+        return _build_html_page(
+            title="Tomorrow's Matches | WebPronos",
+            description="Preview of football matches scheduled for tomorrow.",
+            canonical=f"{SITE_URL}/tomorrow",
+            body_html=f'<h1>Tomorrow\'s matches</h1><p>Loading…</p>{_render_pr_footer()}',
+        )
+
+
+# ── Enhanced match prerender (with body content) ───────────────────────────
+def _render_match_body(event: dict, odds: dict | None, match_id: int) -> str:
+    """Build the visible body content for a match prerender."""
+    home   = event.get("homeTeam", "Home")
+    away   = event.get("awayTeam", "Away")
+    tourn  = event.get("tournament", "")
+    country = event.get("country", "")
+    status = event.get("statusType", "notstarted")
+    h_gls  = event.get("homeGoals", 0) or 0
+    a_gls  = event.get("awayGoals", 0) or 0
+    minute = event.get("minute", 0) or 0
+
+    # Status pill
+    if status == "inprogress":
+        status_pill = f'<span class="pr-stat">🔴 LIVE — {minute}\'</span>'
+        score_html = f'<div style="font-size:2rem;font-weight:800;margin:1rem 0;color:#fff">{home} {h_gls} — {a_gls} {away}</div>'
+    elif status == "finished":
+        status_pill = f'<span class="pr-stat">✓ Finished</span>'
+        score_html = f'<div style="font-size:2rem;font-weight:800;margin:1rem 0;color:#fff">{home} {h_gls} — {a_gls} {away}</div>'
+    else:
+        status_pill = f'<span class="pr-stat">⏰ Scheduled</span>'
+        score_html = f'<div style="font-size:2rem;font-weight:800;margin:1rem 0;color:#fff">{home} vs {away}</div>'
+
+    # Odds section (if available)
+    odds_html = ""
+    if odds:
+        h2h = odds.get("h2h") if isinstance(odds, dict) else None
+        if h2h and isinstance(h2h, dict):
+            home_odd = h2h.get("home_odd") or h2h.get("1") or "—"
+            draw_odd = h2h.get("draw_odd") or h2h.get("X") or "—"
+            away_odd = h2h.get("away_odd") or h2h.get("2") or "—"
+            odds_html = f"""
+            <h2 class="pr-h2">Live Odds Comparison</h2>
+            <div class="pr-card">
+              <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;text-align:center">
+                <div><div class="pr-meta">Home Win</div><div style="font-size:1.4rem;font-weight:700">{home_odd}</div></div>
+                <div><div class="pr-meta">Draw</div><div style="font-size:1.4rem;font-weight:700">{draw_odd}</div></div>
+                <div><div class="pr-meta">Away Win</div><div style="font-size:1.4rem;font-weight:700">{away_odd}</div></div>
+              </div>
+            </div>
+            """
+
+    body = f"""
+    <nav class="pr-nav">
+      <a href="{SITE_URL}/">WebPronos</a> ›
+      <a href="{SITE_URL}/history">Matches</a> › {home} vs {away}
+    </nav>
+
+    <p class="pr-meta">{country} · {tourn}</p>
+    <h1 class="pr-h1">{home} vs {away} — Live Football Predictions</h1>
+    {status_pill}
+    {score_html}
+
+    <p class="pr-lead">Real-time AI predictions for {home} vs {away}, recalculated every 15 seconds based on shots, expected goals (xG), possession, cards and momentum. Compare live odds across top bookmakers and spot value bets the moment they appear.</p>
+
+    {odds_html}
+
+    <h2 class="pr-h2">What you'll find on this page</h2>
+    <ul>
+      <li><strong>Live momentum bar</strong> — visual indicator of who is dominating the match right now.</li>
+      <li><strong>Prediction pill</strong> — the AI model's current best pick for the next goal / final result.</li>
+      <li><strong>Value tip badge</strong> — highlighted when bookmaker odds are higher than our fair price (positive EV).</li>
+      <li><strong>Full odds comparison</strong> — best live price across licensed operators.</li>
+      <li><strong>Shot-by-shot xG breakdown</strong> — every chance plotted with xG value.</li>
+    </ul>
+
+    <h2 class="pr-h2">About this match</h2>
+    <p>{home} take on {away} in the {tourn}. WebPronos publishes live in-play tips for this fixture — every prediction is generated after kickoff, when the model can react to the actual flow of the game. Open the live page during kickoff to see real-time win probabilities, value bets and the full xG shot map.</p>
+
+    {_render_pr_footer()}
+    """
+
+    return body
+
+
+# ── Homepage ──────────────────────────────────────────────────────────────
+def _render_homepage() -> str:
+    """SSR for / — the homepage already has good SSR via Lovable; we pass-through but
+    re-inject canonical meta to be safe."""
+    try:
+        # Just return the Lovable shell as-is — it already SSRs well
+        base_html = _get_base_html()
+        if base_html:
+            return base_html
+    except Exception:
+        pass
+    return _build_html_page(
+        title="WebPronos — Live Football Predictions Updated in Real Time",
+        description="AI-powered football tips across 25 competitions, updated every minute during play.",
+        canonical=f"{SITE_URL}/",
+        body_html=f"<h1>WebPronos</h1><p>Live football predictions powered by AI.</p>{_render_pr_footer()}",
+    )
+
+
+# ── Static-content pages (about, terms, etc.) ─────────────────────────────
+def _render_passthrough(canonical_path: str = "/") -> str:
+    """For static pages — serve Lovable shell unchanged (it has good content already)."""
+    base_html = _get_base_html()
+    if base_html:
+        return base_html
+    return _build_html_page(
+        title="WebPronos — Live Football Predictions",
+        description="AI-powered football tips across 25 competitions.",
+        canonical=f"{SITE_URL}{canonical_path}",
+        body_html=f"<h1>WebPronos</h1>{_render_pr_footer()}",
+    )
+
+
+# ── Unified dispatcher ────────────────────────────────────────────────────
+@app.route("/prerender")
+def prerender_dispatch():
+    """
+    Single bot-facing entry point. The Cloudflare Worker forwards every bot
+    request here with ?path=<original_path>. This dispatcher returns the
+    correct fully-rendered HTML for that path.
+    """
+    import re as _re
+    try:
+        path = (flask_request.args.get("path") or "/").strip()
+        # Normalize: strip query string from path, ensure leading slash
+        if "?" in path:
+            path = path.split("?")[0]
+        if not path.startswith("/"):
+            path = "/" + path
+        # Strip trailing slash (except root)
+        if len(path) > 1 and path.endswith("/"):
+            path = path.rstrip("/")
+
+        # Route patterns
+        if path == "/" or path == "":
+            html = _render_homepage()
+        elif path == "/blog":
+            html = _render_blog_listing()
+        elif _re.match(r'^/blog/[^/]+$', path):
+            slug = path[len("/blog/"):]
+            return prerender_blog(slug)
+        elif _re.match(r'^/match/\d+', path):
+            mid = int(_re.match(r'^/match/(\d+)', path).group(1))
+            return prerender_match(mid)
+        elif path == "/history":
+            html = _render_history()
+        elif path == "/tomorrow" or path == "/upcoming":
+            html = _render_tomorrow()
+        elif path in ("/about", "/terms", "/privacy", "/responsible-gambling"):
+            html = _render_passthrough(path)
+        else:
+            # Unknown path — pass through Lovable shell
+            html = _render_passthrough(path)
+
+        return html, 200, {
+            "Content-Type":  "text/html; charset=utf-8",
+            "Cache-Control": "public, max-age=300",   # 5min cache
+            "X-Prerender":   "webpronos-v1",
+        }
+    except Exception as e:
+        log.exception(f"[prerender] dispatcher error for path={flask_request.args.get('path')}: {e}")
+        return _render_passthrough("/"), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 # ════════════════════════════════════════════════════════════
