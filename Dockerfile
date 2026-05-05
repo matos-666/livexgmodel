@@ -21,4 +21,4 @@ ENV PORT=8080 \
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "gunicorn server:app --bind 0.0.0.0:${PORT} --workers 1 --threads 16 --worker-class gthread --timeout 600 --keep-alive 75 --graceful-timeout 30"]
+CMD ["sh", "-c", "gunicorn server:app --bind 0.0.0.0:${PORT} --worker-class gevent --workers 2 --worker-connections 1000 --timeout 120 --keep-alive 75 --graceful-timeout 30"]

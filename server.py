@@ -17,10 +17,13 @@ import sys
 import math
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 
 from flask import Flask, jsonify, request as flask_request, Response
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -55,6 +58,12 @@ _session = None
 # top-down: each key is used until its remaining requests drop below
 # ODDS_API_KEY_THRESHOLD, at which point the next key takes over.
 _DEFAULT_ODDS_KEYS = [
+    "bc2a057a6832adf77e7b725b7609ca19",  # fresh — added 2026-05-05
+    "1a8a5dbd0516293080b8075b3a991d2e",  # fresh — added 2026-05-04
+    "86131a98d36adbc7db54d8f5130494b5",  # fresh — added 2026-05-04
+    "ed8e51f030dc323c47dd19acf2bf6378",  # fresh — added 2026-05-03
+    "cf867bdd1cb4af120d1c5c27b12cccf0",  # fresh — added 2026-05-03
+    "fa67a9529adddf7c847cb15d4177c4c7",  # fresh — added 2026-05-03
     "ac746e9e33bbcc4436c7b1fd90d1f284",  # fresh — added 2026-05-03
     "9760251740fad32eb0517faabba5d074",  # fresh — added 2026-05-03
     "fc5ffe1ae61f015bd565fca2241a75c9",
@@ -203,13 +212,21 @@ def _tg_subscribers() -> list:
     except Exception:
         return []
 
-def _tg_subscribe(chat_id: int, username: str = None, first_name: str = None):
+def _tg_subscribe(chat_id: int, username: str = None, first_name: str = None, source: str = None):
     with _db() as conn:
+        # Add source column if it doesn't exist yet (migration)
+        try:
+            conn.execute("ALTER TABLE tg_subscribers ADD COLUMN source TEXT")
+        except Exception:
+            pass  # column already exists
         conn.execute("""
-            INSERT INTO tg_subscribers (chat_id, username, first_name, subscribed_at, active)
-            VALUES (?, ?, ?, ?, 1)
-            ON CONFLICT(chat_id) DO UPDATE SET active = 1, subscribed_at = excluded.subscribed_at
-        """, (chat_id, username, first_name, int(time.time())))
+            INSERT INTO tg_subscribers (chat_id, username, first_name, subscribed_at, active, source)
+            VALUES (?, ?, ?, ?, 1, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                active = 1,
+                subscribed_at = excluded.subscribed_at,
+                source = COALESCE(tg_subscribers.source, excluded.source)
+        """, (chat_id, username, first_name, int(time.time()), source))
 
 def _tg_unsubscribe(chat_id: int):
     with _db() as conn:
@@ -273,6 +290,19 @@ def _tg_admin_stats() -> str:
                 ORDER BY c DESC
                 LIMIT 10
             """).fetchall()
+            # Per-source subscriber conversion funnel
+            try:
+                source_funnel = conn.execute("""
+                    SELECT COALESCE(NULLIF(s.source, ''), '(none)') src,
+                           COUNT(*) total,
+                           SUM(CASE WHEN s.active = 1 THEN 1 ELSE 0 END) active
+                    FROM tg_subscribers s
+                    GROUP BY src
+                    ORDER BY total DESC
+                    LIMIT 10
+                """).fetchall()
+            except Exception:
+                source_funnel = []
             recent = conn.execute("""
                 SELECT chat_id, username, first_name, start_param, started_at
                 FROM tg_starts
@@ -280,35 +310,49 @@ def _tg_admin_stats() -> str:
                 LIMIT 5
             """).fetchall()
 
+        from datetime import datetime as _dt, timezone as _tz
+
         lines = [
             "📊 <b>Admin Stats</b>",
             "",
-            f"👥 <b>Users:</b> {unique_users} unique  ({active_subs} active subs · {inactive_subs} unsubscribed)",
+            f"👥 <b>Subscribers:</b> {active_subs} ativos · {inactive_subs} saíram",
+            f"🆔 <b>Utilizadores únicos:</b> {unique_users}",
             f"🚀 <b>/start events:</b> {total_starts} total",
             "",
-            f"📅 <b>Last 24h:</b>  {starts_24h} starts · {new_users_24h} new users",
-            f"📆 <b>Last 7d:</b>   {starts_7d} starts · {new_users_7d} new users",
+            f"📅 <b>Últimas 24h:</b>  {starts_24h} starts · {new_users_24h} novos utilizadores",
+            f"📆 <b>Últimos 7d:</b>   {starts_7d} starts · {new_users_7d} novos utilizadores",
             "",
-            "🔗 <b>Top sources (start params):</b>",
+            "🔗 <b>Funil por fonte (starts → subs ativos):</b>",
         ]
-        if top_params:
-            for r in top_params:
-                src = (r["src"] or "(none)")[:30]
-                lines.append(f"  • <code>{src}</code> — {r['c']} starts ({r['u']} users)")
+        # Merge starts and subs per source
+        starts_by_src = {r["src"]: {"starts": r["c"], "unique": r["u"]} for r in top_params}
+        subs_by_src   = {r["src"]: {"total": r["total"], "active": r["active"]} for r in source_funnel}
+        all_srcs = sorted(set(list(starts_by_src.keys()) + list(subs_by_src.keys())),
+                          key=lambda s: starts_by_src.get(s, {}).get("starts", 0), reverse=True)
+        if all_srcs:
+            for src in all_srcs:
+                s  = starts_by_src.get(src, {})
+                sb = subs_by_src.get(src, {})
+                n_starts = s.get("starts", 0)
+                n_unique = s.get("unique", 0)
+                n_active = sb.get("active", 0)
+                conv = f"{100*n_active/n_unique:.0f}%" if n_unique else "—"
+                lines.append(
+                    f"  • <code>{src[:25]}</code>  {n_starts} starts → {n_active} subs ativos ({conv})"
+                )
         else:
-            lines.append("  <i>(no /start events yet)</i>")
+            lines.append("  <i>(sem dados ainda)</i>")
 
         lines.append("")
-        lines.append("🆕 <b>Latest 5 /start events:</b>")
+        lines.append("🆕 <b>Últimos 5 /start:</b>")
         if recent:
             for r in recent:
-                from datetime import datetime as _dt, timezone as _tz
                 ts = _dt.fromtimestamp(r["started_at"], tz=_tz.utc).strftime("%m-%d %H:%M")
                 uname = f"@{r['username']}" if r["username"] else (r["first_name"] or f"id:{r['chat_id']}")
                 param = f" [{r['start_param']}]" if r["start_param"] else ""
                 lines.append(f"  • {ts} — {uname}{param}")
         else:
-            lines.append("  <i>(none)</i>")
+            lines.append("  <i>(nenhum)</i>")
 
         return "\n".join(lines)
     except Exception as e:
@@ -650,6 +694,94 @@ def _get_alltime_stats() -> dict:
             "winrate": 0.0, "pnl_eur": 0.0, "roi": 0.0, "avg_odds": 0.0,
             "best_streak": 0, "best_win_pnl": 0.0,
         }
+
+
+def _send_daily_summary():
+    """
+    Calculate daily P&L and send summary to all Telegram subscribers.
+    Only sends if daily profit > €25.
+    Includes: lucro €, odds médias, ROI, maior odd, and which bet had the highest odd.
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+
+        # Use Lisbon timezone to determine "today"
+        lisbon_tz = pytz.timezone('Europe/Lisbon')
+        now_lisbon = datetime.now(lisbon_tz)
+        today_start = datetime(now_lisbon.year, now_lisbon.month, now_lisbon.day, 0, 0, 0, tzinfo=lisbon_tz)
+        tomorrow_start = today_start + timedelta(days=1)
+
+        # Convert to UTC timestamps
+        today_start_ts = int(today_start.timestamp())
+        tomorrow_start_ts = int(tomorrow_start.timestamp())
+
+        STAKE = get_setting("stake_per_bet", 100.0)
+
+        with _db() as conn:
+            # Get all settled tips from today
+            tips = conn.execute(
+                "SELECT result, odd_entry, label, market FROM tips "
+                "WHERE wall_ts >= ? AND wall_ts < ? AND result IS NOT NULL "
+                "ORDER BY odd_entry DESC",
+                (today_start_ts, tomorrow_start_ts)
+            ).fetchall()
+
+        if not tips:
+            log.info("_send_daily_summary: no tips settled today")
+            return
+
+        # Calculate stats
+        lucro = 0.0
+        odds_sum = 0.0
+        wins = 0
+        losses = 0
+
+        for tip in tips:
+            result, odd_entry, label, market = tip["result"], tip["odd_entry"], tip["label"], tip["market"]
+            if result in ("win", "green") and odd_entry:
+                lucro += (odd_entry - 1) * STAKE
+                odds_sum += odd_entry
+                wins += 1
+            elif result in ("loss", "red"):
+                lucro -= STAKE
+                odds_sum += (odd_entry or 0)
+                losses += 1
+
+        settled = wins + losses
+
+        # Only send if lucro > €25
+        if lucro <= 25:
+            log.info(f"_send_daily_summary: lucro €{lucro:.2f} below threshold (€25)")
+            return
+
+        # Calculate average odds and ROI
+        avg_odds = odds_sum / settled if settled > 0 else 0.0
+        roi = (lucro / (settled * STAKE) * 100) if settled > 0 else 0.0
+
+        # Find the bet with the highest odd
+        max_odd_tip = max(tips, key=lambda t: t["odd_entry"] or 0)
+        maior_odd = max_odd_tip["odd_entry"]
+        bet_with_maior_odd = f"{max_odd_tip.get('label', '?')} ({max_odd_tip.get('market', '?')})" if max_odd_tip.get("label") else max_odd_tip.get("market", "?")
+
+        # Format the message (no emojis, clean stats)
+        date_str = now_lisbon.strftime("%d/%m/%Y")
+        msg_lines = [
+            f"<b>Resumo Diário — {date_str}</b>",
+            "",
+            f"💶 <b>Lucro:</b> €{lucro:.2f}",
+            f"📊 <b>Odds Médias:</b> {avg_odds:.2f}",
+            f"📈 <b>ROI:</b> {roi:.1f}%",
+            f"🎯 <b>Maior Odd:</b> {maior_odd:.2f}",
+            f"   {bet_with_maior_odd}",
+        ]
+
+        msg = "\n".join(msg_lines)
+
+        log.info(f"_send_daily_summary: sending message for {date_str}, lucro €{lucro:.2f}")
+        _send_telegram(msg)
+
+    except Exception as e:
+        log.error(f"_send_daily_summary error: {e}", exc_info=True)
 
 
 def _generate_chart(period: str = "alltime") -> bytes | None:
@@ -1529,7 +1661,7 @@ def telegram_webhook():
         parts = text.split(maxsplit=1)
         start_param = parts[1].strip() if len(parts) > 1 else None
         _tg_log_start(chat_id, username, first_name, start_param)
-        _tg_subscribe(chat_id, username=username, first_name=first_name)
+        _tg_subscribe(chat_id, username=username, first_name=first_name, source=start_param)
         # Send engaging banner first, then welcome text + menu
         banner = _build_welcome_banner()
         if banner:
@@ -2183,8 +2315,8 @@ def _extract_bookmaker_odds(bookmakers, market_key):
                             "outcomes": mkt["outcomes"],
                         }
 
-    # Fallback: any bookmaker
-    for bm in bookmakers:
+    # Fallback: any non-Pinnacle bookmaker
+    for bm in bookmakers_filtered:
         for mkt in bm.get("markets", []):
             if mkt["key"] == market_key:
                 last_update = mkt.get("last_update") or bm.get("last_update", "")
@@ -3482,16 +3614,18 @@ def _init_db():
     with _db() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS games (
-            id          INTEGER PRIMARY KEY,
-            home_team   TEXT NOT NULL,
-            away_team   TEXT NOT NULL,
-            home_goals  INTEGER DEFAULT 0,
-            away_goals  INTEGER DEFAULT 0,
-            tournament  TEXT,
-            country     TEXT,
-            is_finished INTEGER DEFAULT 0,
-            archived_at INTEGER,
-            start_ts    INTEGER
+            id            INTEGER PRIMARY KEY,
+            home_team     TEXT NOT NULL,
+            away_team     TEXT NOT NULL,
+            home_goals    INTEGER DEFAULT 0,
+            away_goals    INTEGER DEFAULT 0,
+            tournament    TEXT,
+            country       TEXT,
+            is_finished   INTEGER DEFAULT 0,
+            archived_at   INTEGER,
+            start_ts      INTEGER,
+            home_team_id  INTEGER,
+            away_team_id  INTEGER
         );
         CREATE TABLE IF NOT EXISTS tips (
             tip_key      TEXT NOT NULL,
@@ -3542,6 +3676,24 @@ def _init_db():
             active_frontend INTEGER DEFAULT 1,
             updated_at      INTEGER
         );
+        CREATE TABLE IF NOT EXISTS match_shots (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_id    INTEGER NOT NULL,
+            minute      INTEGER NOT NULL,
+            added_time  INTEGER DEFAULT 0,
+            is_home     INTEGER NOT NULL,
+            xg          REAL NOT NULL,
+            is_goal     INTEGER DEFAULT 0,
+            is_penalty  INTEGER DEFAULT 0,
+            player      TEXT,
+            shot_type   TEXT,
+            situation   TEXT,
+            body_part   TEXT,
+            recorded_at INTEGER NOT NULL,
+            UNIQUE(match_id, minute, added_time, is_home, player)
+        );
+        CREATE INDEX IF NOT EXISTS idx_match_shots_match ON match_shots(match_id);
+        CREATE INDEX IF NOT EXISTS idx_match_shots_minute ON match_shots(match_id, minute);
         """)
     # Migration: add edge_entry column to existing DBs
     with _db() as conn:
@@ -3549,6 +3701,12 @@ def _init_db():
         if "edge_entry" not in cols:
             conn.execute("ALTER TABLE tips ADD COLUMN edge_entry REAL")
             log.info("DB migration: added edge_entry column to tips")
+        if "xg_home_at_entry" not in cols:
+            conn.execute("ALTER TABLE tips ADD COLUMN xg_home_at_entry REAL")
+            log.info("DB migration: added xg_home_at_entry column to tips")
+        if "xg_away_at_entry" not in cols:
+            conn.execute("ALTER TABLE tips ADD COLUMN xg_away_at_entry REAL")
+            log.info("DB migration: added xg_away_at_entry column to tips")
 
     # Migration: change PRIMARY KEY from tip_key alone to (match_id, tip_key)
     # Bug: when 2 different games produced picks with same market+label
@@ -3585,6 +3743,49 @@ def _init_db():
             """)
             log.info("DB migration: tips table rebuilt with composite PK")
     log.info(f"DB ready: {DB_PATH}")
+
+
+def _persist_shots(match_id: int, shots: dict) -> None:
+    """
+    Persist shot events for a live match to match_shots table.
+    Called every background cycle — uses INSERT OR IGNORE so duplicates are safe.
+    Only stores shots with xg > 0 (filters noise like blocked shots with no xG value).
+    """
+    if not shots:
+        return
+    now_ts = int(time.time())
+    rows = []
+    for shot in shots.get("homeShots", []) + shots.get("awayShots", []):
+        if shot.get("xg", 0) <= 0:
+            continue
+        rows.append((
+            match_id,
+            shot.get("minute", 0),
+            shot.get("addedTime", 0),
+            1 if shot.get("isHome") else 0,
+            shot["xg"],
+            1 if shot.get("isGoal") else 0,
+            1 if shot.get("isPenalty") else 0,
+            (shot.get("player") or "")[:80],
+            (shot.get("shotType") or "")[:40],
+            (shot.get("situation") or "")[:40],
+            (shot.get("bodyPart") or "")[:40],
+            now_ts,
+        ))
+    if not rows:
+        return
+    try:
+        with _db() as conn:
+            conn.executemany("""
+                INSERT OR IGNORE INTO match_shots
+                    (match_id, minute, added_time, is_home, xg, is_goal, is_penalty,
+                     player, shot_type, situation, body_part, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+        log.debug(f"_persist_shots: match {match_id} — {len(rows)} shots upserted")
+    except Exception as e:
+        log.warning(f"_persist_shots failed for match {match_id}: {e}")
+
 
 # ════════════════════════════════════════════════════════════
 #  DYNAMIC SETTINGS — read from DB, cached, hot-reloadable
@@ -3661,20 +3862,30 @@ def _check_admin_auth() -> bool:
 def _upsert_game(match: dict):
     """Insert or update a game record."""
     with _db() as conn:
+        # Migrate: add team ID columns if missing
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(games)")}
+        if "home_team_id" not in cols:
+            conn.execute("ALTER TABLE games ADD COLUMN home_team_id INTEGER")
+        if "away_team_id" not in cols:
+            conn.execute("ALTER TABLE games ADD COLUMN away_team_id INTEGER")
         conn.execute("""
             INSERT INTO games (id, home_team, away_team, home_goals, away_goals,
-                               tournament, country, is_finished, start_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               tournament, country, is_finished, start_ts,
+                               home_team_id, away_team_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                home_goals  = excluded.home_goals,
-                away_goals  = excluded.away_goals,
-                is_finished = excluded.is_finished
+                home_goals   = excluded.home_goals,
+                away_goals   = excluded.away_goals,
+                is_finished  = excluded.is_finished,
+                home_team_id = COALESCE(excluded.home_team_id, games.home_team_id),
+                away_team_id = COALESCE(excluded.away_team_id, games.away_team_id)
         """, (
             match["id"], match["homeTeam"], match["awayTeam"],
             match["homeGoals"], match["awayGoals"],
             match.get("tournament"), match.get("country"),
             1 if match.get("isFinished") else 0,
             match.get("startTimestamp"),
+            match.get("homeTeamId"), match.get("awayTeamId"),
         ))
         if match.get("isFinished"):
             conn.execute(
@@ -3950,12 +4161,16 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                         continue
 
             try:
+                _xg_home = (shots or {}).get("homeXg") if shots else None
+                _xg_away = (shots or {}).get("awayXg") if shots else None
                 conn.execute("""
                     INSERT INTO tips (tip_key, match_id, market, label,
-                                      odd_entry, odd_now, edge_entry, minute_entry, wall_ts)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      odd_entry, odd_now, edge_entry, minute_entry, wall_ts,
+                                      xg_home_at_entry, xg_away_at_entry)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (key, match_id, p["market"], p["label"],
-                      p["odds"], p["odds"], p.get("edge"), minute, now_ts))
+                      p["odds"], p["odds"], p.get("edge"), minute, now_ts,
+                      _xg_home, _xg_away))
                 existing_keys.add(key)
                 total_tips += 1
                 _accept(p)
@@ -4234,6 +4449,9 @@ def _run_background_cycle():
             shots     = get_shotmap(mid)
             incidents = get_incidents(mid)
             odds      = get_full_odds_analysis(m, shots)
+
+            # Persist shot timeline for xG replay animation
+            _persist_shots(mid, shots)
 
             # Upsert game in DB
             _upsert_game(m)
@@ -4528,6 +4746,19 @@ _MONITORED_LEAGUE_STRICT_KEYWORDS = {
 
 _YOUTH_KEYWORDS = {"u23","u21","u20","u19","u18","u17","u15","youth","reserve","b team"}
 
+# Countries whose competitions are never monitored (block by country field)
+_BLOCKED_COUNTRIES = {
+    "china", "chinese",
+    "india",
+    "south korea", "korea",
+    "indonesia",
+    "vietnam",
+    "thailand",
+    "malaysia",
+    "iran",
+    "uzbekistan",
+}
+
 # Tournament fragments that always mean NOT a monitored competition
 _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "série d", "serie d", "série c", "serie c",   # Brazil lower divisions
@@ -4561,6 +4792,10 @@ def _is_monitored_league_strict(tournament, country):
     raw = tournament.lower()
     t = _normalize_tournament(tournament).lower()
     c = (country or "").lower()
+    # Exclude blocked countries — any competition from these countries is rejected
+    for bc in _BLOCKED_COUNTRIES:
+        if _re.search(r'\b' + _re.escape(bc) + r'\b', c):
+            return False
     # Exclude youth/reserve competitions
     for yk in _YOUTH_KEYWORDS:
         if yk in raw:
@@ -4637,6 +4872,94 @@ def r_today_monitored():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/upcoming")
+def r_upcoming():
+    """
+    Returns scheduled (not live, not finished) matches for the next N days
+    (default 3: today + tomorrow + day after), grouped by date.
+    Each day's matches are filtered to monitored leagues only.
+
+    Response:
+    {
+      "days": [
+        { "date": "2026-05-04", "label": "Today",     "matches": [...] },
+        { "date": "2026-05-05", "label": "Tomorrow",  "matches": [...] },
+        { "date": "2026-05-06", "label": "Wednesday", "matches": [...] }
+      ],
+      "total": 42
+    }
+    """
+    try:
+        days_ahead = flask_request.args.get("days", 3, type=int)
+        days_ahead = max(1, min(days_ahead, 7))  # clamp 1-7
+
+        now_utc = datetime.now(timezone.utc)
+        result_days = []
+        total = 0
+
+        day_labels = ["Today", "Tomorrow"]
+
+        for offset in range(days_ahead):
+            target_dt  = now_utc + timedelta(days=offset)
+            date_str   = target_dt.strftime("%Y-%m-%d")
+            day_start  = int(target_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            day_end    = day_start + 86400
+
+            if offset < len(day_labels):
+                label = day_labels[offset]
+            else:
+                label = target_dt.strftime("%A")  # e.g. "Wednesday"
+
+            try:
+                data = _get(f"{SOFASCORE_API}/sport/football/scheduled-events/{date_str}")
+                all_events = data.get("events", []) if data else []
+            except Exception as fetch_err:
+                log.warning(f"r_upcoming: fetch failed for {date_str}: {fetch_err}")
+                all_events = []
+
+            day_matches = []
+            for m in all_events:
+                if m.get("isFinished") or m.get("isLive"):
+                    continue
+                ts = m.get("startTimestamp", 0)
+                if ts and not (day_start <= ts < day_end):
+                    continue
+
+                tourn = m.get("tournament", {})
+                tourn_name   = tourn.get("name", "") if isinstance(tourn, dict) else str(tourn or "")
+                country      = m.get("country", {})
+                country_name = country.get("name", "") if isinstance(country, dict) else str(country or "")
+
+                if not _is_monitored_league_strict(tourn_name, country_name):
+                    continue
+
+                sk = _resolve_sport_key(tourn_name, country_name)
+                m["_sport_key"] = sk
+                if isinstance(m.get("homeTeam"), dict):
+                    m["homeTeam"] = m["homeTeam"].get("name", "")
+                if isinstance(m.get("awayTeam"), dict):
+                    m["awayTeam"] = m["awayTeam"].get("name", "")
+
+                day_matches.append({
+                    "id":             m["id"],
+                    "homeTeam":       m.get("homeTeam", ""),
+                    "awayTeam":       m.get("awayTeam", ""),
+                    "tournament":     tourn_name,
+                    "country":        country_name,
+                    "startTimestamp": ts,
+                    "_sport_key":     sk,
+                })
+
+            day_matches.sort(key=lambda x: x.get("startTimestamp", 0))
+            result_days.append({"date": date_str, "label": label, "matches": day_matches})
+            total += len(day_matches)
+
+        return jsonify({"days": result_days, "total": total})
+    except Exception as e:
+        log.error(f"r_upcoming error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/state")
 def r_state():
     """
@@ -4653,6 +4976,253 @@ def r_state():
         "quotaRemaining": _api_requests_remaining,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+
+
+@app.route("/api/match/<int:mid>/timeline")
+def r_match_timeline(mid: int):
+    """
+    Returns full xG timeline data for a match — used for the animated replay UI.
+    Response:
+      {
+        "match": { id, home_team, away_team, home_goals, away_goals, tournament, start_ts },
+        "shots": [ { minute, added_time, is_home, xg, is_goal, is_penalty, player, shot_type } ],
+        "tips":  [ { minute_entry, market, label, odd_entry, result,
+                     xg_home_at_entry, xg_away_at_entry, wall_ts } ]
+      }
+    """
+    try:
+        with _db() as conn:
+            game = conn.execute(
+                "SELECT * FROM games WHERE id = ?", (mid,)
+            ).fetchone()
+            if not game:
+                return jsonify({"error": "match not found"}), 404
+
+            shots = conn.execute("""
+                SELECT minute, added_time, is_home, xg, is_goal, is_penalty,
+                       player, shot_type, situation, body_part
+                FROM match_shots
+                WHERE match_id = ?
+                ORDER BY minute, added_time, is_home
+            """, (mid,)).fetchall()
+
+            tips = conn.execute("""
+                SELECT minute_entry, market, label, odd_entry, result,
+                       xg_home_at_entry, xg_away_at_entry, wall_ts, edge_entry
+                FROM tips
+                WHERE match_id = ?
+                ORDER BY wall_ts
+            """, (mid,)).fetchall()
+
+        return jsonify({
+            "match": dict(game),
+            "shots": [dict(s) for s in shots],
+            "tips":  [dict(t) for t in tips],
+        })
+    except Exception as e:
+        log.exception(f"r_match_timeline failed for {mid}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/match/<int:mid>/timeline/export.png")
+def r_match_timeline_export(mid: int):
+    """
+    Generates a branded 1200×630 PNG of the xG timeline — ready for social sharing.
+    Uses matplotlib with Agg backend (no display needed).
+
+    Query params:
+      ?theme=dark|light   (default: dark)
+    """
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import matplotlib.patheffects as pe
+    import numpy as np
+
+    theme = flask_request.args.get("theme", "dark")
+    is_dark = theme != "light"
+
+    # ── Palette ─────────────────────────────────────────────────────────────
+    BG      = "#0f172a" if is_dark else "#f8fafc"
+    PANEL   = "#1e293b" if is_dark else "#ffffff"
+    TEXT    = "#f1f5f9" if is_dark else "#0f172a"
+    SUBTEXT = "#94a3b8" if is_dark else "#64748b"
+    GRID    = "#334155" if is_dark else "#e2e8f0"
+    HOME_C  = "#22c55e"   # green
+    AWAY_C  = "#f97316"   # orange
+    WIN_C   = "#22c55e"
+    LOSS_C  = "#ef4444"
+    VOID_C  = "#94a3b8"
+
+    try:
+        with _db() as conn:
+            game = conn.execute("SELECT * FROM games WHERE id = ?", (mid,)).fetchone()
+            if not game:
+                return Response("Match not found", status=404, mimetype="text/plain")
+            shots = conn.execute("""
+                SELECT minute, added_time, is_home, xg, is_goal
+                FROM match_shots WHERE match_id = ?
+                ORDER BY minute, added_time
+            """, (mid,)).fetchall()
+            tips = conn.execute("""
+                SELECT minute_entry, market, label, odd_entry, result
+                FROM tips WHERE match_id = ?
+                ORDER BY wall_ts
+            """, (mid,)).fetchall()
+        game = dict(game)
+        shots = [dict(s) for s in shots]
+        tips  = [dict(t) for t in tips]
+    except Exception as e:
+        log.exception(f"export png failed for {mid}")
+        return Response(f"Error: {e}", status=500, mimetype="text/plain")
+
+    home_team = game.get("home_team", "Home")
+    away_team = game.get("away_team", "Away")
+    home_g    = game.get("home_goals", 0) or 0
+    away_g    = game.get("away_goals", 0) or 0
+    tourn     = game.get("tournament", "")
+
+    # ── Build cumulative xG series ────────────────────────────────────────
+    max_min = max((s["minute"] for s in shots), default=90)
+    max_min = max(max_min, 90)
+
+    home_pts = [(0, 0.0)]
+    away_pts = [(0, 0.0)]
+    h_cum = 0.0
+    a_cum = 0.0
+    goal_minutes = []
+
+    for s in shots:
+        m = s["minute"] + (s.get("added_time") or 0) * 0.1
+        if s["is_home"]:
+            h_cum += s["xg"]
+            home_pts.append((m, round(h_cum, 4)))
+        else:
+            a_cum += s["xg"]
+            away_pts.append((m, round(a_cum, 4)))
+        if s.get("is_goal"):
+            goal_minutes.append(m)
+
+    home_xs, home_ys = zip(*home_pts) if home_pts else ([0], [0])
+    away_xs, away_ys = zip(*away_pts) if away_pts else ([0], [0])
+
+    # ── Figure ────────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(12, 6.3), facecolor=BG)
+    ax  = fig.add_axes([0.07, 0.17, 0.88, 0.68], facecolor=PANEL)
+
+    # Grid
+    ax.set_axisbelow(True)
+    ax.yaxis.grid(True, color=GRID, linewidth=0.6, linestyle="--", alpha=0.6)
+    ax.xaxis.grid(False)
+    for spine in ax.spines.values():
+        spine.set_color(GRID)
+        spine.set_linewidth(0.5)
+
+    # xG lines (step-after)
+    ax.step(home_xs, home_ys, where="post", color=HOME_C, linewidth=2.5,
+            label=home_team, solid_capstyle="round", zorder=3)
+    ax.step(away_xs, away_ys, where="post", color=AWAY_C, linewidth=2.5,
+            label=away_team, solid_capstyle="round", zorder=3)
+
+    # Filled area under lines
+    ax.fill_between(home_xs, home_ys, step="post", alpha=0.08, color=HOME_C)
+    ax.fill_between(away_xs, away_ys, step="post", alpha=0.08, color=AWAY_C)
+
+    # Goal markers — triangle on the x-axis
+    for gm in goal_minutes:
+        ax.axvline(gm, color=SUBTEXT, linewidth=0.8, linestyle=":", alpha=0.5, zorder=1)
+        ax.scatter([gm], [0], marker="^", s=40, color=SUBTEXT,
+                   zorder=4, clip_on=False)
+
+    # Half-time line
+    ax.axvline(45, color=SUBTEXT, linewidth=0.7, linestyle="--", alpha=0.35, zorder=1)
+
+    # ── Pick annotations ─────────────────────────────────────────────────
+    y_max = max(max(home_ys), max(away_ys), 0.5)
+    y_max_pad = y_max * 1.15
+
+    tip_label_y_offsets = []  # track y positions to avoid overlap
+    for tip in tips:
+        m   = tip.get("minute_entry") or 0
+        res = (tip.get("result") or "").lower()
+        col = WIN_C if res in ("green", "win") else (LOSS_C if res in ("red", "loss") else VOID_C)
+
+        ax.axvline(m, color=col, linewidth=1.4, linestyle="--", alpha=0.85, zorder=2)
+
+        # Badge box
+        label_short = tip.get("label", "")[:14]
+        mkt   = tip.get("market", "")
+        badge = f"{mkt[:5]}  {label_short}  @{tip.get('odd_entry', '')}"
+
+        # Stagger y position for overlapping tips at same minute
+        y_pos = y_max_pad * 0.92
+        for (prev_m, prev_y) in tip_label_y_offsets:
+            if abs(prev_m - m) < 6:
+                y_pos = prev_y - y_max_pad * 0.18
+        tip_label_y_offsets.append((m, y_pos))
+
+        ax.text(
+            m, y_pos, badge,
+            ha="center", va="center",
+            fontsize=6.5, color="white" if is_dark else "#0f172a",
+            fontweight="bold",
+            bbox=dict(
+                boxstyle="round,pad=0.35",
+                facecolor=col,
+                edgecolor="none",
+                alpha=0.88,
+            ),
+            zorder=5,
+        )
+
+    # ── Axes formatting ───────────────────────────────────────────────────
+    ax.set_xlim(0, max_min + 2)
+    ax.set_ylim(0, y_max_pad)
+    ax.tick_params(colors=SUBTEXT, labelsize=8)
+    ax.set_xlabel("Minute", color=SUBTEXT, fontsize=9, labelpad=4)
+    ax.set_ylabel("xG", color=SUBTEXT, fontsize=9, labelpad=4)
+    for tl in ax.get_xticklabels() + ax.get_yticklabels():
+        tl.set_color(SUBTEXT)
+
+    # ── Title ─────────────────────────────────────────────────────────────
+    title_line1 = f"{home_team}  {home_g} – {away_g}  {away_team}"
+    fig.text(0.5, 0.94, title_line1, ha="center", va="top",
+             fontsize=14, fontweight="bold", color=TEXT)
+    if tourn:
+        fig.text(0.5, 0.895, tourn, ha="center", va="top",
+                 fontsize=9, color=SUBTEXT)
+
+    # ── Legend ────────────────────────────────────────────────────────────
+    h_patch = mpatches.Patch(color=HOME_C, label=f"{home_team}  (xG {round(h_cum,2)})")
+    a_patch = mpatches.Patch(color=AWAY_C, label=f"{away_team}  (xG {round(a_cum,2)})")
+    ax.legend(handles=[h_patch, a_patch], loc="upper left",
+              facecolor=PANEL, edgecolor=GRID,
+              labelcolor=TEXT, fontsize=8.5, framealpha=0.9)
+
+    # ── Branding ─────────────────────────────────────────────────────────
+    fig.text(0.96, 0.035, "webpronos.com", ha="right", va="bottom",
+             fontsize=8, color=SUBTEXT, fontstyle="italic")
+    fig.text(0.04, 0.035, "xG Timeline Replay", ha="left", va="bottom",
+             fontsize=8, color=SUBTEXT)
+
+    # ── Render to bytes ───────────────────────────────────────────────────
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+                facecolor=BG, edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+
+    fname = f"webpronos-{_slug(home_team)}-vs-{_slug(away_team)}.png"
+    return Response(
+        buf.read(),
+        mimetype="image/png",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Cache-Control": "public, max-age=86400",
+        },
+    )
 
 
 @app.route("/api/state/tips")
@@ -4692,6 +5262,71 @@ def r_state_tips():
             gd["tips"] = [dict(t) for t in tips_rows]
             result.append(gd)
     return jsonify({"games": result, "count": len(result)})
+
+
+@app.route("/api/admin/backfill-team-ids", methods=["POST"])
+def r_backfill_team_ids():
+    """
+    Server-side backfill: fetch team IDs from Sofascore for all games missing them.
+    Uses the server's curl_cffi session (bypasses Cloudflare).
+    Run once via: POST /api/admin/backfill-team-ids
+    """
+    import threading
+
+    def _do_backfill():
+        with _db() as conn:
+            rows = conn.execute("""
+                SELECT id FROM games
+                WHERE home_team_id IS NULL OR away_team_id IS NULL
+                ORDER BY start_ts DESC
+            """).fetchall()
+
+        log.info(f"[backfill] {len(rows)} games need team IDs")
+        updated = 0
+        for r in rows:
+            mid = r["id"]
+            try:
+                data = _get(f"{SOFASCORE_API}/event/{mid}")
+                if not data:
+                    continue
+                event = data.get("event", {})
+                ht_id = event.get("homeTeam", {}).get("id")
+                at_id = event.get("awayTeam", {}).get("id")
+                if ht_id or at_id:
+                    with _db() as conn:
+                        conn.execute("""
+                            UPDATE games
+                            SET home_team_id = COALESCE(?, home_team_id),
+                                away_team_id = COALESCE(?, away_team_id)
+                            WHERE id = ?
+                        """, (ht_id, at_id, mid))
+                    updated += 1
+                    log.info(f"[backfill] {mid}: ht={ht_id} at={at_id}")
+                time.sleep(0.3)
+            except Exception as e:
+                log.warning(f"[backfill] {mid} failed: {e}")
+
+        log.info(f"[backfill] done — {updated}/{len(rows)} games updated")
+
+    threading.Thread(target=_do_backfill, daemon=True).start()
+    return jsonify({"status": "backfill started in background — check logs"})
+
+
+@app.route("/api/teams")
+def r_teams():
+    """
+    Returns every unique team in the DB with its Sofascore team ID.
+    Used to build the logo map: logo URL = https://api.sofascore.app/api/v1/team/{id}/image
+    """
+    with _db() as conn:
+        rows = conn.execute("""
+            SELECT home_team as name, home_team_id as id FROM games WHERE home_team_id IS NOT NULL
+            UNION
+            SELECT away_team as name, away_team_id as id FROM games WHERE away_team_id IS NOT NULL
+            ORDER BY name
+        """).fetchall()
+    teams = {r["name"]: r["id"] for r in rows}
+    return jsonify({"teams": teams, "count": len(teams)})
 
 
 @app.route("/api/state/tips/<int:match_id>", methods=["PATCH"])
@@ -4965,9 +5600,37 @@ def r_sitemap():
             "0.7",
         ))
 
-    # ── 3. Build XML ───────────────────────────────────────────────────────────
+    # ── 3. Fetch blog posts from Supabase ──────────────────────────────────────
+    blog_urls: list[tuple] = []
+    try:
+        import urllib.request as _ur
+        supa_url = (
+            f"{SUPABASE_URL}/rest/v1/blog_posts"
+            f"?select=slug,published_at&order=published_at.desc&limit=100"
+        )
+        req = _ur.Request(supa_url, headers={
+            "apikey":        SUPABASE_ANON,
+            "Authorization": f"Bearer {SUPABASE_ANON}",
+        })
+        with _ur.urlopen(req, timeout=4) as r:
+            posts = json.loads(r.read())
+        for post in posts:
+            slug = post.get("slug", "")
+            pub  = (post.get("published_at") or now.isoformat())[:10]
+            if slug:
+                blog_urls.append((
+                    f"{SITE_URL}/blog/{slug}",
+                    pub,
+                    "monthly",
+                    "0.7",
+                ))
+    except Exception as _be:
+        log.debug(f"[sitemap] Supabase blog fetch failed: {_be}")
+
+    # ── 4. Build XML ───────────────────────────────────────────────────────────
     static_pages = [
-        (SITE_URL + "/",           now.strftime("%Y-%m-%d"), "daily",  "1.0"),
+        (SITE_URL + "/",      now.strftime("%Y-%m-%d"), "daily",   "1.0"),
+        (SITE_URL + "/blog",  now.strftime("%Y-%m-%d"), "weekly",  "0.8"),
     ]
 
     def url_block(loc, lastmod, changefreq, priority):
@@ -4980,7 +5643,7 @@ def r_sitemap():
             f"  </url>"
         )
 
-    all_urls = static_pages + match_urls
+    all_urls = static_pages + blog_urls + match_urls
     url_blocks = "\n".join(url_block(*u) for u in all_urls)
 
     xml = (
@@ -5535,6 +6198,24 @@ def prerender_match(match_id: int):
         return "Internal error", 500
 
 
+# ════════════════════════════════════════════════════════════
+#  SCHEDULED TASKS — Daily summary at 23:00 Lisbon time
+# ════════════════════════════════════════════════════════════
+
+def _init_scheduler():
+    """Initialize APScheduler for daily summary messages."""
+    scheduler = BackgroundScheduler()
+    # Run every day at 23:00 Lisbon time (Europe/Lisbon)
+    trigger = CronTrigger(hour=23, minute=0, timezone='Europe/Lisbon')
+    scheduler.add_job(_send_daily_summary, trigger=trigger, id='daily_summary', replace_existing=True)
+    scheduler.start()
+    log.info("Scheduler started: daily summary at 23:00 Lisbon time")
+    return scheduler
+
+
+_scheduler = None
+
+
 if __name__ == "__main__":
     _load_aliases()
 
@@ -5547,15 +6228,18 @@ if __name__ == "__main__":
         print("=" * 60)
         _init_client()
         _init_db()
+        _scheduler = _init_scheduler()
         threading.Thread(target=_background_loop, daemon=True).start()
         print(f"  Client: {_client_type}")
         print(f"  Odds API: enabled")
         print(f"  Background engine: every {BG_INTERVAL}s")
-        print(f"  Team aliases: {len(_team_aliases)} loaded\n")
+        print(f"  Team aliases: {len(_team_aliases)} loaded")
+        print(f"  Scheduler: daily summary at 23:00 Lisbon time\n")
         app.run(host="0.0.0.0", port=5050, debug=True)
 else:
     # Running under gunicorn — __main__ block is skipped, so initialize here
     _load_aliases()
     _init_db()
+    _scheduler = _init_scheduler()
     threading.Thread(target=_init_client, daemon=True).start()
     threading.Thread(target=_background_loop, daemon=True).start()
