@@ -6064,14 +6064,16 @@ def r_admin_debug_daily_summary():
                 (target_start_ts, target_end_ts)
             ).fetchall()
 
-            subs = conn.execute("SELECT COUNT(*) c FROM tg_subscribers WHERE active = 1").fetchone()["c"]
+            subs_active = conn.execute("SELECT COUNT(*) c FROM tg_subscribers WHERE active = 1").fetchone()["c"]
+            subs_list = conn.execute("SELECT chat_id, username, first_name, active FROM tg_subscribers ORDER BY subscribed_at DESC LIMIT 10").fetchall()
 
         if not tips:
             return jsonify({
                 "ok": False,
                 "reason": "No settled tips this day",
                 "tips_count": 0,
-                "subscribers_active": subs,
+                "subscribers_active": subs_active,
+                "subscribers": [{"chat_id": s["chat_id"], "user": s["username"] or s["first_name"], "active": s["active"]} for s in subs_list],
                 "day": target_start.strftime("%d/%m/%Y")
             })
 
@@ -6108,7 +6110,8 @@ def r_admin_debug_daily_summary():
             "roi_percent": round(roi, 1),
             "will_send": lucro > 25,
             "threshold_eur": 25,
-            "subscribers_active": subs
+            "subscribers_active": subs_active,
+            "subscribers": [{"chat_id": s["chat_id"], "user": s["username"] or s["first_name"], "active": s["active"]} for s in subs_list]
         })
     except Exception as e:
         log.error(f"r_admin_debug_daily_summary error: {e}", exc_info=True)
@@ -6267,6 +6270,291 @@ def _inject_meta(html: str, meta: dict, canonical: str) -> str:
     )
 
     return html
+
+
+def _md_to_html(md: str) -> str:
+    """
+    Minimal Markdown → HTML converter for blog prerender.
+    Handles headings, bold/italic, lists, links, paragraphs.
+    No extra dependencies needed.
+    """
+    import re
+    lines = md.replace('\r\n', '\n').split('\n')
+    html_lines = []
+    in_ul = False
+    in_ol = False
+
+    def inline(text):
+        # Bold + italic
+        text = re.sub(r'\*\*\*(.+?)\*\*\*', r'<strong><em>\1</em></strong>', text)
+        text = re.sub(r'\*\*(.+?)\*\*',     r'<strong>\1</strong>', text)
+        text = re.sub(r'\*(.+?)\*',         r'<em>\1</em>', text)
+        text = re.sub(r'`(.+?)`',           r'<code>\1</code>', text)
+        # Links [text](url)
+        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+        return text
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Close open lists if line doesn't match
+        if in_ul and not re.match(r'^[\*\-] ', line):
+            html_lines.append('</ul>')
+            in_ul = False
+        if in_ol and not re.match(r'^\d+\. ', line):
+            html_lines.append('</ol>')
+            in_ol = False
+
+        # ATX headings
+        m = re.match(r'^(#{1,6})\s+(.+)', line)
+        if m:
+            level = len(m.group(1))
+            html_lines.append(f'<h{level}>{inline(m.group(2))}</h{level}>')
+            i += 1
+            continue
+
+        # Horizontal rule
+        if re.match(r'^[-*_]{3,}$', line.strip()):
+            html_lines.append('<hr>')
+            i += 1
+            continue
+
+        # Unordered list item
+        m = re.match(r'^[\*\-] (.+)', line)
+        if m:
+            if not in_ul:
+                html_lines.append('<ul>')
+                in_ul = True
+            html_lines.append(f'  <li>{inline(m.group(1))}</li>')
+            i += 1
+            continue
+
+        # Ordered list item
+        m = re.match(r'^\d+\. (.+)', line)
+        if m:
+            if not in_ol:
+                html_lines.append('<ol>')
+                in_ol = True
+            html_lines.append(f'  <li>{inline(m.group(1))}</li>')
+            i += 1
+            continue
+
+        # Blockquote
+        m = re.match(r'^> (.+)', line)
+        if m:
+            html_lines.append(f'<blockquote><p>{inline(m.group(1))}</p></blockquote>')
+            i += 1
+            continue
+
+        # Blank line → paragraph break
+        if line.strip() == '':
+            html_lines.append('')
+            i += 1
+            continue
+
+        # Regular paragraph line
+        html_lines.append(f'<p>{inline(line)}</p>')
+        i += 1
+
+    # Close any open list
+    if in_ul:
+        html_lines.append('</ul>')
+    if in_ol:
+        html_lines.append('</ol>')
+
+    return '\n'.join(html_lines)
+
+
+def _supabase_get_blog_post(slug: str) -> dict | None:
+    """Fetch a single blog post from Supabase by slug."""
+    if not SUPABASE_ANON:
+        return None
+    try:
+        import urllib.request as _ur, urllib.parse as _up
+        url = (
+            f"{SUPABASE_URL}/rest/v1/blog_posts"
+            f"?slug=eq.{_up.quote(slug)}"
+            f"&select=*"
+            f"&limit=1"
+        )
+        req = _ur.Request(url, headers={
+            "apikey":        SUPABASE_ANON,
+            "Authorization": f"Bearer {SUPABASE_ANON}",
+        })
+        with _ur.urlopen(req, timeout=5) as r:
+            rows = json.loads(r.read())
+            return rows[0] if rows else None
+    except Exception as e:
+        log.warning(f"[prerender/blog] Supabase fetch failed for slug={slug}: {e}")
+        return None
+
+
+def _inject_blog_content(html: str, meta: dict, canonical: str, article_html: str,
+                          published_at: str, author: str, jsonld: str) -> str:
+    """
+    Inject blog meta tags AND full article body into the SPA shell.
+    Replaces the <div id="root">...</div> with the rendered article.
+    """
+    import re
+
+    # ── 1. Inject head meta (reuse existing helper logic) ──
+    title_tag    = f'<title>{meta["title"]}</title>'
+    desc_content = meta["description"].replace('"', '&quot;')
+    og_image     = meta.get("og_image", f"{SITE_URL}/og/default.png")
+
+    html = re.sub(r'<title>[^<]*</title>', title_tag, html)
+    html = re.sub(r'<meta\s+name=["\']description["\'][^>]*/?>', '', html)
+    html = re.sub(r'<meta\s+(?:property|name)=["\'](?:og:|twitter:)[^"\']*["\'][^>]*/?>', '', html)
+    html = re.sub(r'<link\s+rel=["\']canonical["\'][^>]*/?>',  '', html)
+    html = re.sub(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>.*?</script>', '', html, flags=re.DOTALL)
+
+    new_head = (
+        f'<meta name="description" content="{desc_content}">\n'
+        f'    <meta property="og:title" content="{meta["title"]}">\n'
+        f'    <meta property="og:description" content="{desc_content}">\n'
+        f'    <meta property="og:image" content="{og_image}">\n'
+        f'    <meta property="og:url" content="{canonical}">\n'
+        f'    <meta property="og:type" content="article">\n'
+        f'    <meta name="twitter:card" content="summary_large_image">\n'
+        f'    <meta name="twitter:title" content="{meta["title"]}">\n'
+        f'    <meta name="twitter:description" content="{desc_content}">\n'
+        f'    <meta name="twitter:image" content="{og_image}">\n'
+        f'    <link rel="canonical" href="{canonical}">\n'
+        f'    <script type="application/ld+json">{jsonld}</script>'
+    )
+    html = re.sub(
+        r'(<title>[^<]*</title>)',
+        r'\1\n    ' + new_head,
+        html, count=1
+    )
+
+    # ── 2. Replace <div id="root">...</div> with full article body ──
+    # Keeps the SPA JS loading in background for hydration, but bots read the article
+    pub_formatted = published_at[:10] if published_at else ""
+    article_body = f"""<div id="root">
+<article itemscope itemtype="https://schema.org/BlogPosting"
+         style="max-width:800px;margin:0 auto;padding:2rem 1rem;font-family:system-ui,sans-serif;line-height:1.7;color:#e8f0f7">
+  <header style="margin-bottom:2rem;padding-bottom:1.5rem;border-bottom:1px solid #2a2f4a">
+    <nav style="margin-bottom:1rem;font-size:.85rem">
+      <a href="{SITE_URL}" style="color:#10b981;text-decoration:none">WebPronos</a>
+      &nbsp;›&nbsp;
+      <a href="{SITE_URL}/blog" style="color:#10b981;text-decoration:none">Blog</a>
+    </nav>
+    <h1 itemprop="headline" style="font-size:2rem;font-weight:800;line-height:1.2;color:#fff;margin:0 0 1rem">{meta["title"]}</h1>
+    <p itemprop="description" style="font-size:1.05rem;color:#9ca3af;margin:0 0 1rem">{meta["description"]}</p>
+    <div style="font-size:.85rem;color:#6b7280">
+      <span itemprop="author" itemscope itemtype="https://schema.org/Person">
+        <span itemprop="name">{author}</span>
+      </span>
+      &nbsp;·&nbsp;
+      <time itemprop="datePublished" datetime="{pub_formatted}">{pub_formatted}</time>
+    </div>
+  </header>
+  <div itemprop="articleBody" style="font-size:1rem;color:#cbd5e1">
+    {article_html}
+  </div>
+  <footer style="margin-top:3rem;padding-top:1.5rem;border-top:1px solid #2a2f4a;font-size:.85rem;color:#6b7280">
+    <a href="{SITE_URL}/blog" style="color:#10b981;text-decoration:none">← Voltar ao Blog</a>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="{SITE_URL}" style="color:#10b981;text-decoration:none">WebPronos — Live Football Predictions</a>
+  </footer>
+</article>
+</div>"""
+
+    # Replace the entire #root div
+    html = re.sub(r'<div id="root">.*?</div>', article_body, html, count=1, flags=re.DOTALL)
+
+    return html
+
+
+@app.route("/prerender/blog/<slug>")
+def prerender_blog(slug: str):
+    """
+    SEO prerender for blog posts.
+    Called by the Cloudflare Worker when a bot requests /blog/<slug>.
+    Returns the full article HTML — title, meta, JSON-LD BlogPosting + body text.
+    Google can read every word of the article without executing JS.
+    """
+    try:
+        post = _supabase_get_blog_post(slug)
+
+        if not post:
+            # Return a minimal 404 — don't serve the SPA shell for missing posts
+            return (
+                f'<!DOCTYPE html><html><head><title>Not Found — WebPronos Blog</title>'
+                f'<meta name="robots" content="noindex"></head>'
+                f'<body><h1>Article not found</h1>'
+                f'<p><a href="{SITE_URL}/blog">Back to Blog</a></p></body></html>',
+                404,
+                {"Content-Type": "text/html; charset=utf-8"},
+            )
+
+        # ── Extract fields ──────────────────────────────────────────────────
+        title        = post.get("title")       or post.get("meta_title")      or "WebPronos Blog"
+        description  = post.get("description") or post.get("meta_description") or post.get("excerpt") or ""
+        content_md   = post.get("content")     or post.get("body")            or ""
+        author       = post.get("author")      or "WebPronos"
+        published_at = post.get("published_at") or ""
+        og_image     = post.get("og_image")    or f"{SITE_URL}/og/default.png"
+        canonical    = f"{SITE_URL}/blog/{slug}"
+
+        # ── Markdown → HTML ─────────────────────────────────────────────────
+        article_html = _md_to_html(content_md) if content_md else "<p>Article coming soon.</p>"
+
+        # ── JSON-LD BlogPosting ─────────────────────────────────────────────
+        jsonld = json.dumps({
+            "@context":       "https://schema.org",
+            "@type":          "BlogPosting",
+            "headline":       title,
+            "description":    description,
+            "author":         {"@type": "Person", "name": author},
+            "publisher":      {"@type": "Organization", "name": "WebPronos", "url": SITE_URL},
+            "datePublished":  published_at[:10] if published_at else "",
+            "url":            canonical,
+            "image":          og_image,
+            "mainEntityOfPage": {"@type": "WebPage", "@id": canonical},
+        }, ensure_ascii=False)
+
+        meta = {"title": title, "description": description, "og_image": og_image}
+
+        # ── Get SPA shell & inject ──────────────────────────────────────────
+        base_html = _get_base_html()
+        if base_html:
+            rendered = _inject_blog_content(base_html, meta, canonical, article_html, published_at, author, jsonld)
+            return rendered, 200, {
+                "Content-Type":  "text/html; charset=utf-8",
+                "Cache-Control": "public, max-age=3600",   # cache 1h — articles don't change often
+            }
+
+        # Fallback standalone page (Lovable unreachable)
+        fallback = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title}</title>
+  <meta name="description" content="{description}">
+  <meta property="og:title" content="{title}">
+  <meta property="og:description" content="{description}">
+  <meta property="og:image" content="{og_image}">
+  <meta property="og:url" content="{canonical}">
+  <meta property="og:type" content="article">
+  <link rel="canonical" href="{canonical}">
+  <script type="application/ld+json">{jsonld}</script>
+</head>
+<body style="max-width:800px;margin:0 auto;padding:2rem;font-family:system-ui,sans-serif">
+  <nav><a href="{SITE_URL}/blog">← Blog</a></nav>
+  <h1>{title}</h1>
+  <p><em>{description}</em></p>
+  {article_html}
+</body>
+</html>"""
+        return fallback, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    except Exception as e:
+        log.exception(f"[prerender/blog] Error for slug={slug}: {e}")
+        return "Internal error", 500
 
 
 @app.route("/prerender/match/<int:match_id>")
