@@ -6398,31 +6398,41 @@ def _inject_blog_content(html: str, meta: dict, canonical: str, article_html: st
     """
     import re
 
-    # ── 1. Inject head meta (reuse existing helper logic) ──
-    title_tag    = f'<title>{meta["title"]}</title>'
+    # ── 1. Inject head meta ──────────────────────────────────────────────────
     desc_content = meta["description"].replace('"', '&quot;')
     og_image     = meta.get("og_image", f"{SITE_URL}/og/default.png")
+    title_escaped = meta["title"].replace('<', '&lt;').replace('>', '&gt;')
 
-    html = re.sub(r'<title>[^<]*</title>', title_tag, html)
-    html = re.sub(r'<meta\s+name=["\']description["\'][^>]*/?>', '', html)
-    html = re.sub(r'<meta\s+(?:property|name)=["\'](?:og:|twitter:)[^"\']*["\'][^>]*/?>', '', html)
+    # Strip ALL existing dynamic meta (data-rh="true" tags from react-helmet)
+    # They come as one long concatenated line — wipe the entire block
+    html = re.sub(r'<meta\s+data-rh=["\']true["\'][^>]*/?>',  '', html)
+    html = re.sub(r'<link\s+data-rh=["\']true["\'][^>]*/?>',  '', html)
+    html = re.sub(r'<script\s+data-rh=["\']true["\'][^>]*>.*?</script>', '', html, flags=re.DOTALL)
+
+    # Replace title tag (may have data-rh attribute)
+    html = re.sub(r'<title[^>]*>[^<]*</title>', f'<title>{title_escaped}</title>', html)
+
+    # Strip any remaining og/twitter/canonical tags
+    html = re.sub(r'<meta\s+(?:property|name)=["\'](?:og:|twitter:)[^"\']*["\'][^>]*/?>',  '', html)
+    html = re.sub(r'<meta\s+name=["\']description["\'][^>]*/?>',  '', html)
     html = re.sub(r'<link\s+rel=["\']canonical["\'][^>]*/?>',  '', html)
     html = re.sub(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>.*?</script>', '', html, flags=re.DOTALL)
 
     new_head = (
         f'<meta name="description" content="{desc_content}">\n'
-        f'    <meta property="og:title" content="{meta["title"]}">\n'
+        f'    <meta property="og:title" content="{title_escaped}">\n'
         f'    <meta property="og:description" content="{desc_content}">\n'
         f'    <meta property="og:image" content="{og_image}">\n'
         f'    <meta property="og:url" content="{canonical}">\n'
         f'    <meta property="og:type" content="article">\n'
         f'    <meta name="twitter:card" content="summary_large_image">\n'
-        f'    <meta name="twitter:title" content="{meta["title"]}">\n'
+        f'    <meta name="twitter:title" content="{title_escaped}">\n'
         f'    <meta name="twitter:description" content="{desc_content}">\n'
         f'    <meta name="twitter:image" content="{og_image}">\n'
         f'    <link rel="canonical" href="{canonical}">\n'
         f'    <script type="application/ld+json">{jsonld}</script>'
     )
+    # Inject right after the (now-clean) title tag
     html = re.sub(
         r'(<title>[^<]*</title>)',
         r'\1\n    ' + new_head,
