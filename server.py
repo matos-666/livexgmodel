@@ -6472,8 +6472,28 @@ def _inject_blog_content(html: str, meta: dict, canonical: str, article_html: st
 </article>
 </div>"""
 
-    # Replace the entire #root div
-    html = re.sub(r'<div id="root">.*?</div>', article_body, html, count=1, flags=re.DOTALL)
+    # Replace the entire #root div — balanced div matching (nested divs)
+    start_idx = html.find('<div id="root">')
+    if start_idx >= 0:
+        i = start_idx + len('<div id="root">')
+        depth = 1
+        end_idx = -1
+        while i < len(html) and depth > 0:
+            next_open  = html.find('<div', i)
+            next_close = html.find('</div>', i)
+            if next_close == -1:
+                break
+            if next_open != -1 and next_open < next_close:
+                depth += 1
+                i = next_open + 4
+            else:
+                depth -= 1
+                i = next_close + 6
+                if depth == 0:
+                    end_idx = i
+                    break
+        if end_idx > start_idx:
+            html = html[:start_idx] + article_body + html[end_idx:]
 
     return html
 
@@ -6752,9 +6772,37 @@ def _build_html_page(title: str, description: str, canonical: str,
     )
     html = re.sub(r'(<title>[^<]*</title>)', r'\1\n    ' + new_head, html, count=1)
 
-    # Replace #root with the body
+    # Strip the aria-hidden cloaking div from Lovable shell (SEO risk + redundant now)
+    html = re.sub(
+        r'<div\s+aria-hidden=["\']true["\'][^>]*>.*?</div>\s*</body>',
+        '</body>',
+        html, flags=re.DOTALL
+    )
+
+    # Replace #root with the body — need balanced div matching since #root has nested divs
     new_root = f'<div id="root"><div class="pr-wrap">{body_html}</div></div>'
-    html = re.sub(r'<div id="root">.*?</div>', new_root, html, count=1, flags=re.DOTALL)
+    start_idx = html.find('<div id="root">')
+    if start_idx >= 0:
+        # Walk forward counting <div ... and </div> to find the matching close tag
+        i = start_idx + len('<div id="root">')
+        depth = 1
+        end_idx = -1
+        while i < len(html) and depth > 0:
+            next_open  = html.find('<div', i)
+            next_close = html.find('</div>', i)
+            if next_close == -1:
+                break
+            if next_open != -1 and next_open < next_close:
+                depth += 1
+                i = next_open + 4
+            else:
+                depth -= 1
+                i = next_close + 6
+                if depth == 0:
+                    end_idx = i
+                    break
+        if end_idx > start_idx:
+            html = html[:start_idx] + new_root + html[end_idx:]
 
     return html
 
