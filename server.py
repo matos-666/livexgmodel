@@ -4580,6 +4580,15 @@ def _run_background_cycle():
     if not monitored:
         with _state_lock:
             _live_state.clear()
+        # CRITICAL: even with 0 monitored live games, we MUST still finalize
+        # and resolve tips for games that finished while we weren't looking.
+        # Without this, picks for finished games stay "pending" forever any time
+        # there happens to be no monitored match live (common late at night).
+        try:
+            _finalize_dropped_games(set())
+            _resolve_finished_tips()
+        except Exception as e:
+            log.warning(f"BG: post-empty finalize/resolve failed: {e}")
         _last_cycle_ts = time.time()
         return
 
@@ -4710,9 +4719,15 @@ def _finalize_dropped_games(live_ids: set):
     fetch its current state from Sofascore directly. If it's finished, mark it
     and update the score so _resolve_finished_tips() can settle its tips.
     """
+    # Only consider games that should plausibly be over: kickoff at least
+    # 90 min ago. Avoids hammering Sofascore with one request per scheduled
+    # game just to be told "still notstarted" — important when this runs
+    # with an empty live_ids set (no monitored games live).
+    cutoff_ts = int(time.time()) - 90 * 60
     with _db() as conn:
         pending = conn.execute(
-            "SELECT id FROM games WHERE is_finished = 0"
+            "SELECT id FROM games WHERE is_finished = 0 AND start_ts <= ?",
+            (cutoff_ts,)
         ).fetchall()
 
     dropped = [r["id"] for r in pending if r["id"] not in live_ids]
