@@ -58,6 +58,16 @@ _session = None
 # top-down: each key is used until its remaining requests drop below
 # ODDS_API_KEY_THRESHOLD, at which point the next key takes over.
 _DEFAULT_ODDS_KEYS = [
+    "bbd321935d529638185ff20493a529bd",  # fresh — added 2026-05-08
+    "cb98e44e1017b7074f09d64c3d6e13cf",  # fresh — added 2026-05-08
+    "4ea8ea2fd077d1e3a78d22a96457cfaa",  # fresh — added 2026-05-08
+    "991b181701f0357ee480d5cc4a130775",  # fresh — added 2026-05-08
+    "8df74b4da3761af46c46ccaf9aa66e06",  # fresh — added 2026-05-07
+    "dd8897a2d2a3f132cf61ec7b60023655",  # fresh — added 2026-05-06
+    "937d66f8602ffa24432758360e85a4f4",  # fresh — added 2026-05-06
+    "47cba4ae66282b03fd97e132901ee90c",  # fresh — added 2026-05-06
+    "f503c6dd5df67563cf516864f33bd0a7",  # fresh — added 2026-05-06
+    "00cb1a6454aa5451338fc6583326bab4",  # fresh — added 2026-05-05
     "bc2a057a6832adf77e7b725b7609ca19",  # fresh — added 2026-05-05
     "1a8a5dbd0516293080b8075b3a991d2e",  # fresh — added 2026-05-04
     "86131a98d36adbc7db54d8f5130494b5",  # fresh — added 2026-05-04
@@ -193,7 +203,11 @@ _COUNTRY_FLAGS = {
     "czech republic": "🇨🇿", "denmark": "🇩🇰", "sweden": "🇸🇪", "norway": "🇳🇴",
     "usa": "🇺🇸", "brazil": "🇧🇷", "argentina": "🇦🇷", "mexico": "🇲🇽",
     "colombia": "🇨🇴", "chile": "🇨🇱", "japan": "🇯🇵", "south korea": "🇰🇷",
-    "australia": "🇦🇺", "china": "🇨🇳", "international": "🌍",
+    "australia": "🇦🇺", "china": "🇨🇳",
+    # Confederations / international competitions
+    "europe": "🇪🇺", "international": "🌍", "world": "🌍",
+    "south america": "🌎", "north america": "🌎", "americas": "🌎",
+    "asia": "🌏", "africa": "🌍", "oceania": "🌏",
 }
 
 def _country_flag(country: str) -> str:
@@ -765,12 +779,19 @@ def _send_daily_summary(days_back: int = 0, force_send: bool = False):
         roi = (lucro / (settled * STAKE) * 100) if settled > 0 else 0.0
 
         # Find the bet with the highest odd, with match info
+        # NOTE: tips are sqlite3.Row objects — no .get(), use indexing with try/except
         max_odd_tip = max(tips, key=lambda t: t["odd_entry"] or 0)
-        maior_odd = max_odd_tip["odd_entry"]
-        bet_label = max_odd_tip.get('label', '?')
-        bet_market = max_odd_tip.get('market', '?')
-        home_team = max_odd_tip.get('home_team', '')
-        away_team = max_odd_tip.get('away_team', '')
+        def _row_get(row, key, default=""):
+            try:
+                v = row[key]
+                return v if v is not None else default
+            except (IndexError, KeyError):
+                return default
+        maior_odd  = max_odd_tip["odd_entry"]
+        bet_label  = _row_get(max_odd_tip, 'label', '?')
+        bet_market = _row_get(max_odd_tip, 'market', '?')
+        home_team  = _row_get(max_odd_tip, 'home_team', '')
+        away_team  = _row_get(max_odd_tip, 'away_team', '')
 
         # Build match string
         if home_team and away_team:
@@ -2851,6 +2872,36 @@ _last_req = 0
 REQ_GAP = 2.0
 
 
+def _get_bytes(url, timeout: int = 8):
+    """
+    Like _get but returns raw bytes + content-type. Uses the same session
+    (curl_cffi with Chrome TLS impersonation) so endpoints that 403 plain
+    `requests` (e.g. Sofascore image CDN) work here.
+    """
+    global _last_req
+    if _session is None:
+        _init_client()
+    for attempt in range(2):
+        try:
+            wait = REQ_GAP - (time.time() - _last_req)
+            if wait > 0:
+                time.sleep(wait)
+            _last_req = time.time()
+            resp = _session.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                ct = resp.headers.get("Content-Type", "image/png")
+                return resp.content, ct
+            if resp.status_code in (403, 429):
+                _init_client()
+                time.sleep(2 * (attempt + 1))
+            elif resp.status_code == 404:
+                return None
+        except Exception as e:
+            log.warning(f"_get_bytes error for {url}: {e}")
+            time.sleep(1)
+    return None
+
+
 def _get(url, retries=3):
     global _last_req
     if _session is None:
@@ -2993,8 +3044,9 @@ def _parse_event(ev):
         "injuryTime": injury_time,
         "startTimestamp": ev.get("startTimestamp"),
         "currentPeriodStartTimestamp": period_ts,
-        "tournament": tourn.get("name", ""),
-        "country": tourn.get("category", {}).get("name", ""),
+        "tournament":   tourn.get("name", ""),
+        "tournamentId": (tourn.get("uniqueTournament") or {}).get("id"),
+        "country":      tourn.get("category", {}).get("name", ""),
         "isLive": st.get("type") == "inprogress",
         "isFinished": st.get("type") == "finished",
         "isScheduled": st.get("type") == "notstarted",
@@ -3935,6 +3987,81 @@ def _hcp_canonical(label: str) -> str:
     team = label[:label.rfind(m.group(0))].strip().lower()
     return f"{team}|{val_str}"
 
+def _filter_redundant_live_picks(picks: list) -> list:
+    """
+    Strip equivalent picks from a candidate list before exposing them as
+    live "VALUE PICKS NOW" to the frontend. Mirrors the cross-market dedup
+    that _sync_tips_db applies before committing to DB:
+
+      - 1X2 'Team' is equivalent to Handicap 'Team -0.5' (same outcome).
+        When both are present, keep the higher-edge one.
+      - O/U Over X.5 contradicts Under Y.5 when Y <= X.
+        When both are present, keep the higher-edge one.
+
+    Pure function — does not touch DB. Returns a new list.
+    """
+    import re as _re
+    if not picks:
+        return picks
+
+    # Build keyed views
+    team_picks: dict[str, list[int]] = {}   # team_lower → list of indices into picks
+    for i, p in enumerate(picks):
+        market = p.get("market", "")
+        label  = (p.get("label") or "").strip()
+        team_key = None
+        if market == "1X2" and label.lower() != "draw":
+            team_key = label.lower()
+        elif market == "Handicap":
+            m = _re.search(r'([+-][\d.]+)$', label)
+            if m:
+                try:
+                    val = float(m.group(1))
+                except ValueError:
+                    val = None
+                # Only -0.5 handicap is equivalent to a straight 1X2 win
+                if val == -0.5:
+                    team_key = label[:label.rfind(m.group(0))].strip().lower()
+        if team_key:
+            team_picks.setdefault(team_key, []).append(i)
+
+    drop: set[int] = set()
+    for team, idxs in team_picks.items():
+        if len(idxs) <= 1:
+            continue
+        # Keep the one with the largest edge; drop the rest
+        idxs_sorted = sorted(idxs, key=lambda i: -(picks[i].get("edge") or 0))
+        for i in idxs_sorted[1:]:
+            drop.add(i)
+
+    # O/U cross-line: same direction is fine, but Over X.5 + Under Y.5 with Y<=X is contradictory
+    overs:  list[tuple[int, float]] = []   # (index, line)
+    unders: list[tuple[int, float]] = []
+    for i, p in enumerate(picks):
+        if i in drop:
+            continue
+        if not p.get("market", "").startswith("O/U"):
+            continue
+        m = _re.match(r'^(Over|Under)\s+([\d.]+)$', p.get("label", ""), _re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            line = float(m.group(2))
+        except ValueError:
+            continue
+        (overs if m.group(1).lower() == "over" else unders).append((i, line))
+
+    for io, lo in overs:
+        for iu, lu in unders:
+            if lu <= lo and io not in drop and iu not in drop:
+                # Contradictory pair — drop the one with the smaller edge
+                eo = picks[io].get("edge") or 0
+                eu = picks[iu].get("edge") or 0
+                drop.add(iu if eu <= eo else io)
+
+    return [p for i, p in enumerate(picks) if i not in drop]
+
+
 def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                   last_goal_minute=None, match: dict = None, shots: dict = None) -> list:
     """
@@ -4510,8 +4637,10 @@ def _run_background_cycle():
             # These are computed from the current live odds + current model probabilities.
             # If a tip's value disappeared (odds moved against us), it won't appear here,
             # even if it's still stored in `tips` (for historical track record).
+            # Apply the same cross-market dedup as _sync_tips_db so the UI never
+            # shows two equivalent picks (e.g. 1X2 Team + HCP Team -0.5).
             live_picks = []
-            for p in picks:
+            for p in _filter_redundant_live_picks(picks):
                 live_picks.append({
                     "market":     p.get("market"),
                     "label":      p.get("label"),
@@ -4521,6 +4650,10 @@ def _run_background_cycle():
                     "model":      p.get("model", 0),
                     "minute":     minute,
                 })
+
+            # Inject logos inline — zero extra requests from the frontend
+            m["home_logo"] = _quick_logo(m.get("home_team", ""))
+            m["away_logo"] = _quick_logo(m.get("away_team", ""))
 
             new_state[mid] = {
                 "match":     m,
@@ -4542,6 +4675,25 @@ def _run_background_cycle():
     live_ids = {m["id"] for m in monitored}
     _finalize_dropped_games(live_ids)
     _resolve_finished_tips()
+
+    # Keep upcoming cache warm — runs in same bg thread (curl_cffi safe here)
+    try:
+        _refresh_upcoming_cache(days_ahead=3)
+    except Exception as e:
+        log.warning(f"BG: _refresh_upcoming_cache failed: {e}")
+
+    # Keep SEO slug index fresh (cheap, one DB query)
+    try:
+        _refresh_slug_index()
+    except Exception as e:
+        log.warning(f"BG: _refresh_slug_index failed: {e}")
+
+    # Pre-warm league logo CDN bytes + tournament IDs so first user
+    # request to /api/seo/league/{slug} is sub-100ms.
+    try:
+        _warmup_seo_caches()
+    except Exception as e:
+        log.warning(f"BG: _warmup_seo_caches failed: {e}")
 
     req_after = _api_requests_remaining or 0
     _last_cycle_ts = time.time()
@@ -4681,9 +4833,9 @@ _MONITORED_LEAGUE_STRICT_KEYWORDS = {
     "premier league": {"england", "english"},  # "uk" removed — substring matches "ukraine"
     "championship": {"england", "english"},
     "efl": {"england", "english"},
-    # Spain
-    "la liga": None,
-    "laliga": None,
+    # Spain — restrict to Spain so Chilean "Copa de la Liga" doesn't slip in
+    "la liga": {"spain", "spanish"},
+    "laliga": {"spain", "spanish"},
     "primera division": {"spain", "spanish"},
     # Italy
     "serie a": {"italy", "italian"},
@@ -4796,6 +4948,7 @@ _BLOCKED_TOURNAMENT_FRAGMENTS = {
     "damallsvenskan",                             # Swedish women's league (no live xG from Sofascore)
     "northern premier",                           # English amateur pyramid (all divisions)
     "amateur",                                    # Any amateur competition
+    "copa de la liga",                            # Chilean cup (not Spanish LaLiga)
 }
 
 def _get_blocked_fragments() -> set:
@@ -4895,87 +5048,509 @@ def r_today_monitored():
         return jsonify({"error": str(e)}), 500
 
 
+# ── Upcoming matches cache — keyed by date string, refreshed in background ──
+# Dict operations in CPython are GIL-protected; no lock needed for basic get/set.
+_upcoming_cache: dict = {}   # date_str → {"matches": [...], "ts": float}
+_UPCOMING_TTL = 900          # 15 minutes; background loop refreshes every cycle
+
+
+def _fetch_day_matches(date_str: str) -> list:
+    """
+    Fetch & filter scheduled matches for one date from Sofascore.
+    Returns list of match dicts ready for the API response.
+    Must only be called from a background thread (curl_cffi blocks gevent).
+    """
+    try:
+        day_dt    = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        day_start = int(day_dt.timestamp())
+        day_end   = day_start + 86400
+
+        data       = _get(f"{SOFASCORE_API}/sport/football/scheduled-events/{date_str}")
+        all_events = data.get("events", []) if data else []
+    except Exception as e:
+        log.warning(f"_fetch_day_matches: Sofascore fetch failed for {date_str}: {e}")
+        return []
+
+    day_matches = []
+    for m in all_events:
+        if m.get("isFinished") or m.get("isLive"):
+            continue
+        ts = m.get("startTimestamp", 0)
+        if ts and not (day_start <= ts < day_end):
+            continue
+
+        tourn        = m.get("tournament", {})
+        tourn_name   = tourn.get("name", "") if isinstance(tourn, dict) else str(tourn or "")
+        country      = m.get("country", {})
+        country_name = country.get("name", "") if isinstance(country, dict) else str(country or "")
+
+        if not _is_monitored_league_strict(tourn_name, country_name):
+            continue
+
+        home = m.get("homeTeam", "")
+        away = m.get("awayTeam", "")
+        if isinstance(home, dict):
+            home = home.get("name", "")
+        if isinstance(away, dict):
+            away = away.get("name", "")
+
+        unique_tournament_id = ((tourn.get("uniqueTournament") or {}).get("id")
+                                if isinstance(tourn, dict) else None)
+        day_matches.append({
+            "id":             m["id"],
+            "homeTeam":       home,
+            "awayTeam":       away,
+            "home_logo":      _quick_logo(home),
+            "away_logo":      _quick_logo(away),
+            "tournament":     tourn_name,
+            "tournamentId":   unique_tournament_id,
+            "country":        country_name,
+            "startTimestamp": ts,
+            "_sport_key":     _resolve_sport_key(tourn_name, country_name),
+        })
+
+    day_matches.sort(key=lambda x: x.get("startTimestamp", 0))
+    return day_matches
+
+
+def _refresh_upcoming_cache(days_ahead: int = 3):
+    """
+    Called from the background loop thread — safe to block with curl_cffi.
+    Refreshes the upcoming cache for today + next N days.
+    """
+    now_utc = datetime.now(timezone.utc)
+    for offset in range(days_ahead):
+        date_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
+        cached   = _upcoming_cache.get(date_str)
+        # Skip if fresh enough
+        if cached and (time.time() - cached["ts"]) < _UPCOMING_TTL:
+            continue
+        matches = _fetch_day_matches(date_str)
+        _upcoming_cache[date_str] = {"matches": matches, "ts": time.time()}
+        log.info(f"_refresh_upcoming_cache: {date_str} → {len(matches)} matches cached")
+
+
+# ── SEO slug index + page cache ───────────────────────────────────────────────
+# Maps slugified team / tournament names → canonical name as stored in the DB.
+# Refreshed by the background loop (cheap: one query, scans ~285 games).
+# Plus a generic page-level cache for rendered HTML, so SEO pages never block.
+_slug_index_cache: dict = {"teams": {}, "leagues": {}, "ts": 0.0}
+_SLUG_INDEX_TTL    = 3600    # 1 hour
+_seo_cache: dict   = {}      # cache_key → {"html": str, "ts": float}
+_SEO_CACHE_TTL     = 900     # 15 minutes
+
+
+def _normalize_tournament_pretty(name: str) -> str:
+    """
+    Like _normalize_tournament but preserves original case.
+    'CONMEBOL Sudamericana, Group C'  → 'CONMEBOL Sudamericana'
+    'Scottish Premiership, Championship Round' → 'Scottish Premiership'
+    'Liga MX, Clausura Playoffs'      → 'Liga MX'
+    """
+    import re
+    cleaned = re.sub(
+        r'\s*,\s+(group|grp|round|phase|stage|pool|matchday|md|jornada|giornata|journée|'
+        r'spieltag|playoff|play-off|play off|qualification|qualifying|relegation|promotion|'
+        r'conference|champions|europa|cup|shield|super|final|semi|quarter)\b.*$',
+        '', name, flags=re.IGNORECASE
+    ).strip()
+    cleaned = re.sub(r'\s*,.*$', '', cleaned).strip()
+    cleaned = re.sub(r'\s*\(.*\)\s*$', '', cleaned).strip()
+    return cleaned
+
+
+def _refresh_slug_index():
+    """
+    Build slug → canonical-name maps for teams and leagues that have ≥1 pick.
+    For leagues, group fragments ('CONMEBOL Sudamericana, Group C', 'Group H',
+    etc.) are collapsed into a single canonical entry so the league page
+    aggregates all phases/rounds into one URL.
+    """
+    if (time.time() - _slug_index_cache["ts"]) < _SLUG_INDEX_TTL:
+        return
+    try:
+        teams: dict[str, str] = {}
+        leagues: dict[str, str] = {}                    # slug → canonical pretty name
+        league_variants: dict[str, list[str]] = {}      # canonical → list of DB tournament strings
+        with _db() as conn:
+            # Teams that have appeared in a game with at least one tip
+            for row in conn.execute("""
+                SELECT DISTINCT g.home_team AS name FROM games g
+                JOIN tips t ON t.match_id = g.id
+                UNION
+                SELECT DISTINCT g.away_team AS name FROM games g
+                JOIN tips t ON t.match_id = g.id
+            """).fetchall():
+                name = (row["name"] or "").strip()
+                if name:
+                    teams[_slug(name)] = name
+
+            # Leagues — collapse "Foo, Group A" / "Foo, Group B" / "Foo, Knockout stage"
+            # under a single canonical "Foo".
+            for row in conn.execute("""
+                SELECT DISTINCT g.tournament AS name FROM games g
+                JOIN tips t ON t.match_id = g.id
+                WHERE g.tournament IS NOT NULL AND g.tournament <> ''
+            """).fetchall():
+                raw = (row["name"] or "").strip()
+                if not raw:
+                    continue
+                canonical = _normalize_tournament_pretty(raw) or raw
+                slug      = _slug(canonical)
+                leagues.setdefault(slug, canonical)
+                league_variants.setdefault(canonical, []).append(raw)
+
+        # Variant slug → canonical name. Lets /league/uefa-europa-league-knockout-stage
+        # (whatever raw slug Lovable might build from a match's tournament field)
+        # still resolve to the unified canonical league page.
+        variant_slug_map: dict[str, str] = {}
+        for canonical, variants in league_variants.items():
+            for raw in variants:
+                variant_slug_map[_slug(raw)] = canonical
+
+        _slug_index_cache["teams"]                = teams
+        _slug_index_cache["leagues"]              = leagues
+        _slug_index_cache["league_variants"]      = league_variants
+        _slug_index_cache["league_variant_slugs"] = variant_slug_map
+        _slug_index_cache["ts"]                   = time.time()
+        log.info(f"_refresh_slug_index: {len(teams)} teams, "
+                 f"{len(leagues)} leagues "
+                 f"({sum(len(v) for v in league_variants.values())} variant rows, "
+                 f"{len(variant_slug_map)} variant slugs)")
+    except Exception as e:
+        log.warning(f"_refresh_slug_index failed: {e}")
+
+
+def _resolve_league_tid_quick(name: str) -> int | None:
+    """
+    Request-path-safe deep resolution: scans only the next 3 days via
+    Sofascore (≤3 HTTP calls, each cached upstream). Used by the logo
+    proxy on cold-cache misses so the very first user gets the logo.
+    Updates _league_tid_memo on success.
+    """
+    if name in _league_tid_memo and _league_tid_memo[name]:
+        return _league_tid_memo[name]
+    target = _normalize_tournament(name)
+    today = datetime.now(timezone.utc)
+    for offset in range(3):
+        date_str = (today + timedelta(days=offset)).strftime("%Y-%m-%d")
+        try:
+            for m in get_scheduled(date_str):
+                if (_normalize_tournament(m.get("tournament") or "") == target
+                        and m.get("tournamentId")):
+                    tid = m["tournamentId"]
+                    _league_tid_memo[name] = tid
+                    return tid
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_league_tid_deep(name: str) -> int | None:
+    """
+    Background-only deep resolution: scans the next 14 days via Sofascore
+    `get_scheduled()` (curl_cffi-safe in BG thread) when the in-memory
+    upcoming cache doesn't contain a match for the league.
+    Used by the warmup so leagues that don't play every day (UEFA knockout
+    rounds, CONMEBOL between matchdays) still get their tid populated.
+    """
+    if name in _league_tid_memo and _league_tid_memo[name]:
+        return _league_tid_memo[name]
+    target = _normalize_tournament(name)
+    today = datetime.now(timezone.utc)
+    for offset in range(14):
+        date_str = (today + timedelta(days=offset)).strftime("%Y-%m-%d")
+        try:
+            for m in get_scheduled(date_str):
+                if (_normalize_tournament(m.get("tournament") or "") == target
+                        and m.get("tournamentId")):
+                    tid = m["tournamentId"]
+                    _league_tid_memo[name] = tid
+                    return tid
+        except Exception:
+            continue
+    return None
+
+
+def _warmup_seo_caches():
+    """
+    Proactive warmup of SEO caches. Runs in the background loop after
+    slug index + upcoming cache are fresh, so the very first user request
+    to any league/team page gets a sub-100ms response.
+
+    Resolves tournament IDs (using a 14-day Sofascore scan as fallback so
+    sporadic competitions like UEFA knockouts also resolve) and pre-fetches
+    each league's logo bytes via curl_cffi.
+    """
+    leagues = _slug_index_cache.get("leagues") or {}
+    if not leagues:
+        return
+
+    for slug, name in leagues.items():
+        # Deep resolution allowed here (we're in the BG thread)
+        tid = _resolve_league_tid_deep(name)
+        if not tid:
+            continue
+        if slug in _league_logo_bytes:
+            continue
+        try:
+            fetched = _get_bytes(
+                f"https://api.sofascore.com/api/v1/unique-tournament/{tid}/image",
+                timeout=6,
+            )
+            if fetched:
+                _league_logo_bytes[slug] = fetched
+        except Exception as e:
+            log.debug(f"warmup logo {slug}: {e}")
+
+    # The JSON cache may have been written before tids were resolved.
+    # Drop entries with stale null logo_url so they re-build with the
+    # logos populated.
+    stale_keys = []
+    for k, v in list(_seo_cache.items()):
+        if k.startswith("jsonleague:") and v.get("html") and '"logo_url": null' in v["html"]:
+            stale_keys.append(k)
+    for k in stale_keys:
+        _seo_cache.pop(k, None)
+
+    log.info(f"_warmup_seo_caches: tids={len(_league_tid_memo)} "
+             f"logo_bytes={len(_league_logo_bytes)} "
+             f"json_cache_invalidated={len(stale_keys)}")
+
+
+def _league_variants_for(canonical: str) -> list[str]:
+    """All DB tournament strings that collapse into this canonical league name."""
+    if not _slug_index_cache.get("league_variants"):
+        _refresh_slug_index()
+    return _slug_index_cache.get("league_variants", {}).get(canonical, [canonical])
+
+
+def _team_by_slug(slug: str) -> str | None:
+    return _slug_index_cache["teams"].get(slug)
+
+
+def _league_by_slug(slug: str) -> str | None:
+    """
+    Slug → canonical league name. Falls back to variant slugs so that
+    naive slugs like 'uefa-europa-league-knockout-stage' resolve to the
+    canonical 'UEFA Europa League'.
+    """
+    direct = _slug_index_cache.get("leagues", {}).get(slug)
+    if direct:
+        return direct
+    return _slug_index_cache.get("league_variant_slugs", {}).get(slug)
+
+
+_league_tid_memo: dict = {}              # canonical name → uniqueTournament id
+_league_logo_bytes: dict = {}            # slug → (bytes, content_type)
+
+# Hardcoded Sofascore uniqueTournament IDs as a final safety-net for major
+# competitions that may have no games in the next 14 days (between rounds
+# of UEFA knockout phases, off-season, etc.). Keyed by lowercase canonical
+# name (after _normalize_tournament).
+_LEAGUE_TID_FALLBACK = {
+    "premier league":         17,
+    "championship":           18,
+    "laliga":                  8,
+    "la liga":                 8,
+    "bundesliga":             35,
+    "2. bundesliga":          44,
+    "serie a":                23,
+    "ligue 1":                34,
+    "liga portugal":         238,
+    "liga portugal betclic": 238,
+    "primeira liga":         238,
+    "eredivisie":             37,
+    "vriendenloterij eredivisie": 37,
+    "pro league":             38,
+    "stoiximan super league": 185,
+    "trendyol süper lig":     52,
+    "süper lig":              52,
+    "super lig":              52,
+    "austrian bundesliga":    45,
+    "scottish premiership":   36,
+    "swiss super league":    215,
+    "ekstraklasa":           202,
+    "eliteserien":            20,
+    "saudi pro league":      955,
+    "mls":                   242,
+    "liga mx":             11621,
+    "brasileirão betano":    325,
+    "brasileirão":           325,
+    "brasileirão série b":   390,
+    "uefa champions league":   7,
+    "champions league":        7,
+    "uefa europa league":    679,
+    "europa league":         679,
+    "uefa conference league": 17015,
+    "conference league":   17015,
+    "conmebol libertadores": 384,
+    "copa libertadores":     384,
+    "conmebol sudamericana": 480,
+    "copa sudamericana":     480,
+}
+
+
+def _resolve_league_tid(name: str) -> int | None:
+    """
+    Resolve a canonical league name → Sofascore uniqueTournament ID.
+    Tiered lookup: memo → upcoming cache → hardcoded fallback dict.
+    Request-path-safe (no HTTP).
+    """
+    if name in _league_tid_memo and _league_tid_memo[name]:
+        return _league_tid_memo[name]
+    target = _normalize_tournament(name)
+    # In-memory upcoming cache
+    for date_key in _upcoming_cache:
+        for m in _upcoming_cache[date_key].get("matches", []):
+            if (_normalize_tournament(m.get("tournament") or "") == target
+                    and m.get("tournamentId")):
+                tid = m["tournamentId"]
+                _league_tid_memo[name] = tid
+                return tid
+    # Hardcoded fallback for major competitions (handles between-rounds gaps)
+    tid = _LEAGUE_TID_FALLBACK.get(target)
+    if tid:
+        _league_tid_memo[name] = tid
+        return tid
+    return None
+
+
+def _league_logo(name: str) -> str | None:
+    """
+    Return the public logo URL for a competition. The URL is always
+    deterministic — the proxy endpoint handles 404 gracefully when
+    the tid hasn't been resolved yet (frontend falls back to monogram).
+    This avoids JSON cache poisoning while warmup is still running.
+    """
+    if not name:
+        return None
+    target = _normalize_tournament(name)
+    for slug, canonical in _slug_index_cache.get("leagues", {}).items():
+        if _normalize_tournament(canonical) == target:
+            return f"{API_BASE_URL}/api/league-logo/{slug}"
+    return None
+
+
+def _filter_monitored(matches: list[dict]) -> list[dict]:
+    """
+    Keep only matches whose (tournament, country) pair is in our strict
+    monitored list. This is the same gate used by /api/today/monitored —
+    correctly distinguishes English Premier League from Ukrainian PL,
+    French Ligue 1 from Algerian Ligue 1, etc.
+    """
+    out = []
+    for m in matches:
+        tourn   = m.get("tournament") or ""
+        country = m.get("country") or ""
+        if _is_monitored_league_strict(tourn, country):
+            out.append(m)
+    return out
+
+
+def _scan_upcoming(days_ahead: int = 3) -> list[dict]:
+    """
+    Read-only scan of `_upcoming_cache` for the next `days_ahead` days.
+    NEVER calls Sofascore from the request path — that's the background
+    loop's job (`_refresh_upcoming_cache`). Cold-cache responses just
+    return whatever is in memory, which keeps p99 latency under 50ms.
+    """
+    now_ts = int(time.time())
+    today  = datetime.now(timezone.utc)
+    out: list[dict] = []
+    seen: set = set()
+    for offset in range(days_ahead):
+        date_str = (today + timedelta(days=offset)).strftime("%Y-%m-%d")
+        cached = _upcoming_cache.get(date_str)
+        if not cached or not cached.get("matches"):
+            continue
+        for m in cached["matches"]:
+            mid = m.get("id")
+            ts  = m.get("startTimestamp") or 0
+            if not mid or mid in seen or ts <= now_ts:
+                continue
+            seen.add(mid)
+            out.append(m)
+    out.sort(key=lambda x: x.get("startTimestamp") or 0)
+    return out
+
+
+def _upcoming_for_league(name: str, limit: int = 20) -> list[dict]:
+    """
+    Find upcoming matches for a canonical tournament name. Group/phase
+    fragments are matched via _normalize_tournament so all stages of the
+    same competition (e.g. Sudamericana Group A + Group H) appear together.
+    Strict country gate prevents same-name leagues from other countries.
+    """
+    target = _normalize_tournament(name)  # lowercase canonical form
+    out = []
+    for m in _scan_upcoming():
+        m_tourn = m.get("tournament") or ""
+        if _normalize_tournament(m_tourn) != target:
+            continue
+        if not _is_monitored_league_strict(m_tourn, m.get("country") or ""):
+            continue
+        out.append({
+            "match_id":   m.get("id"),
+            "home_team":  m.get("homeTeam"),
+            "away_team":  m.get("awayTeam"),
+            "kickoff_ts": m.get("startTimestamp"),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _next_fixture_for_team(name: str) -> dict | None:
+    """Earliest upcoming match (any tournament) involving this team."""
+    for m in _scan_upcoming():
+        if m.get("homeTeam") != name and m.get("awayTeam") != name:
+            continue
+        return {
+            "match_id":   m.get("id"),
+            "home_team":  m.get("homeTeam"),
+            "away_team":  m.get("awayTeam"),
+            "tournament": m.get("tournament"),
+            "kickoff_ts": m.get("startTimestamp"),
+        }
+    return None
+
+
+def _seo_cache_get(key: str) -> str | None:
+    entry = _seo_cache.get(key)
+    if entry and (time.time() - entry["ts"]) < _SEO_CACHE_TTL:
+        return entry["html"]
+    return None
+
+
+def _seo_cache_put(key: str, html: str) -> None:
+    _seo_cache[key] = {"html": html, "ts": time.time()}
+
+
 @app.route("/api/upcoming")
 def r_upcoming():
     """
-    Returns scheduled (not live, not finished) matches for the next N days
-    (default 3: today + tomorrow + day after), grouped by date.
-    Each day's matches are filtered to monitored leagues only.
-
-    Response:
-    {
-      "days": [
-        { "date": "2026-05-04", "label": "Today",     "matches": [...] },
-        { "date": "2026-05-05", "label": "Tomorrow",  "matches": [...] },
-        { "date": "2026-05-06", "label": "Wednesday", "matches": [...] }
-      ],
-      "total": 42
-    }
+    Returns scheduled matches for the next N days, grouped by date.
+    Purely served from in-memory cache — ZERO blocking I/O in the request path.
+    Cache is populated/refreshed by the background loop (_refresh_upcoming_cache).
+    If a date is not yet cached, returns [] for that day (frontend retries).
     """
     try:
-        days_ahead = flask_request.args.get("days", 3, type=int)
-        days_ahead = max(1, min(days_ahead, 7))  # clamp 1-7
-
-        now_utc = datetime.now(timezone.utc)
+        days_ahead  = flask_request.args.get("days", 3, type=int)
+        days_ahead  = max(1, min(days_ahead, 7))
+        now_utc     = datetime.now(timezone.utc)
         result_days = []
-        total = 0
-
-        day_labels = ["Today", "Tomorrow"]
+        total       = 0
+        day_labels  = ["Today", "Tomorrow"]
 
         for offset in range(days_ahead):
-            target_dt  = now_utc + timedelta(days=offset)
-            date_str   = target_dt.strftime("%Y-%m-%d")
-            day_start  = int(target_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-            day_end    = day_start + 86400
-
-            if offset < len(day_labels):
-                label = day_labels[offset]
-            else:
-                label = target_dt.strftime("%A")  # e.g. "Wednesday"
-
-            try:
-                data = _get(f"{SOFASCORE_API}/sport/football/scheduled-events/{date_str}")
-                all_events = data.get("events", []) if data else []
-            except Exception as fetch_err:
-                log.warning(f"r_upcoming: fetch failed for {date_str}: {fetch_err}")
-                all_events = []
-
-            day_matches = []
-            for m in all_events:
-                if m.get("isFinished") or m.get("isLive"):
-                    continue
-                ts = m.get("startTimestamp", 0)
-                if ts and not (day_start <= ts < day_end):
-                    continue
-
-                tourn = m.get("tournament", {})
-                tourn_name   = tourn.get("name", "") if isinstance(tourn, dict) else str(tourn or "")
-                country      = m.get("country", {})
-                country_name = country.get("name", "") if isinstance(country, dict) else str(country or "")
-
-                if not _is_monitored_league_strict(tourn_name, country_name):
-                    continue
-
-                sk = _resolve_sport_key(tourn_name, country_name)
-                m["_sport_key"] = sk
-                if isinstance(m.get("homeTeam"), dict):
-                    m["homeTeam"] = m["homeTeam"].get("name", "")
-                if isinstance(m.get("awayTeam"), dict):
-                    m["awayTeam"] = m["awayTeam"].get("name", "")
-
-                day_matches.append({
-                    "id":             m["id"],
-                    "homeTeam":       m.get("homeTeam", ""),
-                    "awayTeam":       m.get("awayTeam", ""),
-                    "tournament":     tourn_name,
-                    "country":        country_name,
-                    "startTimestamp": ts,
-                    "_sport_key":     sk,
-                })
-
-            day_matches.sort(key=lambda x: x.get("startTimestamp", 0))
-            result_days.append({"date": date_str, "label": label, "matches": day_matches})
-            total += len(day_matches)
+            target_dt = now_utc + timedelta(days=offset)
+            date_str  = target_dt.strftime("%Y-%m-%d")
+            label     = day_labels[offset] if offset < len(day_labels) else target_dt.strftime("%A")
+            cached    = _upcoming_cache.get(date_str)   # GIL-safe dict read, no lock needed
+            matches   = cached["matches"] if cached else []
+            result_days.append({"date": date_str, "label": label, "matches": matches})
+            total += len(matches)
 
         return jsonify({"days": result_days, "total": total})
     except Exception as e:
@@ -5283,6 +5858,9 @@ def r_state_tips():
                 (g["id"], get_setting("max_minute_for_tips", 85))
             ).fetchall()
             gd["tips"] = [dict(t) for t in tips_rows]
+            # Inject logos directly so the frontend makes zero extra requests
+            gd["home_logo"] = _quick_logo(g["home_team"])
+            gd["away_logo"] = _quick_logo(g["away_team"])
             result.append(gd)
     return jsonify({"games": result, "count": len(result)})
 
@@ -5460,31 +6038,80 @@ def _load_logos():
         log.error(f"Failed to load team logos: {e}")
 
 def _get_logos():
-    if time.time() - _logos_ts > _LOGOS_TTL or not _logos_cache:
-        _load_logos()
-    return _logos_cache
+    # NEVER block a gevent worker — curl_cffi is not gevent-compatible.
+    # If cache is empty or stale, kick off a background thread and return
+    # whatever we have immediately (empty dict on first boot, stale on refresh).
+    if time.time() - _logos_ts > _LOGOS_TTL:
+        threading.Thread(target=_load_logos, daemon=True).start()
+    return _logos_cache  # may be {} until background thread finishes
+
+# Memoization cache: team name → logo URL (or None). Persisted across requests
+# so each unique team is fuzzy-matched only ONCE per server lifetime.
+_fuzzy_logo_memo: dict = {}
+
+def _quick_logo(name: str) -> str | None:
+    """
+    Fast logo lookup — exact + normalized only, NO fuzzy fallback.
+    Use this in bulk endpoints (state/tips, upcoming, live state) where 700+
+    teams may be looked up per request. Fuzzy matching against 10k logos is
+    far too slow for that path. Returns None if no exact match.
+    """
+    if not name:
+        return None
+    if name in _fuzzy_logo_memo:
+        return _fuzzy_logo_memo[name]
+    logos = _get_logos()
+    if not logos:
+        return None
+    # Exact match
+    if name in logos:
+        _fuzzy_logo_memo[name] = logos[name]
+        return logos[name]
+    # Normalized exact match
+    nkey = _normalize_team_for_logo(name)
+    if nkey in _logos_norm_cache:
+        url = _logos_norm_cache[nkey]
+        _fuzzy_logo_memo[name] = url
+        return url
+    # No exact match — cache miss as None to avoid retrying
+    _fuzzy_logo_memo[name] = None
+    return None
+
 
 def _fuzzy_logo(name: str, threshold: float = 0.72) -> str | None:
     """
     Return a logo URL for *name* using a tiered lookup:
-      1. Exact match  (original keys)
-      2. Normalized exact match
-      3. Best fuzzy match via SequenceMatcher (above threshold)
+      1. Memoized result  (instant after first lookup)
+      2. Exact match       (original keys)
+      3. Normalized exact match
+      4. Best fuzzy match via SequenceMatcher (above threshold)
     Returns None when no acceptable match is found.
     """
-    logos = _get_logos()
+    if not name:
+        return None
 
-    # 1. exact
+    # 1. memoized — avoids redoing SequenceMatcher across 10k logos every call
+    if name in _fuzzy_logo_memo:
+        return _fuzzy_logo_memo[name]
+
+    logos = _get_logos()
+    # If logos cache is still cold, don't write None to memo (so we retry later)
+    if not logos:
+        return None
+
+    # 2. exact
     if name in logos:
+        _fuzzy_logo_memo[name] = logos[name]
         return logos[name]
 
-    # 2. normalized exact
+    # 3. normalized exact
     norm_cache = _logos_norm_cache
     nkey = _normalize_team_for_logo(name)
     if nkey in norm_cache:
+        _fuzzy_logo_memo[name] = norm_cache[nkey]
         return norm_cache[nkey]
 
-    # 3. fuzzy over normalized keys
+    # 4. fuzzy over normalized keys (slow — only runs once per unique name)
     best_score = 0.0
     best_url   = None
     for stored_norm, url in norm_cache.items():
@@ -5492,11 +6119,124 @@ def _fuzzy_logo(name: str, threshold: float = 0.72) -> str | None:
         if score > best_score:
             best_score = score
             best_url   = url
-    if best_score >= threshold:
-        log.debug(f"Fuzzy logo match '{name}' → score={best_score:.2f}")
-        return best_url
+    result = best_url if best_score >= threshold else None
+    _fuzzy_logo_memo[name] = result
+    return result
 
-    return None
+
+_FUZZY_MEMO_PATH = str(DB_PATH.parent / "fuzzy_logo_memo.json")
+
+
+def _load_fuzzy_memo_from_disk():
+    """Load previously-computed fuzzy memo from disk into memory. Cheap, fast."""
+    try:
+        if os.path.exists(_FUZZY_MEMO_PATH):
+            with open(_FUZZY_MEMO_PATH, "r", encoding="utf-8") as f:
+                disk_memo = json.load(f)
+            _fuzzy_logo_memo.update(disk_memo)
+            log.info(f"Fuzzy logo memo loaded: {len(disk_memo)} entries from disk")
+    except Exception as e:
+        log.warning(f"Failed to load fuzzy memo from disk: {e}")
+
+
+def _prewarm_fuzzy_logos():
+    """
+    Run the heavy fuzzy resolution in a SEPARATE OS process (subprocess) so
+    it completely bypasses gevent's monkey-patching. The subprocess writes
+    the memo to disk; the running gunicorn workers reload it via SIGUSR1
+    or simply on the next boot.
+
+    This guarantees zero impact on request latency — the gunicorn workers
+    keep serving requests at full speed while the subprocess crunches.
+    """
+    import subprocess
+    script_path = os.path.abspath(__file__)
+    log.info("_prewarm_fuzzy_logos: spawning subprocess for fuzzy resolution...")
+    try:
+        # Use Popen so it's fully detached and doesn't block our caller.
+        proc = subprocess.Popen(
+            [sys.executable, script_path, "prewarm-logos"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+
+        def _drain_and_reload():
+            """Stream subprocess output to logs; reload memo when done."""
+            try:
+                if proc.stdout:
+                    for line in proc.stdout:
+                        log.info(f"[prewarm-subprocess] {line.decode().rstrip()}")
+                proc.wait()
+                log.info(f"_prewarm_fuzzy_logos: subprocess exited with code {proc.returncode}")
+                _load_fuzzy_memo_from_disk()
+            except Exception as e:
+                log.warning(f"_prewarm_fuzzy_logos: drain failed: {e}")
+
+        threading.Thread(target=_drain_and_reload, daemon=True).start()
+    except Exception as e:
+        log.error(f"_prewarm_fuzzy_logos: failed to spawn subprocess: {e}")
+
+
+def _run_prewarm_cli():
+    """
+    Standalone CLI entry: `python server.py prewarm-logos`.
+    Runs fuzzy resolution synchronously (no gevent here — pure CPython
+    process) and persists the memo to disk.
+    """
+    print(f"[prewarm-cli] starting")
+    _load_aliases()
+    _init_db()
+    _init_client()           # _load_logos uses _session
+    _load_logos()
+    if not _logos_cache:
+        print("[prewarm-cli] FATAL: logos cache empty"); return
+
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT home_team AS name FROM games "
+            "UNION SELECT DISTINCT away_team AS name FROM games"
+        ).fetchall()
+    names = sorted({r["name"] for r in rows if r["name"]})
+
+    # Load existing memo to skip already-resolved teams
+    if os.path.exists(_FUZZY_MEMO_PATH):
+        try:
+            with open(_FUZZY_MEMO_PATH, "r", encoding="utf-8") as f:
+                _fuzzy_logo_memo.update(json.load(f))
+            print(f"[prewarm-cli] loaded {len(_fuzzy_logo_memo)} existing entries")
+        except Exception as e:
+            print(f"[prewarm-cli] failed to load existing memo: {e}")
+
+    pending = [n for n in names if n not in _fuzzy_logo_memo]
+    print(f"[prewarm-cli] {len(pending)} new teams to resolve "
+          f"({len(names) - len(pending)} cached)")
+
+    t0 = time.time()
+    resolved = 0
+    for i, name in enumerate(pending):
+        url = _fuzzy_logo(name)
+        if url:
+            resolved += 1
+        if (i + 1) % 50 == 0:
+            print(f"[prewarm-cli] progress: {i+1}/{len(pending)} "
+                  f"({(time.time()-t0):.1f}s elapsed)")
+
+    try:
+        with open(_FUZZY_MEMO_PATH, "w", encoding="utf-8") as f:
+            json.dump(_fuzzy_logo_memo, f, ensure_ascii=False)
+        print(f"[prewarm-cli] persisted {len(_fuzzy_logo_memo)} entries → {_FUZZY_MEMO_PATH}")
+    except Exception as e:
+        print(f"[prewarm-cli] FATAL persist failed: {e}")
+
+    print(f"[prewarm-cli] done in {time.time()-t0:.1f}s — {resolved}/{len(pending)} resolved")
+
+
+@app.route("/api/admin/prewarm-logos", methods=["POST", "GET"])
+def r_prewarm_logos():
+    """Manually trigger the fuzzy logo prewarm (also runs automatically on boot)."""
+    threading.Thread(target=_prewarm_fuzzy_logos, daemon=True).start()
+    return jsonify({"ok": True, "message": "Prewarm started in background — check logs"})
 
 
 @app.route("/api/team_logos")
@@ -5551,85 +6291,197 @@ def _slug(text: str) -> str:
     return text.strip("-")
 
 
-@app.route("/sitemap.xml")
-def r_sitemap():
+@app.route("/robots.txt")
+def r_robots():
+    """robots.txt — points crawlers to the sitemap index, blocks API/admin paths."""
+    body = (
+        "User-agent: *\n"
+        "Disallow: /api/\n"
+        "Disallow: /admin/\n"
+        "Disallow: /telegram/\n"
+        "Disallow: /prerender\n"
+        "Disallow: /proxy/\n"
+        "Allow: /\n"
+        "\n"
+        f"Sitemap: {SITE_URL}/sitemap.xml\n"
+    )
+    return Response(body, mimetype="text/plain", headers={"Cache-Control": "public, max-age=86400"})
+
+
+def _xml_url(loc: str, lastmod: str, changefreq: str, priority: str) -> str:
+    return (
+        f"  <url>\n"
+        f"    <loc>{loc}</loc>\n"
+        f"    <lastmod>{lastmod}</lastmod>\n"
+        f"    <changefreq>{changefreq}</changefreq>\n"
+        f"    <priority>{priority}</priority>\n"
+        f"  </url>"
+    )
+
+
+def _xml_response(body: str, count: int) -> "Response":
+    return Response(
+        body,
+        mimetype="application/xml",
+        headers={
+            "Cache-Control": "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls": str(count),
+        },
+    )
+
+
+def _sm_urls_pages() -> list[str]:
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    pages = [
+        (SITE_URL + "/",                     today, "daily",   "1.0"),
+        (SITE_URL + "/today",                today, "always",  "0.95"),
+        (SITE_URL + "/tomorrow",             today, "daily",   "0.9"),
+        (SITE_URL + "/history",              today, "daily",   "0.8"),
+        (SITE_URL + "/blog",                 today, "weekly",  "0.7"),
+        (SITE_URL + "/about",                today, "monthly", "0.5"),
+        (SITE_URL + "/responsible-gambling", today, "yearly",  "0.3"),
+        (SITE_URL + "/terms",                today, "yearly",  "0.3"),
+        (SITE_URL + "/privacy",              today, "yearly",  "0.3"),
+    ]
+    for slug in _TIP_MARKET_LABELS.keys():
+        pages.append((f"{SITE_URL}/tips/{slug}", today, "daily", "0.7"))
+    return [_xml_url(*p) for p in pages]
+
+
+def _sm_urls_teams() -> list[str]:
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not _slug_index_cache["teams"]:
+        _refresh_slug_index()
+    urls: list[str] = []
+    try:
+        with _db() as conn:
+            for slug, name in _slug_index_cache["teams"].items():
+                row = conn.execute("""
+                    SELECT MAX(t.wall_ts) AS last_ts
+                    FROM tips t JOIN games g ON g.id = t.match_id
+                    WHERE g.home_team = ? OR g.away_team = ?
+                """, (name, name)).fetchone()
+                last_ts = row["last_ts"] if row and row["last_ts"] else None
+                lastmod = (datetime.fromtimestamp(last_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                           if last_ts else today)
+                urls.append(_xml_url(f"{SITE_URL}/team/{slug}", lastmod, "weekly", "0.6"))
+    except Exception as e:
+        log.warning(f"sitemap-teams: {e}")
+    return urls
+
+
+def _sm_urls_leagues() -> list[str]:
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not _slug_index_cache["leagues"]:
+        _refresh_slug_index()
+    urls: list[str] = []
+    try:
+        with _db() as conn:
+            for slug, name in _slug_index_cache["leagues"].items():
+                variants = _league_variants_for(name)
+                placeholders = ",".join("?" * len(variants))
+                row = conn.execute(f"""
+                    SELECT MAX(t.wall_ts) AS last_ts
+                    FROM tips t JOIN games g ON g.id = t.match_id
+                    WHERE g.tournament IN ({placeholders})
+                """, tuple(variants)).fetchone()
+                last_ts = row["last_ts"] if row and row["last_ts"] else None
+                lastmod = (datetime.fromtimestamp(last_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                           if last_ts else today)
+                urls.append(_xml_url(f"{SITE_URL}/league/{slug}", lastmod, "daily", "0.7"))
+    except Exception as e:
+        log.warning(f"sitemap-leagues: {e}")
+    return urls
+
+
+def _sm_urls_matches() -> list[str]:
     """
-    Dynamic XML sitemap for webpronos.com.
-    Includes ONLY accessible pages:
-      - Homepage
-      - Live matches (in progress right now)
-      - Scheduled matches (not yet started, start_ts in the next 48h)
-    Finished matches are excluded — their pages are no longer accessible.
+    Includes:
+      - Live matches in progress
+      - Scheduled matches in the next 30 days (added ~48h before kickoff
+        once they land in the games table; sitemap regenerated hourly)
+      - Finished matches with ≥1 tip, but ONLY within the last 30 days
+        (after that they drop out of the sitemap to free crawl budget;
+        the URLs themselves keep working — only sitemap inclusion expires)
     """
     from datetime import datetime, timezone
-
     now = datetime.now(timezone.utc)
     now_ts = int(now.timestamp())
-    next_48h = now_ts + 48 * 3600
+    next_30d = now_ts + 30 * 86400
+    last_7d  = now_ts - 7 * 86400
 
-    # ── 1. Live games from _live_state ─────────────────────────────────────────
-    live_ids: dict[int, dict] = {}
+    urls: list[str] = []
+    seen: set[int] = set()
+
+    # 1. Live games
     try:
         with _state_lock:
             for entry in _live_state.values():
                 m = entry.get("match", {})
                 mid = m.get("id")
                 if mid and m.get("statusType") == "inprogress":
-                    live_ids[mid] = m
+                    slug_part = f"{_slug(m.get('homeTeam', 'home'))}-{_slug(m.get('awayTeam', 'away'))}"
+                    urls.append(_xml_url(
+                        f"{SITE_URL}/match/{mid}/{slug_part}",
+                        now.strftime("%Y-%m-%d"), "always", "0.95"))
+                    seen.add(mid)
     except Exception:
         pass
 
-    # ── 2. Scheduled matches from DB (not yet started, within next 48h) ────────
+    # 2. Scheduled (next 30d) + finished-with-picks
     try:
         with _db() as conn:
-            scheduled_rows = conn.execute(
-                """
+            scheduled = conn.execute("""
                 SELECT id, home_team, away_team, start_ts
                 FROM games
-                WHERE is_finished = 0
-                  AND start_ts > ?
-                  AND start_ts <= ?
+                WHERE is_finished = 0 AND start_ts > ? AND start_ts <= ?
                 ORDER BY start_ts ASC
-                LIMIT 200
-                """,
-                (now_ts, next_48h)
-            ).fetchall()
-    except Exception:
-        scheduled_rows = []
+                LIMIT 5000
+            """, (now_ts, next_30d)).fetchall()
+            for r in scheduled:
+                if r["id"] in seen:
+                    continue
+                slug_part = f"{_slug(r['home_team'])}-{_slug(r['away_team'])}"
+                urls.append(_xml_url(
+                    f"{SITE_URL}/match/{r['id']}/{slug_part}",
+                    now.strftime("%Y-%m-%d"), "daily", "0.8"))
+                seen.add(r["id"])
 
-    # ── 3. Build match URL list ────────────────────────────────────────────────
-    match_urls: list[tuple] = []
+            finished = conn.execute("""
+                SELECT g.id, g.home_team, g.away_team, MAX(t.wall_ts) AS last_ts
+                FROM games g JOIN tips t ON t.match_id = g.id
+                WHERE g.is_finished = 1 AND g.start_ts >= ?
+                GROUP BY g.id
+                ORDER BY last_ts DESC
+                LIMIT 10000
+            """, (last_7d,)).fetchall()
+            for r in finished:
+                if r["id"] in seen:
+                    continue
+                slug_part = f"{_slug(r['home_team'])}-{_slug(r['away_team'])}"
+                lastmod = (datetime.fromtimestamp(r["last_ts"], tz=timezone.utc).strftime("%Y-%m-%d")
+                           if r["last_ts"] else now.strftime("%Y-%m-%d"))
+                urls.append(_xml_url(
+                    f"{SITE_URL}/match/{r['id']}/{slug_part}",
+                    lastmod, "monthly", "0.5"))
+                seen.add(r["id"])
+    except Exception as e:
+        log.warning(f"sitemap-matches: {e}")
+    return urls
 
-    # Live games (highest priority)
-    for mid, m in live_ids.items():
-        slug_part = f"{_slug(m.get('homeTeam', 'home'))}-{_slug(m.get('awayTeam', 'away'))}"
-        match_urls.append((
-            f"{SITE_URL}/match/{mid}/{slug_part}",
-            now.strftime("%Y-%m-%d"),
-            "always",
-            "0.9",
-        ))
 
-    # Scheduled games
-    seen_live = set(live_ids.keys())
-    for r in scheduled_rows:
-        if r["id"] in seen_live:
-            continue
-        slug_part = f"{_slug(r['home_team'])}-{_slug(r['away_team'])}"
-        match_urls.append((
-            f"{SITE_URL}/match/{r['id']}/{slug_part}",
-            now.strftime("%Y-%m-%d"),
-            "daily",
-            "0.7",
-        ))
-
-    # ── 3. Fetch blog posts from Supabase ──────────────────────────────────────
-    blog_urls: list[tuple] = []
+def _sm_urls_blog() -> list[str]:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    urls: list[str] = []
     try:
         import urllib.request as _ur
         supa_url = (
             f"{SUPABASE_URL}/rest/v1/blog_posts"
-            f"?select=slug,published_at&order=published_at.desc&limit=100"
+            f"?select=slug,published_at&order=published_at.desc&limit=500"
         )
         req = _ur.Request(supa_url, headers={
             "apikey":        SUPABASE_ANON,
@@ -5641,55 +6493,71 @@ def r_sitemap():
             slug = post.get("slug", "")
             pub  = (post.get("published_at") or now.isoformat())[:10]
             if slug:
-                blog_urls.append((
-                    f"{SITE_URL}/blog/{slug}",
-                    pub,
-                    "monthly",
-                    "0.7",
-                ))
-    except Exception as _be:
-        log.debug(f"[sitemap] Supabase blog fetch failed: {_be}")
+                urls.append(_xml_url(f"{SITE_URL}/blog/{slug}", pub, "monthly", "0.6"))
+    except Exception as e:
+        log.debug(f"sitemap-blog Supabase fetch failed: {e}")
+    return urls
 
-    # ── 4. Build XML ───────────────────────────────────────────────────────────
-    static_pages = [
-        (SITE_URL + "/",                     now.strftime("%Y-%m-%d"), "daily",   "1.0"),
-        (SITE_URL + "/tomorrow",             now.strftime("%Y-%m-%d"), "daily",   "0.9"),
-        (SITE_URL + "/history",              now.strftime("%Y-%m-%d"), "daily",   "0.8"),
-        (SITE_URL + "/blog",                 now.strftime("%Y-%m-%d"), "weekly",  "0.8"),
-        (SITE_URL + "/about",                now.strftime("%Y-%m-%d"), "monthly", "0.5"),
-        (SITE_URL + "/responsible-gambling", now.strftime("%Y-%m-%d"), "yearly",  "0.3"),
-        (SITE_URL + "/terms",                now.strftime("%Y-%m-%d"), "yearly",  "0.3"),
-        (SITE_URL + "/privacy",              now.strftime("%Y-%m-%d"), "yearly",  "0.3"),
-    ]
 
-    def url_block(loc, lastmod, changefreq, priority):
-        return (
-            f"  <url>\n"
-            f"    <loc>{loc}</loc>\n"
-            f"    <lastmod>{lastmod}</lastmod>\n"
-            f"    <changefreq>{changefreq}</changefreq>\n"
-            f"    <priority>{priority}</priority>\n"
-            f"  </url>"
-        )
-
-    all_urls = static_pages + blog_urls + match_urls
-    url_blocks = "\n".join(url_block(*u) for u in all_urls)
-
-    xml = (
+def _sm_envelope(urls: list[str]) -> str:
+    return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-        f"{url_blocks}\n"
-        "</urlset>"
+        + "\n".join(urls) + "\n"
+        '</urlset>'
     )
 
-    return Response(
-        xml,
-        mimetype="application/xml",
-        headers={
-            "Cache-Control": "public, max-age=600, s-maxage=600",
-            "X-Sitemap-Urls": str(len(all_urls)),
-        },
+
+@app.route("/sitemap.xml")
+def r_sitemap():
+    """
+    Single flat sitemap with ALL URLs (~1000) — pages, leagues, teams,
+    matches, blog. Sitemap protocol allows up to 50k URLs / 50MB per file,
+    we are well below the limit. Flat instead of an index because the CDN
+    in front of webpronos.com only routes /sitemap.xml itself to Flask, so
+    sub-sitemap URLs would 404. This keeps everything reachable in one shot.
+    """
+    urls = (
+        _sm_urls_pages()
+        + _sm_urls_leagues()
+        + _sm_urls_teams()
+        + _sm_urls_matches()
+        + _sm_urls_blog()
     )
+    return _xml_response(_sm_envelope(urls), len(urls))
+
+
+# Sub-sitemap routes kept as direct Flask endpoints in case crawlers fetch
+# them or if a future CDN config exposes them. Each one calls the same
+# helper used by /sitemap.xml.
+@app.route("/sitemap-pages.xml")
+def r_sitemap_pages():
+    urls = _sm_urls_pages()
+    return _xml_response(_sm_envelope(urls), len(urls))
+
+
+@app.route("/sitemap-teams.xml")
+def r_sitemap_teams():
+    urls = _sm_urls_teams()
+    return _xml_response(_sm_envelope(urls), len(urls))
+
+
+@app.route("/sitemap-leagues.xml")
+def r_sitemap_leagues():
+    urls = _sm_urls_leagues()
+    return _xml_response(_sm_envelope(urls), len(urls))
+
+
+@app.route("/sitemap-matches.xml")
+def r_sitemap_matches():
+    urls = _sm_urls_matches()
+    return _xml_response(_sm_envelope(urls), len(urls))
+
+
+@app.route("/sitemap-blog.xml")
+def r_sitemap_blog():
+    urls = _sm_urls_blog()
+    return _xml_response(_sm_envelope(urls), len(urls))
 
 
 @app.route("/api/live/picks-stream")
@@ -6132,6 +7000,11 @@ def r_admin_debug_daily_summary():
 SUPABASE_URL  = os.environ.get("SUPABASE_URL", "https://lcugjwhcmtpdoernjgei.supabase.co")
 SUPABASE_ANON = os.environ.get("SUPABASE_ANON_KEY", "")
 SITE_URL      = os.environ.get("SITE_URL", "https://webpronos.com")
+# Public base URL of THIS Flask backend — used to build links to /api/*
+# routes that the Lovable frontend (different origin) consumes. The
+# Cloudflare Worker on webpronos.com doesn't proxy /api/* to Flask, so
+# we point straight at the fly.dev hostname.
+API_BASE_URL  = os.environ.get("API_BASE_URL", "https://livexgmodel-pt.fly.dev")
 SITE_NAME     = "WebPronos"
 
 # Cache the base Lovable HTML for 10 min to avoid hammering their CDN
@@ -6189,49 +7062,42 @@ def _build_meta_tags(match: dict, odds: dict | None, override: dict | None) -> d
     a_gls  = match.get("awayGoals", 0) or 0
 
     # Build title (English — primary language)
+    # SEO STABILITY RULE: title/description MUST stay identical from
+    # creation (48h pre-kickoff) through the end of the live game.
+    # Only `finished` status changes the meta — once the result is set,
+    # the title/description rewrite themselves with the final score and
+    # never change again. This protects Google's cached snippet.
     if override and override.get("meta_title"):
         title = override["meta_title"]
-    elif status == "inprogress":
-        title = f"{home} {h_gls}–{a_gls} {away} LIVE – xG Predictions | {SITE_NAME}"
     elif status == "finished":
-        title = f"{home} {h_gls}–{a_gls} {away} – Final xG Analysis | {SITE_NAME}"
+        title = f"{home} {h_gls}–{a_gls} {away} – Final Result & xG Analysis | {SITE_NAME}"
     else:
+        # Identical title for scheduled AND in-progress (no score, no "LIVE")
         if tourn:
-            title = f"{home} vs {away} ({tourn}) – Live xG Predictions | {SITE_NAME}"
+            title = f"{home} vs {away} ({tourn}) – Picks & xG Predictions | {SITE_NAME}"
         else:
-            title = f"{home} vs {away} – Live xG Predictions | {SITE_NAME}"
+            title = f"{home} vs {away} – Picks & xG Predictions | {SITE_NAME}"
 
     # Build description (English — primary language)
     if override and override.get("meta_description"):
         desc = override["meta_description"]
+    elif status == "finished":
+        desc = (
+            f"Full xG analysis for {home} {h_gls}–{a_gls} {away}. "
+            f"Expected Goals, win probabilities and value bets generated by the WebPronos algorithm."
+        )
     else:
-        if status == "inprogress":
-            desc = (
-                f"Follow {home} vs {away} live. "
-                f"Current score: {h_gls}–{a_gls}. xG probabilities and predictions updated every minute."
-            )
-        elif status == "finished":
-            desc = (
-                f"Full xG analysis for {home} {h_gls}–{a_gls} {away}. "
-                f"Expected Goals, win probabilities and value bets generated by the WebPronos algorithm."
-            )
-        else:
-            desc = (
-                f"Live xG predictions for {home} vs {away}"
-                + (f" – {tourn}" if tourn else "")
-                + f". Real-time probabilities, value bets and match analysis on {SITE_NAME}."
-            )
+        # Identical description for scheduled AND in-progress
+        desc = (
+            f"xG predictions and value bets for {home} vs {away}"
+            + (f" – {tourn}" if tourn else "")
+            + f". Picks, real-time probabilities and match analysis on {SITE_NAME}."
+        )
 
-    # Append live odds snippet if available
-    if odds and odds.get("h2h") and odds["h2h"].get("outcomes") and not (override and override.get("meta_description")):
-        try:
-            oc = {o["name"]: o["price"] for o in odds["h2h"]["outcomes"]}
-            h_price = next((v for k, v in oc.items() if home.split()[0].lower() in k.lower()), None)
-            a_price = next((v for k, v in oc.items() if away.split()[0].lower() in k.lower()), None)
-            if h_price and a_price:
-                desc += f" Odds: {home} @{h_price} | {away} @{a_price}."
-        except Exception:
-            pass
+    # NOTE: live odds are intentionally NOT appended to the description.
+    # Odds drift constantly and would change the meta on every crawl,
+    # defeating the SEO-stability rule above. Odds belong in the page
+    # body, not in <meta>.
 
     og_image = (override or {}).get("og_image") or "https://webpronos.com/og-default.png"
 
@@ -7235,22 +8101,540 @@ def _render_match_body(event: dict, odds: dict | None, match_id: int) -> str:
     return body
 
 
+# ── SEO renderers: team / league / tips-market / today ────────────────────
+
+# Common pretty-name lookup for tip markets
+# market slug → (display title, list of SQL LIKE patterns matched against tips.market)
+# Only markets we actually bet on. Goal totals collapsed into one bucket
+# because comparing by line (1.5, 2.5, 3.5) doesn't tell a coherent story.
+_TIP_MARKET_LABELS = {
+    "total-goals": ("Total Goals",        ["O/U%", "Over/Under%", "Goals%", "Total%"]),
+    "handicap":    ("Asian Handicap",     ["Handicap%", "AH%"]),
+    "1x2":         ("Match Winner (1X2)", ["1X2", "Match Winner%", "Match Result%"]),
+}
+
+
+def _render_team(slug: str) -> tuple:
+    """SSR for /team/{slug} — recent picks + stats for one team."""
+    cache_key = f"team:{slug}"
+    cached = _seo_cache_get(cache_key)
+    if cached:
+        return cached, 200, {"Content-Type": "text/html; charset=utf-8",
+                              "Cache-Control": "public, max-age=600",
+                              "X-Prerender": "webpronos-team"}
+
+    name = _team_by_slug(slug)
+    if not name:
+        # Trigger lazy refresh in case the bg loop hasn't run yet
+        _refresh_slug_index()
+        name = _team_by_slug(slug)
+    if not name:
+        return _render_passthrough(f"/team/{slug}"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    STAKE = get_setting("stake_per_bet", 100.0)
+    try:
+        with _db() as conn:
+            picks = conn.execute("""
+                SELECT t.match_id, t.market, t.label, t.odd_entry, t.result, t.wall_ts,
+                       g.home_team, g.away_team, g.home_goals, g.away_goals,
+                       g.tournament, g.country, g.start_ts, g.is_finished
+                FROM tips t
+                JOIN games g ON g.id = t.match_id
+                WHERE g.home_team = ? OR g.away_team = ?
+                ORDER BY t.wall_ts DESC
+                LIMIT 30
+            """, (name, name)).fetchall()
+
+        # Next fixture from in-memory cache (today + next 2 days)
+        next_fixture = _next_fixture_for_team(name)
+
+        # Stats
+        settled = [p for p in picks if p["result"] is not None]
+        wins  = sum(1 for p in settled if p["result"] in ("win", "green"))
+        losses = sum(1 for p in settled if p["result"] in ("loss", "red"))
+        total = len(settled)
+        winrate = (wins / total * 100) if total else 0
+        pnl = 0.0
+        for p in settled:
+            if p["result"] in ("win", "green") and p["odd_entry"]:
+                pnl += (p["odd_entry"] - 1) * STAKE
+            elif p["result"] in ("loss", "red"):
+                pnl -= STAKE
+
+        # Logo
+        logo_url = _quick_logo(name) or ""
+        logo_img = (f'<img src="{logo_url}" alt="{name} logo" '
+                    f'style="width:64px;height:64px;vertical-align:middle;margin-right:.75rem">'
+                    if logo_url else "")
+
+        # Picks table
+        rows_html = []
+        for p in picks[:20]:
+            from datetime import datetime as _dt, timezone as _tz
+            date_str = _dt.fromtimestamp(p["wall_ts"], tz=_tz.utc).strftime("%b %d")
+            opp_is_home = p["away_team"] == name
+            opponent = p["home_team"] if opp_is_home else p["away_team"]
+            score = (f'{p["home_goals"]}-{p["away_goals"]}'
+                     if p["home_goals"] is not None and p["is_finished"] else "—")
+            if p["result"] in ("win", "green"):
+                badge = '<span class="pr-win">✓ Won</span>'
+            elif p["result"] in ("loss", "red"):
+                badge = '<span class="pr-lose">✗ Lost</span>'
+            else:
+                badge = '<span class="pr-meta">Pending</span>'
+            rows_html.append(f"""
+              <tr>
+                <td class="pr-meta">{date_str}</td>
+                <td><a href="{SITE_URL}/match/{p['match_id']}" style="color:#fff">vs {opponent}</a></td>
+                <td class="pr-meta">{score}</td>
+                <td class="pr-meta">{p['market']} — {p['label']}</td>
+                <td class="pr-meta">@{(p['odd_entry'] or 0):.2f}</td>
+                <td>{badge}</td>
+              </tr>""")
+
+        # Next fixture block
+        if next_fixture:
+            from datetime import datetime as _dt, timezone as _tz
+            kickoff = _dt.fromtimestamp(next_fixture["kickoff_ts"], tz=_tz.utc).strftime("%b %d, %H:%M UTC")
+            next_html = f"""
+            <h2 class="pr-h2">Next fixture</h2>
+            <p><a href="{SITE_URL}/match/{next_fixture['match_id']}" style="color:#22d3ee">
+              {next_fixture['home_team']} vs {next_fixture['away_team']}
+            </a> — {next_fixture['tournament'] or ''} · {kickoff}</p>"""
+        else:
+            next_html = ""
+
+        body = f"""
+        <nav class="pr-nav">
+          <a href="{SITE_URL}/">WebPronos</a> › <a href="{SITE_URL}/teams" style="color:#22d3ee">Teams</a> › {name}
+        </nav>
+        <h1 class="pr-h1">{logo_img}{name}</h1>
+        <p class="pr-lead">All AI-generated football tips and historical picks for {name}, plus their next scheduled fixture.</p>
+
+        <div style="margin:1.5rem 0">
+          <span class="pr-stat">Settled picks: <strong>{total}</strong></span>
+          <span class="pr-stat">Wins / Losses: <strong>{wins} / {losses}</strong></span>
+          <span class="pr-stat">Win rate: <strong>{winrate:.1f}%</strong></span>
+          <span class="pr-stat">P&amp;L: <strong>{'+' if pnl > 0 else ''}{pnl:.0f}€</strong></span>
+        </div>
+
+        {next_html}
+
+        <h2 class="pr-h2">Last picks involving {name}</h2>
+        <table class="pr-table">
+          <thead><tr>
+            <th>Date</th><th>Match</th><th>Score</th><th>Pick</th><th>Odds</th><th>Result</th>
+          </tr></thead>
+          <tbody>
+            {''.join(rows_html) if rows_html else '<tr><td colspan="6" style="text-align:center;padding:2rem">No picks logged yet.</td></tr>'}
+          </tbody>
+        </table>
+
+        {_render_pr_footer()}
+        """
+
+        jsonld = json.dumps({
+            "@context": "https://schema.org",
+            "@type": "SportsTeam",
+            "name": name,
+            "sport": "Soccer",
+            "url": f"{SITE_URL}/team/{slug}",
+            "logo": logo_url or f"{SITE_URL}/og/default.png",
+        }, ensure_ascii=False)
+
+        html = _build_html_page(
+            title=f"{name} — AI Football Tips & Track Record | WebPronos",
+            description=f"Live and historical AI predictions for {name}. {total} settled picks, {winrate:.0f}% win rate. Next fixture and full audit trail.",
+            canonical=f"{SITE_URL}/team/{slug}",
+            body_html=body,
+            jsonld=jsonld,
+            og_image=logo_url or None,
+        )
+        _seo_cache_put(cache_key, html)
+        return html, 200, {"Content-Type": "text/html; charset=utf-8",
+                            "Cache-Control": "public, max-age=600",
+                            "X-Prerender": "webpronos-team"}
+    except Exception as e:
+        log.exception(f"[prerender/team] Error for slug={slug}: {e}")
+        return _render_passthrough(f"/team/{slug}"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+def _render_league(slug: str) -> tuple:
+    """SSR for /league/{slug} — upcoming fixtures + recent picks for one competition."""
+    cache_key = f"league:{slug}"
+    cached = _seo_cache_get(cache_key)
+    if cached:
+        return cached, 200, {"Content-Type": "text/html; charset=utf-8",
+                              "Cache-Control": "public, max-age=600",
+                              "X-Prerender": "webpronos-league"}
+
+    name = _league_by_slug(slug)
+    if not name:
+        _refresh_slug_index()
+        name = _league_by_slug(slug)
+    if not name:
+        return _render_passthrough(f"/league/{slug}"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    try:
+        variants = _league_variants_for(name)
+        placeholders = ",".join("?" * len(variants))
+        with _db() as conn:
+            recent_picks = conn.execute(f"""
+                SELECT t.match_id, t.market, t.label, t.odd_entry, t.result, t.wall_ts,
+                       g.home_team, g.away_team, g.home_goals, g.away_goals
+                FROM tips t
+                JOIN games g ON g.id = t.match_id
+                WHERE g.tournament IN ({placeholders})
+                ORDER BY t.wall_ts DESC
+                LIMIT 25
+            """, tuple(variants)).fetchall()
+            country_row = conn.execute(
+                f"SELECT country FROM games WHERE tournament IN ({placeholders}) "
+                f"AND country IS NOT NULL LIMIT 1",
+                tuple(variants)
+            ).fetchone()
+        country = country_row["country"] if country_row else ""
+
+        # Upcoming fixtures from in-memory cache (today + next 2 days)
+        upcoming = _upcoming_for_league(name, limit=20)
+        from datetime import datetime as _dt, timezone as _tz
+        fixt_rows = []
+        for r in upcoming:
+            ko = _dt.fromtimestamp(r["kickoff_ts"], tz=_tz.utc).strftime("%b %d, %H:%M UTC")
+            fixt_rows.append(f"""
+              <tr>
+                <td class="pr-meta">{ko}</td>
+                <td><a href="{SITE_URL}/match/{r['match_id']}" style="color:#fff">{r['home_team']} vs {r['away_team']}</a></td>
+              </tr>""")
+
+        # Recent picks table
+        pick_rows = []
+        for p in recent_picks:
+            date_str = _dt.fromtimestamp(p["wall_ts"], tz=_tz.utc).strftime("%b %d")
+            score = (f'{p["home_goals"]}-{p["away_goals"]}'
+                     if p["home_goals"] is not None else "—")
+            if p["result"] in ("win", "green"):
+                badge = '<span class="pr-win">✓ Won</span>'
+            elif p["result"] in ("loss", "red"):
+                badge = '<span class="pr-lose">✗ Lost</span>'
+            else:
+                badge = '<span class="pr-meta">Pending</span>'
+            match = f"{p['home_team']} vs {p['away_team']}"
+            pick_rows.append(f"""
+              <tr>
+                <td class="pr-meta">{date_str}</td>
+                <td><a href="{SITE_URL}/match/{p['match_id']}" style="color:#fff">{match}</a></td>
+                <td class="pr-meta">{score}</td>
+                <td class="pr-meta">{p['market']} — {p['label']}</td>
+                <td class="pr-meta">@{(p['odd_entry'] or 0):.2f}</td>
+                <td>{badge}</td>
+              </tr>""")
+
+        logo_url = _league_logo(name) or ""
+        logo_img = (f'<img src="{logo_url}" alt="{name} logo" '
+                    f'style="width:64px;height:64px;vertical-align:middle;margin-right:.75rem">'
+                    if logo_url else "")
+        body = f"""
+        <nav class="pr-nav">
+          <a href="{SITE_URL}/">WebPronos</a> › <a href="{SITE_URL}/leagues" style="color:#22d3ee">Leagues</a> › {name}
+        </nav>
+        <h1 class="pr-h1">{logo_img}{name}</h1>
+        <p class="pr-lead">AI-driven live and pre-match football tips for {name}{f" ({country})" if country else ""}. Upcoming fixtures and the latest recorded picks below.</p>
+
+        <h2 class="pr-h2">Upcoming fixtures</h2>
+        <table class="pr-table">
+          <thead><tr><th>Kickoff</th><th>Match</th></tr></thead>
+          <tbody>
+            {''.join(fixt_rows) if fixt_rows else '<tr><td colspan="2" style="text-align:center;padding:2rem">No upcoming fixtures.</td></tr>'}
+          </tbody>
+        </table>
+
+        <h2 class="pr-h2">Recent picks in {name}</h2>
+        <table class="pr-table">
+          <thead><tr>
+            <th>Date</th><th>Match</th><th>Score</th><th>Pick</th><th>Odds</th><th>Result</th>
+          </tr></thead>
+          <tbody>
+            {''.join(pick_rows) if pick_rows else '<tr><td colspan="6" style="text-align:center;padding:2rem">No picks logged yet for this league.</td></tr>'}
+          </tbody>
+        </table>
+
+        {_render_pr_footer()}
+        """
+
+        jsonld = json.dumps({
+            "@context": "https://schema.org",
+            "@type": "SportsLeague",
+            "name": name,
+            "sport": "Soccer",
+            "url": f"{SITE_URL}/league/{slug}",
+            **({"location": {"@type": "Country", "name": country}} if country else {}),
+        }, ensure_ascii=False)
+
+        html = _build_html_page(
+            title=f"{name} — Live Football Tips & Predictions | WebPronos",
+            description=f"AI-generated tips and predictions for {name}. {len(upcoming)} upcoming fixtures and {len(recent_picks)} recent picks with full results.",
+            canonical=f"{SITE_URL}/league/{slug}",
+            body_html=body,
+            jsonld=jsonld,
+        )
+        _seo_cache_put(cache_key, html)
+        return html, 200, {"Content-Type": "text/html; charset=utf-8",
+                            "Cache-Control": "public, max-age=600",
+                            "X-Prerender": "webpronos-league"}
+    except Exception as e:
+        log.exception(f"[prerender/league] Error for slug={slug}: {e}")
+        return _render_passthrough(f"/league/{slug}"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+def _render_tips_market(market_slug: str) -> tuple:
+    """SSR for /tips/{market} — last picks of one market type."""
+    cache_key = f"tips:{market_slug}"
+    cached = _seo_cache_get(cache_key)
+    if cached:
+        return cached, 200, {"Content-Type": "text/html; charset=utf-8",
+                              "Cache-Control": "public, max-age=600",
+                              "X-Prerender": "webpronos-tips-market"}
+
+    market_info = _TIP_MARKET_LABELS.get(market_slug)
+    if not market_info:
+        return _render_passthrough(f"/tips/{market_slug}"), 200, {"Content-Type": "text/html; charset=utf-8"}
+    pretty_name, like_patterns = market_info
+
+    STAKE = get_setting("stake_per_bet", 100.0)
+    try:
+        # Match by tips.market against any of the configured LIKE patterns
+        where_clause = " OR ".join("t.market LIKE ?" for _ in like_patterns)
+        with _db() as conn:
+            rows = conn.execute(f"""
+                SELECT t.match_id, t.market, t.label, t.odd_entry, t.result, t.wall_ts,
+                       g.home_team, g.away_team, g.home_goals, g.away_goals,
+                       g.tournament
+                FROM tips t
+                JOIN games g ON g.id = t.match_id
+                WHERE {where_clause}
+                ORDER BY t.wall_ts DESC
+                LIMIT 30
+            """, tuple(like_patterns)).fetchall()
+
+        wins = sum(1 for r in rows if r["result"] in ("win", "green"))
+        losses = sum(1 for r in rows if r["result"] in ("loss", "red"))
+        total_settled = wins + losses
+        winrate = (wins / total_settled * 100) if total_settled else 0
+        pnl = 0.0
+        for r in rows:
+            if r["result"] in ("win", "green") and r["odd_entry"]:
+                pnl += (r["odd_entry"] - 1) * STAKE
+            elif r["result"] in ("loss", "red"):
+                pnl -= STAKE
+
+        from datetime import datetime as _dt, timezone as _tz
+        pick_rows = []
+        for r in rows:
+            date_str = _dt.fromtimestamp(r["wall_ts"], tz=_tz.utc).strftime("%b %d")
+            score = (f'{r["home_goals"]}-{r["away_goals"]}'
+                     if r["home_goals"] is not None else "—")
+            if r["result"] in ("win", "green"):
+                badge = '<span class="pr-win">✓ Won</span>'
+            elif r["result"] in ("loss", "red"):
+                badge = '<span class="pr-lose">✗ Lost</span>'
+            else:
+                badge = '<span class="pr-meta">Pending</span>'
+            match = f"{r['home_team']} vs {r['away_team']}"
+            pick_rows.append(f"""
+              <tr>
+                <td class="pr-meta">{date_str}</td>
+                <td class="pr-meta">{r['tournament'] or '—'}</td>
+                <td><a href="{SITE_URL}/match/{r['match_id']}" style="color:#fff">{match}</a></td>
+                <td class="pr-meta">{score}</td>
+                <td class="pr-meta">{r['label']}</td>
+                <td class="pr-meta">@{(r['odd_entry'] or 0):.2f}</td>
+                <td>{badge}</td>
+              </tr>""")
+
+        body = f"""
+        <nav class="pr-nav">
+          <a href="{SITE_URL}/">WebPronos</a> › Tips › {pretty_name}
+        </nav>
+        <h1 class="pr-h1">{pretty_name} — Live Football Tips</h1>
+        <p class="pr-lead">All AI-detected {pretty_name} bets logged by the WebPronos live model. Each pick includes entry odds, result and running track record.</p>
+
+        <div style="margin:1.5rem 0">
+          <span class="pr-stat">Settled: <strong>{total_settled}</strong></span>
+          <span class="pr-stat">Win rate: <strong>{winrate:.1f}%</strong></span>
+          <span class="pr-stat">P&amp;L: <strong>{'+' if pnl > 0 else ''}{pnl:.0f}€</strong></span>
+        </div>
+
+        <h2 class="pr-h2">Latest {pretty_name} picks</h2>
+        <table class="pr-table">
+          <thead><tr>
+            <th>Date</th><th>League</th><th>Match</th><th>Score</th><th>Pick</th><th>Odds</th><th>Result</th>
+          </tr></thead>
+          <tbody>
+            {''.join(pick_rows) if pick_rows else '<tr><td colspan="7" style="text-align:center;padding:2rem">No picks logged yet for this market.</td></tr>'}
+          </tbody>
+        </table>
+
+        {_render_pr_footer()}
+        """
+
+        jsonld = json.dumps({
+            "@context": "https://schema.org",
+            "@type": "CollectionPage",
+            "name": f"{pretty_name} football tips — WebPronos",
+            "url": f"{SITE_URL}/tips/{market_slug}",
+            "about": pretty_name,
+        }, ensure_ascii=False)
+
+        html = _build_html_page(
+            title=f"{pretty_name} Tips — Live AI Predictions | WebPronos",
+            description=f"All {pretty_name} football tips logged by the WebPronos AI model with entry odds, results and ROI. {total_settled} settled picks tracked.",
+            canonical=f"{SITE_URL}/tips/{market_slug}",
+            body_html=body,
+            jsonld=jsonld,
+        )
+        _seo_cache_put(cache_key, html)
+        return html, 200, {"Content-Type": "text/html; charset=utf-8",
+                            "Cache-Control": "public, max-age=600",
+                            "X-Prerender": "webpronos-tips-market"}
+    except Exception as e:
+        log.exception(f"[prerender/tips-market] Error for {market_slug}: {e}")
+        return _render_passthrough(f"/tips/{market_slug}"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+def _render_today() -> str:
+    """SSR for /today — today's monitored fixtures."""
+    cache_key = "page:today"
+    cached = _seo_cache_get(cache_key)
+    if cached:
+        return cached
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        date_str = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+        cached_day = _upcoming_cache.get(date_str)
+        matches = cached_day["matches"] if cached_day else []
+
+        rows = []
+        for m in matches:
+            ko_ts = m.get("startTimestamp") or 0
+            ko = _dt.fromtimestamp(ko_ts, tz=_tz.utc).strftime("%H:%M UTC") if ko_ts else "—"
+            rows.append(f"""
+              <tr>
+                <td class="pr-meta">{ko}</td>
+                <td class="pr-meta">{m.get('tournament','')}</td>
+                <td><a href="{SITE_URL}/match/{m['id']}" style="color:#fff">{m['homeTeam']} vs {m['awayTeam']}</a></td>
+              </tr>""")
+
+        body = f"""
+        <nav class="pr-nav">
+          <a href="{SITE_URL}/">WebPronos</a> › Today
+        </nav>
+        <h1 class="pr-h1">Today's Football Matches — Live AI Tips</h1>
+        <p class="pr-lead">Every monitored match scheduled for today. Click any fixture to follow the live xG model and AI tips in real time.</p>
+
+        <table class="pr-table">
+          <thead><tr><th>Kickoff</th><th>League</th><th>Match</th></tr></thead>
+          <tbody>
+            {''.join(rows) if rows else '<tr><td colspan="3" style="text-align:center;padding:2rem">No monitored matches today.</td></tr>'}
+          </tbody>
+        </table>
+
+        {_render_pr_footer()}
+        """
+
+        jsonld = json.dumps({
+            "@context": "https://schema.org",
+            "@type": "ItemList",
+            "name": f"Football matches today — {date_str}",
+            "numberOfItems": len(matches),
+            "itemListElement": [{
+                "@type": "ListItem",
+                "position": i + 1,
+                "url": f"{SITE_URL}/match/{m['id']}",
+                "name": f"{m['homeTeam']} vs {m['awayTeam']}",
+            } for i, m in enumerate(matches[:50])],
+        }, ensure_ascii=False)
+
+        html = _build_html_page(
+            title=f"Today's Football Tips & Live Predictions | WebPronos",
+            description=f"All {len(matches)} monitored football matches scheduled for today with live AI tips, xG model and value detection.",
+            canonical=f"{SITE_URL}/today",
+            body_html=body,
+            jsonld=jsonld,
+        )
+        _seo_cache_put(cache_key, html)
+        return html
+    except Exception as e:
+        log.exception(f"[prerender/today] Error: {e}")
+        return _build_html_page(
+            title="Today's Football Tips | WebPronos",
+            description="Today's monitored football matches with live AI tips.",
+            canonical=f"{SITE_URL}/today",
+            body_html=f'<h1>Today</h1><p>Loading…</p>{_render_pr_footer()}',
+        )
+
+
 # ── Homepage ──────────────────────────────────────────────────────────────
 def _render_homepage() -> str:
-    """SSR for / — the homepage already has good SSR via Lovable; we pass-through but
-    re-inject canonical meta to be safe."""
-    try:
-        # Just return the Lovable shell as-is — it already SSRs well
-        base_html = _get_base_html()
-        if base_html:
-            return base_html
-    except Exception:
-        pass
+    """SSR for / — builds a semantically correct homepage with exactly ONE H1."""
+    body_html = f"""
+<section style="max-width:800px;margin:0 auto;padding:2rem 1rem">
+  <h1 style="font-size:2.2rem;font-weight:900;color:#fff;line-height:1.2;margin:0 0 .75rem">
+    Live Football Tips &amp; In-Play Predictions — Updated Every 15 Seconds
+  </h1>
+  <p style="color:#94a3b8;font-size:1.1rem;margin:0 0 2rem">
+    AI-powered football picks across 25+ competitions. Our algorithm tracks xG, momentum shifts
+    and live odds to fire tips during the match — not before it.
+  </p>
+  <a href="/history" style="display:inline-block;background:#22d3ee;color:#0f172a;font-weight:700;padding:.75rem 1.5rem;border-radius:.5rem;text-decoration:none;margin-bottom:2rem;transition:background 200ms">
+    View Historical Results →
+  </a>
+
+  <h2 style="font-size:1.4rem;font-weight:700;color:#e2e8f0;margin:2rem 0 .5rem">
+    How it works
+  </h2>
+  <p style="color:#94a3b8;margin:0 0 1rem">
+    Every match in our database is monitored minute-by-minute. When xG diverges from the
+    scoreline and live odds offer value, the algorithm fires a pick — visible instantly on
+    the live dashboard.
+  </p>
+
+  <h2 style="font-size:1.4rem;font-weight:700;color:#e2e8f0;margin:2rem 0 .5rem">
+    Why in-play betting?
+  </h2>
+  <p style="color:#94a3b8;margin:0 0 1rem">
+    Pre-match odds are heavily efficient. In-play markets move fast and are often mis-priced
+    for 2–3 minutes after a key event — that's the window our model exploits.
+  </p>
+
+  <h2 style="font-size:1.4rem;font-weight:700;color:#e2e8f0;margin:2rem 0 .5rem">
+    Track record
+  </h2>
+  <p style="color:#94a3b8;margin:0 0 2rem">
+    All picks are logged with entry time, odds and result. Check the
+    <a href="/history" style="color:#22d3ee;text-decoration:none">historical performance page</a>
+    for full transparency.
+  </p>
+</section>
+{_render_pr_footer()}"""
+
     return _build_html_page(
-        title="WebPronos — Live Football Predictions Updated in Real Time",
-        description="AI-powered football tips across 25 competitions, updated every minute during play.",
+        title="WebPronos — Live Football Tips & In-Play Predictions",
+        description="AI-powered in-play football tips updated every 15 seconds. xG-based picks across 25+ competitions with full track record.",
         canonical=f"{SITE_URL}/",
-        body_html=f"<h1>WebPronos</h1><p>Live football predictions powered by AI.</p>{_render_pr_footer()}",
+        body_html=body_html,
+        jsonld=json.dumps({
+            "@context": "https://schema.org",
+            "@type": "WebSite",
+            "name": "WebPronos",
+            "url": SITE_URL,
+            "description": "Live football tips and in-play predictions powered by xG analytics.",
+            "potentialAction": {
+                "@type": "SearchAction",
+                "target": f"{SITE_URL}/history",
+                "query-input": "required name=search_term_string"
+            }
+        }, ensure_ascii=False),
     )
 
 
@@ -7269,6 +8653,341 @@ def _render_passthrough(canonical_path: str = "/") -> str:
 
 
 # ── Unified dispatcher ────────────────────────────────────────────────────
+# ───────────────────── SEO JSON endpoints ──────────────────────
+# These endpoints expose the same data the prerender HTML pages use,
+# but as raw JSON so the Lovable frontend can render React equivalents
+# at /team/{slug}, /league/{slug}, /tips/{market}, /today. Real users
+# coming from Google search results land on the React page, which calls
+# these endpoints. Bots still get the prerender HTML (no JS dependency).
+
+def _format_pick_row(row, *, perspective_team: str | None = None) -> dict:
+    """Normalize a tips+games joined row into the shape Lovable expects."""
+    home = row["home_team"]
+    away = row["away_team"]
+    is_finished = bool(row["is_finished"]) if "is_finished" in row.keys() else (row["home_goals"] is not None)
+    score = (f'{row["home_goals"]}-{row["away_goals"]}'
+             if row["home_goals"] is not None and is_finished else None)
+
+    # Result normalization: "win"/"green" → "win", "loss"/"red" → "loss"
+    raw_result = row["result"]
+    if raw_result in ("win", "green"):
+        result = "win"
+    elif raw_result in ("loss", "red"):
+        result = "loss"
+    else:
+        result = None
+
+    out = {
+        "match_id":   row["match_id"],
+        "wall_ts":    row["wall_ts"],
+        "home_team":  home,
+        "away_team":  away,
+        "score":      score,
+        "is_finished": is_finished,
+        "market":     row["market"],
+        "label":      row["label"],
+        "odds":       row["odd_entry"],
+        "result":     result,
+    }
+    if "tournament" in row.keys() and row["tournament"]:
+        out["tournament"] = row["tournament"]
+    if perspective_team:
+        out["opponent"] = away if perspective_team == home else home
+        out["is_home"]  = (perspective_team == home)
+    return out
+
+
+def _calc_stats(picks: list[dict]) -> dict:
+    """Standard stats block: settled count, wins, losses, win rate, P&L."""
+    STAKE = get_setting("stake_per_bet", 100.0)
+    settled = [p for p in picks if p["result"] in ("win", "loss")]
+    wins   = sum(1 for p in settled if p["result"] == "win")
+    losses = sum(1 for p in settled if p["result"] == "loss")
+    pnl    = 0.0
+    for p in settled:
+        if p["result"] == "win" and p["odds"]:
+            pnl += (p["odds"] - 1) * STAKE
+        elif p["result"] == "loss":
+            pnl -= STAKE
+    return {
+        "settled":  len(settled),
+        "wins":     wins,
+        "losses":   losses,
+        "win_rate": (wins / len(settled) * 100) if settled else 0.0,
+        "pnl":      round(pnl, 2),
+    }
+
+
+@app.route("/api/seo/team/<slug>")
+def r_seo_team(slug: str):
+    name = _team_by_slug(slug)
+    if not name:
+        _refresh_slug_index()
+        name = _team_by_slug(slug)
+    if not name:
+        return jsonify({"error": "team_not_found", "slug": slug}), 404
+    cache_key = f"jsonteam:{slug}"
+    cached_body = _seo_cache_get(cache_key)
+    if cached_body:
+        return cached_body, 200, {"Content-Type": "application/json",
+                                   "Cache-Control": "public, max-age=300"}
+    try:
+        with _db() as conn:
+            picks_rows = conn.execute("""
+                SELECT t.match_id, t.market, t.label, t.odd_entry, t.result, t.wall_ts,
+                       g.home_team, g.away_team, g.home_goals, g.away_goals,
+                       g.tournament, g.country, g.start_ts, g.is_finished
+                FROM tips t
+                JOIN games g ON g.id = t.match_id
+                WHERE g.home_team = ? OR g.away_team = ?
+                ORDER BY t.wall_ts DESC
+                LIMIT 30
+            """, (name, name)).fetchall()
+        # Same reasoning as league: next fixture comes from the live cache, not
+        # the local `games` table.
+        next_fix = _next_fixture_for_team(name)
+
+        picks = [_format_pick_row(r, perspective_team=name) for r in picks_rows]
+        payload = {
+            "team_name":    name,
+            "slug":         slug,
+            "logo_url":     _quick_logo(name) or None,
+            "stats":        _calc_stats(picks),
+            "next_fixture": next_fix,
+            "picks":        picks,
+        }
+        body = json.dumps(payload, ensure_ascii=False)
+        _seo_cache_put(cache_key, body)
+        return body, 200, {"Content-Type": "application/json",
+                            "Cache-Control": "public, max-age=300"}
+    except Exception as e:
+        log.exception(f"[api/seo/team] {slug}: {e}")
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+
+
+@app.route("/api/seo/league/<slug>")
+def r_seo_league(slug: str):
+    name = _league_by_slug(slug)
+    if not name:
+        _refresh_slug_index()
+        name = _league_by_slug(slug)
+    if not name:
+        return jsonify({"error": "league_not_found", "slug": slug}), 404
+
+    # JSON cache — same TTL pattern as the prerender HTML cache (15 min).
+    # Cuts cold-page load from ~1-2s (Sofascore + DB) to <50ms.
+    cache_key = f"jsonleague:{slug}"
+    cached_body = _seo_cache_get(cache_key)
+    if cached_body:
+        return cached_body, 200, {"Content-Type": "application/json",
+                                   "Cache-Control": "public, max-age=300"}
+    try:
+        variants = _league_variants_for(name)
+        placeholders = ",".join("?" * len(variants))
+        with _db() as conn:
+            picks_rows = conn.execute(f"""
+                SELECT t.match_id, t.market, t.label, t.odd_entry, t.result, t.wall_ts,
+                       g.home_team, g.away_team, g.home_goals, g.away_goals,
+                       g.is_finished, g.tournament
+                FROM tips t
+                JOIN games g ON g.id = t.match_id
+                WHERE g.tournament IN ({placeholders})
+                ORDER BY t.wall_ts DESC LIMIT 25
+            """, tuple(variants)).fetchall()
+            country_row = conn.execute(
+                f"SELECT country FROM games WHERE tournament IN ({placeholders}) "
+                f"AND country IS NOT NULL LIMIT 1",
+                tuple(variants)).fetchone()
+
+        upcoming = _upcoming_for_league(name, limit=20)
+        picks = [_format_pick_row(r) for r in picks_rows]
+        payload = {
+            "league_name":  name,
+            "slug":         slug,
+            "country":      country_row["country"] if country_row else None,
+            "logo_url":     _league_logo(name),
+            "upcoming":     upcoming,
+            "recent_picks": picks,
+            "stats":        _calc_stats(picks),
+        }
+        body = json.dumps(payload, ensure_ascii=False)
+        _seo_cache_put(cache_key, body)
+        return body, 200, {"Content-Type": "application/json",
+                            "Cache-Control": "public, max-age=300"}
+    except Exception as e:
+        log.exception(f"[api/seo/league] {slug}: {e}")
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+
+
+@app.route("/api/seo/tips/<market_slug>")
+def r_seo_tips(market_slug: str):
+    market_info = _TIP_MARKET_LABELS.get(market_slug)
+    if not market_info:
+        return jsonify({
+            "error": "market_not_found",
+            "slug":  market_slug,
+            "available_slugs": list(_TIP_MARKET_LABELS.keys()),
+        }), 404
+    pretty_name, like_patterns = market_info
+    try:
+        where_clause = " OR ".join("t.market LIKE ?" for _ in like_patterns)
+        with _db() as conn:
+            rows = conn.execute(f"""
+                SELECT t.match_id, t.market, t.label, t.odd_entry, t.result, t.wall_ts,
+                       g.home_team, g.away_team, g.home_goals, g.away_goals,
+                       g.is_finished, g.tournament
+                FROM tips t
+                JOIN games g ON g.id = t.match_id
+                WHERE {where_clause}
+                ORDER BY t.wall_ts DESC LIMIT 30
+            """, tuple(like_patterns)).fetchall()
+        picks = [_format_pick_row(r) for r in rows]
+        return jsonify({
+            "market_slug": market_slug,
+            "market_name": pretty_name,
+            "stats":       _calc_stats(picks),
+            "picks":       picks,
+        })
+    except Exception as e:
+        log.exception(f"[api/seo/tips] {market_slug}: {e}")
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+
+
+@app.route("/api/seo/today")
+def r_seo_today():
+    """Today's fixtures — only leagues we actively monitor (≥1 pick in DB)."""
+    try:
+        matches = _filter_monitored(get_scheduled())
+        return jsonify({
+            "date":    datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "count":   len(matches),
+            "matches": matches,
+        })
+    except Exception as e:
+        log.exception(f"[api/seo/today] {e}")
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+
+
+@app.route("/api/seo/tomorrow")
+def r_seo_tomorrow():
+    """Tomorrow's fixtures — monitored leagues only."""
+    try:
+        date_str = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+        matches  = _filter_monitored(get_scheduled(date_str))
+        return jsonify({
+            "date":    date_str,
+            "count":   len(matches),
+            "matches": matches,
+        })
+    except Exception as e:
+        log.exception(f"[api/seo/tomorrow] {e}")
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+
+
+@app.route("/api/seo/schedule/<date_str>")
+def r_seo_schedule(date_str: str):
+    """Fixtures for any date (YYYY-MM-DD) — monitored leagues only."""
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+        matches = _filter_monitored(get_scheduled(date_str))
+        return jsonify({
+            "date":    date_str,
+            "count":   len(matches),
+            "matches": matches,
+        })
+    except ValueError:
+        return jsonify({"error": "bad_date", "expected": "YYYY-MM-DD"}), 400
+    except Exception as e:
+        log.exception(f"[api/seo/schedule] {date_str}: {e}")
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+
+
+@app.route("/api/league-logo/<slug>")
+def r_league_logo_proxy(slug: str):
+    """
+    Image proxy for competition badges. Lovable / browsers can't fetch
+    Sofascore's image CDN directly (returns 403 to non-Sofascore origins).
+    This route fetches server-side via curl_cffi + Chrome TLS impersonation
+    and serves the bytes with a long cache header.
+    """
+    # Strip optional .png/.svg/.webp suffix for nicer URLs
+    raw_slug = slug
+    if "." in slug:
+        slug = slug.rsplit(".", 1)[0]
+
+    cached = _league_logo_bytes.get(slug)
+    if cached:
+        body, ct = cached
+        return body, 200, {
+            "Content-Type":  ct,
+            "Cache-Control": "public, max-age=86400, immutable",
+            "X-Cache":       "HIT",
+        }
+
+    name = _league_by_slug(slug)
+    if not name:
+        _refresh_slug_index()
+        name = _league_by_slug(slug)
+    if not name:
+        # Short cache: don't poison the browser if the slug becomes
+        # valid after slug-index refresh.
+        return ("Not found", 404, {"Cache-Control": "max-age=60"})
+
+    tid = _resolve_league_tid(name)
+    if not tid:
+        # Memo cold — try a quick 3-day deep resolve here so we don't
+        # serve the user a permanent monogram while warmup catches up.
+        tid = _resolve_league_tid_quick(name)
+    if not tid:
+        # Don't long-cache the miss — warmup will populate within 30s.
+        return ("Not found", 404, {"Cache-Control": "max-age=60"})
+
+    fetched = _get_bytes(f"https://api.sofascore.com/api/v1/unique-tournament/{tid}/image")
+    if not fetched:
+        return ("Upstream fetch failed", 502, {"Cache-Control": "max-age=60"})
+    body, ct = fetched
+    _league_logo_bytes[slug] = (body, ct)
+    return body, 200, {
+        "Content-Type":  ct,
+        "Cache-Control": "public, max-age=86400, immutable",
+        "X-Cache":       "MISS",
+    }
+
+
+# Useful for the Lovable frontend footer / discovery
+@app.route("/api/seo/index")
+def r_seo_index():
+    """Top-N teams, leagues, and the available tip markets — for footer links."""
+    try:
+        if not _slug_index_cache["teams"] or not _slug_index_cache["leagues"]:
+            _refresh_slug_index()
+        with _db() as conn:
+            top_teams = conn.execute("""
+                SELECT g.home_team AS name, COUNT(*) AS n
+                FROM tips t JOIN games g ON g.id = t.match_id
+                GROUP BY g.home_team ORDER BY n DESC LIMIT 12
+            """).fetchall()
+            top_leagues = conn.execute("""
+                SELECT g.tournament AS name, COUNT(*) AS n
+                FROM tips t JOIN games g ON g.id = t.match_id
+                WHERE g.tournament IS NOT NULL
+                GROUP BY g.tournament ORDER BY n DESC LIMIT 8
+            """).fetchall()
+        # Resolve canonical slugs
+        teams_idx = {v: k for k, v in _slug_index_cache["teams"].items()}
+        leagues_idx = {v: k for k, v in _slug_index_cache["leagues"].items()}
+        return jsonify({
+            "top_teams": [{"name": r["name"], "slug": teams_idx.get(r["name"], _slug(r["name"]))}
+                          for r in top_teams if r["name"]],
+            "top_leagues": [{"name": r["name"], "slug": leagues_idx.get(r["name"], _slug(r["name"]))}
+                            for r in top_leagues if r["name"]],
+            "tip_markets": [{"slug": s, "name": v[0]} for s, v in _TIP_MARKET_LABELS.items()],
+        })
+    except Exception as e:
+        log.exception(f"[api/seo/index] {e}")
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+
+
 @app.route("/prerender")
 def prerender_dispatch():
     """
@@ -7299,6 +9018,14 @@ def prerender_dispatch():
         elif _re.match(r'^/match/\d+', path):
             mid = int(_re.match(r'^/match/(\d+)', path).group(1))
             return prerender_match(mid)
+        elif _re.match(r'^/team/[^/]+$', path):
+            return _render_team(path[len("/team/"):])
+        elif _re.match(r'^/league/[^/]+$', path):
+            return _render_league(path[len("/league/"):])
+        elif _re.match(r'^/tips/[^/]+$', path):
+            return _render_tips_market(path[len("/tips/"):])
+        elif path == "/today":
+            html = _render_today()
         elif path == "/history":
             html = _render_history()
         elif path == "/tomorrow" or path == "/upcoming":
@@ -7324,20 +9051,81 @@ def prerender_dispatch():
 # ════════════════════════════════════════════════════════════
 
 def _init_scheduler():
-    """Initialize APScheduler for daily summary messages."""
+    """
+    Initialize APScheduler for daily summary messages.
+
+    Hardening (2026-05-08): previous version had three issues that caused
+    the 07/05 summary to be skipped:
+      1. With gunicorn --workers 2, each worker spawned its own scheduler,
+         making behaviour racy (could double-send or skip).
+      2. APScheduler's default misfire_grace_time is 1 second, so any
+         deploy/restart within seconds of the trigger silently dropped it.
+      3. Trigger at 23:00 + days_back=0 summarised "today so far",
+         missing tips that settled between 23:00–23:59.
+
+    Fix: cross-worker DB lock (only one instance fires per minute per day),
+    1h grace window, trigger moved to 23:55 with days_back=0 still
+    summarising the current Lisbon day (now nearly complete).
+    """
     scheduler = BackgroundScheduler()
-    # Run every day at 23:00 Lisbon time (Europe/Lisbon)
-    trigger = CronTrigger(hour=23, minute=0, timezone='Europe/Lisbon')
-    scheduler.add_job(_send_daily_summary, trigger=trigger, id='daily_summary', replace_existing=True)
+    # 23:55 Lisbon — late enough to capture nearly all settled tips,
+    # before Lisbon midnight rolls the date.
+    trigger = CronTrigger(hour=23, minute=55, timezone='Europe/Lisbon')
+    scheduler.add_job(
+        _send_daily_summary_locked,
+        trigger=trigger,
+        id='daily_summary',
+        replace_existing=True,
+        misfire_grace_time=3600,  # 1h: still fires if process restarted late
+        coalesce=True,            # collapse multiple pending fires into one
+        max_instances=1,
+    )
     scheduler.start()
-    log.info("Scheduler started: daily summary at 23:00 Lisbon time")
+    log.info("Scheduler started: daily summary at 23:55 Lisbon time (1h grace, DB-locked)")
     return scheduler
+
+
+def _send_daily_summary_locked():
+    """
+    Wrapper around _send_daily_summary that takes a DB-backed lock.
+    Prevents duplicate sends when multiple gunicorn workers each spawn
+    their own scheduler — the first worker to insert the lock row wins;
+    others see UNIQUE violation and bail out silently.
+    """
+    from datetime import datetime
+    lisbon_tz = pytz.timezone('Europe/Lisbon')
+    today_str = datetime.now(lisbon_tz).strftime("%Y-%m-%d")
+    try:
+        with _db() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_summary_locks (
+                    day TEXT PRIMARY KEY,
+                    sent_at INTEGER NOT NULL
+                )
+            """)
+            try:
+                conn.execute(
+                    "INSERT INTO daily_summary_locks (day, sent_at) VALUES (?, ?)",
+                    (today_str, int(datetime.utcnow().timestamp()))
+                )
+            except sqlite3.IntegrityError:
+                log.info(f"_send_daily_summary_locked: another worker already sent for {today_str}")
+                return
+        # Lock acquired → send (days_back=0 = today, called near end of Lisbon day)
+        _send_daily_summary(days_back=0, force_send=False)
+    except Exception as e:
+        log.error(f"_send_daily_summary_locked error: {e}", exc_info=True)
 
 
 _scheduler = None
 
 
 if __name__ == "__main__":
+    # CLI: prewarm subcommand runs in a clean OS process (no gevent)
+    if len(sys.argv) > 1 and sys.argv[1] == "prewarm-logos":
+        _run_prewarm_cli()
+        sys.exit(0)
+
     _load_aliases()
 
     if len(sys.argv) > 1 and sys.argv[1] == "test":
@@ -7355,7 +9143,7 @@ if __name__ == "__main__":
         print(f"  Odds API: enabled")
         print(f"  Background engine: every {BG_INTERVAL}s")
         print(f"  Team aliases: {len(_team_aliases)} loaded")
-        print(f"  Scheduler: daily summary at 23:00 Lisbon time\n")
+        print(f"  Scheduler: daily summary at 23:55 Lisbon time\n")
         app.run(host="0.0.0.0", port=5050, debug=True)
 else:
     # Running under gunicorn — __main__ block is skipped, so initialize here
@@ -7364,3 +9152,12 @@ else:
     _scheduler = _init_scheduler()
     threading.Thread(target=_init_client, daemon=True).start()
     threading.Thread(target=_background_loop, daemon=True).start()
+    # Pre-warm logos cache so the first API response already has logos inline
+    threading.Thread(target=_load_logos, daemon=True).start()
+    # Cheap: load fuzzy memo from disk if it exists (instant ~1ms read)
+    _load_fuzzy_memo_from_disk()
+    # Spawn fuzzy resolver as a SUBPROCESS — runs in a clean OS process so it
+    # NEVER blocks gunicorn's gevent event loop. Subprocess writes memo to disk;
+    # we reload it when subprocess exits. Skipped if memo already populated.
+    if not _fuzzy_logo_memo:
+        threading.Thread(target=_prewarm_fuzzy_logos, daemon=True).start()

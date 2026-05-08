@@ -4,16 +4,15 @@
  * Place this at the root of the Lovable project as `middleware.ts`.
  * It runs at the edge BEFORE the SPA is served.
  *
- * For /match/:id requests from known bots, it redirects to the
- * Supabase Edge Function (seo-router) which returns prerendered HTML.
- * All other requests pass through normally to the Lovable SPA.
+ * For known bots, it forwards SEO routes to the Flask /prerender dispatcher,
+ * which returns fully-rendered HTML with title/meta/JSON-LD. All other
+ * traffic passes through normally to the Lovable SPA.
  */
 
 import { NextResponse } from "next/server"; // Lovable may use a different import
 import type { NextRequest } from "next/server";
 
-const SEO_ROUTER =
-  "https://lcugjwhcmtpdoernjgei.supabase.co/functions/v1/seo-router";
+const PRERENDER_BASE = "https://livexgmodel-pt.fly.dev/prerender";
 
 const BOT_PATTERNS = [
   "googlebot", "bingbot", "slurp", "duckduckbot",
@@ -23,15 +22,33 @@ const BOT_PATTERNS = [
   "applebot", "ia_archiver", "semrushbot", "ahrefsbot",
 ];
 
+// Routes the dispatcher knows how to render
+const SEO_ROUTE_PATTERNS = [
+  /^\/match\/\d+/,
+  /^\/team\/[^/]+$/,
+  /^\/league\/[^/]+$/,
+  /^\/tips\/[^/]+$/,
+  /^\/blog(\/.*)?$/,
+  /^\/today$/,
+  /^\/tomorrow$/,
+  /^\/history$/,
+  /^\/about$/,
+  /^\/terms$/,
+  /^\/privacy$/,
+  /^\/responsible-gambling$/,
+  /^\/$/,
+];
+
 export function middleware(request: NextRequest) {
-  const { pathname } = request.nextUrl;
+  const { pathname, search } = request.nextUrl;
   const ua = (request.headers.get("user-agent") ?? "").toLowerCase();
   const isBot = BOT_PATTERNS.some(p => ua.includes(p));
+  const isSeoRoute = SEO_ROUTE_PATTERNS.some(re => re.test(pathname));
 
-  if (isBot && /^\/match\/\d+/.test(pathname)) {
-    // Rewrite internally to Supabase Edge Function — keeps the URL clean
-    const target = new URL(SEO_ROUTER);
-    target.pathname = pathname;
+  if (isBot && isSeoRoute) {
+    // Forward to /prerender?path=<original_path> — keeps the URL clean
+    const target = new URL(PRERENDER_BASE);
+    target.searchParams.set("path", pathname + (search || ""));
     return NextResponse.rewrite(target);
   }
 
@@ -39,5 +56,20 @@ export function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/match/:id*"],
+  matcher: [
+    "/",
+    "/match/:id*",
+    "/team/:slug*",
+    "/league/:slug*",
+    "/tips/:market*",
+    "/blog",
+    "/blog/:slug*",
+    "/today",
+    "/tomorrow",
+    "/history",
+    "/about",
+    "/terms",
+    "/privacy",
+    "/responsible-gambling",
+  ],
 };
