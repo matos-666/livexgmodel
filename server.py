@@ -2912,56 +2912,23 @@ _flaresolverr_session_lock = threading.Lock()
 
 
 def _flaresolverr_ensure_session():
-    """
-    Create the FlareSolverr session AND pre-warm it by visiting the Sofascore
-    website. The website visit populates the cookies that api.sofascore.com
-    requires — without them the API returns {"error":{"code":403}} even though
-    Cloudflare lets the HTTP request through (it's an application-level block).
-
-    Subsequent calls are no-ops once warm.
-    """
+    """Create the FlareSolverr session once. Subsequent calls are no-ops."""
     global _flaresolverr_session_ready
     with _flaresolverr_session_lock:
         if _flaresolverr_session_ready:
             return True
         try:
-            # 1. Create the persistent browser session
             r = _req.post(
                 FLARESOLVERR_URL,
                 json={"cmd": "sessions.create", "session": FLARESOLVERR_SESSION},
                 timeout=30,
             )
             data = r.json()
-            if data.get("status") != "ok" and "already exists" not in str(data.get("message", "")):
-                log.warning(f"FlareSolverr session create failed: {data}")
-                return False
-
-            # 2. Pre-warm: visit the SPA so the browser executes its JS,
-            #    grabs the right cookies, and registers itself as a "real"
-            #    user with Sofascore's backend. ~3-5s wait gives time for
-            #    the page's bootstrapping XHRs to land.
-            log.info("FlareSolverr: warming session by visiting www.sofascore.com")
-            r = _req.post(
-                FLARESOLVERR_URL,
-                json={
-                    "cmd":        "request.get",
-                    "url":        "https://www.sofascore.com/",
-                    "session":    FLARESOLVERR_SESSION,
-                    "maxTimeout": 60000,
-                },
-                timeout=70,
-            )
-            wd = r.json()
-            if wd.get("status") != "ok":
-                log.warning(f"FlareSolverr warmup failed: {wd.get('message')}")
-                # don't bail — maybe API still works without warmup
-            else:
-                cookies = (wd.get("solution") or {}).get("cookies") or []
-                log.info(f"FlareSolverr session warmed — {len(cookies)} cookies received")
-
-            _flaresolverr_session_ready = True
-            log.info(f"FlareSolverr session '{FLARESOLVERR_SESSION}' ready")
-            return True
+            if data.get("status") == "ok" or "already exists" in str(data.get("message", "")):
+                _flaresolverr_session_ready = True
+                log.info(f"FlareSolverr session '{FLARESOLVERR_SESSION}' ready")
+                return True
+            log.warning(f"FlareSolverr session create failed: {data}")
         except Exception as e:
             log.warning(f"FlareSolverr unreachable on session create: {e}")
         return False
@@ -3057,26 +3024,20 @@ def _get(url, retries=3):
             status, body, _ct = _flaresolverr_get(url)
             if status == 200 and body:
                 # FlareSolverr wraps the response in <html><body><pre>JSON</pre>...
-                # when upstream returns application/json. Strip the wrapper.
+                # when the upstream returns application/json; strip the wrapper.
                 import re as _re_loc
                 m = _re_loc.search(r"<pre[^>]*>(.*?)</pre>", body, _re_loc.S)
                 payload = (m.group(1) if m else body).strip()
                 try:
-                    parsed = json.loads(payload)
+                    return json.loads(payload)
                 except Exception:
+                    if payload.startswith(("{", "[")):
+                        try:
+                            return json.loads(payload)
+                        except Exception:
+                            pass
                     log.warning(f"FlareSolverr returned non-JSON for {url[:80]}")
                     return None
-                # Sofascore returns HTTP 200 with {"error":{"code":403}} when
-                # its application-level anti-bot rejects the request. Treat
-                # this as a retriable failure — re-warm the session and retry.
-                if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict) \
-                   and parsed["error"].get("code") in (401, 403):
-                    log.warning(f"FlareSolverr app-level {parsed['error'].get('code')} on {url[:80]} (attempt {attempt+1}/{retries})")
-                    global _flaresolverr_session_ready
-                    _flaresolverr_session_ready = False  # force re-warm next call
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                return parsed
             elif status == 404:
                 return None
             else:
