@@ -2903,13 +2903,23 @@ def _get_bytes(url, timeout: int = 8):
     global _last_req
     if _session is None:
         _init_client()
+    extra_headers = None
+    if "sofascore.com" in url:
+        extra_headers = {
+            "Origin":          "https://www.sofascore.com",
+            "Referer":         "https://www.sofascore.com/",
+            "Accept":          "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Sec-Fetch-Site":  "same-site",
+            "Sec-Fetch-Mode":  "no-cors",
+            "Sec-Fetch-Dest":  "image",
+        }
     for attempt in range(2):
         try:
             wait = REQ_GAP - (time.time() - _last_req)
             if wait > 0:
                 time.sleep(wait)
             _last_req = time.time()
-            resp = _session.get(url, timeout=timeout)
+            resp = _session.get(url, timeout=timeout, headers=extra_headers) if extra_headers else _session.get(url, timeout=timeout)
             if resp.status_code == 200:
                 ct = resp.headers.get("Content-Type", "image/png")
                 return resp.content, ct
@@ -2929,6 +2939,24 @@ def _get(url, retries=3):
     if _session is None:
         _init_client()
 
+    # Sofascore upgraded their API anti-bot in May 2026. The website now
+    # passes the TLS check but api.sofascore.com still 403s unless the
+    # request looks like a same-site fetch from the SPA (proper Origin,
+    # Referer, Sec-Fetch-* headers). curl_cffi's impersonation provides
+    # the right browser fingerprint but does not auto-set these for raw
+    # API calls — we add them explicitly for any sofascore.com URL.
+    extra_headers = None
+    if "sofascore.com" in url:
+        extra_headers = {
+            "Origin":          "https://www.sofascore.com",
+            "Referer":         "https://www.sofascore.com/",
+            "Accept":          "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Site":  "same-site",
+            "Sec-Fetch-Mode":  "cors",
+            "Sec-Fetch-Dest":  "empty",
+        }
+
     for attempt in range(retries):
         wait = REQ_GAP - (time.time() - _last_req)
         if wait > 0:
@@ -2936,7 +2964,7 @@ def _get(url, retries=3):
         _last_req = time.time()
 
         try:
-            resp = _session.get(url, timeout=15)
+            resp = _session.get(url, timeout=15, headers=extra_headers) if extra_headers else _session.get(url, timeout=15)
 
             if resp.status_code == 200:
                 try:
