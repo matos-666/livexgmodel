@@ -7904,6 +7904,12 @@ def _render_history() -> str:
             "description": f"Public history of {total} AI-generated football predictions with results and P&L.",
             "url":      f"{SITE_URL}/history",
             "creator":  {"@type": "Organization", "name": "WebPronos", "url": SITE_URL},
+            # Required by Google's Dataset structured data spec — flagged in
+            # Search Console as "Missing field 'license'". Points to the site
+            # terms which describe permitted reuse of the prediction history.
+            "license":  f"{SITE_URL}/terms",
+            "isAccessibleForFree": True,
+            "keywords": ["football predictions", "AI tips", "track record", "betting analytics", "xG model"],
         }, ensure_ascii=False)
 
         return _build_html_page(
