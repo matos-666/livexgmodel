@@ -2894,81 +2894,6 @@ _last_req = 0
 REQ_GAP = 2.0
 
 
-# ─── FlareSolverr adapter ────────────────────────────────────────────────────
-# Sofascore upgraded their API anti-bot in May 2026 with a Cloudflare layer
-# that requires a real browser to clear (JS challenge + cookies). curl_cffi's
-# TLS impersonation alone is no longer enough. We run a FlareSolverr instance
-# as a sidecar process (see supervisord.conf) on 127.0.0.1:8191 — it spins up
-# a headless Chromium, solves the challenge, and returns the response.
-#
-# We keep one persistent session ("sofascore") so cookies are reused across
-# requests instead of paying the ~10s Chromium boot per call.
-import requests as _req
-
-FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://127.0.0.1:8191/v1")
-FLARESOLVERR_SESSION = "sofascore"
-_flaresolverr_session_ready = False
-_flaresolverr_session_lock = threading.Lock()
-
-
-def _flaresolverr_ensure_session():
-    """Create the FlareSolverr session once. Subsequent calls are no-ops."""
-    global _flaresolverr_session_ready
-    with _flaresolverr_session_lock:
-        if _flaresolverr_session_ready:
-            return True
-        try:
-            r = _req.post(
-                FLARESOLVERR_URL,
-                json={"cmd": "sessions.create", "session": FLARESOLVERR_SESSION},
-                timeout=30,
-            )
-            data = r.json()
-            if data.get("status") == "ok" or "already exists" in str(data.get("message", "")):
-                _flaresolverr_session_ready = True
-                log.info(f"FlareSolverr session '{FLARESOLVERR_SESSION}' ready")
-                return True
-            log.warning(f"FlareSolverr session create failed: {data}")
-        except Exception as e:
-            log.warning(f"FlareSolverr unreachable on session create: {e}")
-        return False
-
-
-def _flaresolverr_get(url: str, timeout_ms: int = 60000):
-    """
-    Fetch a URL through FlareSolverr. Returns (status_code, text, content_type)
-    or (None, None, None) on transport error.
-
-    Only used for sofascore.com URLs; all other hosts go direct via curl_cffi.
-    """
-    if not _flaresolverr_ensure_session():
-        return None, None, None
-    try:
-        r = _req.post(
-            FLARESOLVERR_URL,
-            json={
-                "cmd":         "request.get",
-                "url":         url,
-                "session":     FLARESOLVERR_SESSION,
-                "maxTimeout":  timeout_ms,
-            },
-            timeout=(timeout_ms / 1000) + 10,
-        )
-        data = r.json()
-        if data.get("status") != "ok":
-            log.warning(f"FlareSolverr non-ok for {url}: {data.get('message', 'unknown')}")
-            return None, None, None
-        sol = data.get("solution") or {}
-        return (
-            sol.get("status"),
-            sol.get("response", ""),
-            (sol.get("headers") or {}).get("content-type", "application/json"),
-        )
-    except Exception as e:
-        log.warning(f"FlareSolverr request error for {url}: {e}")
-        return None, None, None
-
-
 def _get_bytes(url, timeout: int = 8):
     """
     Like _get but returns raw bytes + content-type. Uses the same session
@@ -3011,44 +2936,26 @@ def _get_bytes(url, timeout: int = 8):
 
 def _get(url, retries=3):
     global _last_req
-
-    # Sofascore goes through the FlareSolverr Cloudflare-bypass proxy.
-    # Returns the parsed JSON or None on persistent failure. Retries
-    # transparently within the proxy (Chromium handles the JS challenge).
-    if "sofascore.com" in url:
-        for attempt in range(retries):
-            wait = REQ_GAP - (time.time() - _last_req)
-            if wait > 0:
-                time.sleep(wait)
-            _last_req = time.time()
-            status, body, _ct = _flaresolverr_get(url)
-            if status == 200 and body:
-                # FlareSolverr wraps the response in <html><body><pre>JSON</pre>...
-                # when the upstream returns application/json; strip the wrapper.
-                import re as _re_loc
-                m = _re_loc.search(r"<pre[^>]*>(.*?)</pre>", body, _re_loc.S)
-                payload = (m.group(1) if m else body).strip()
-                try:
-                    return json.loads(payload)
-                except Exception:
-                    if payload.startswith(("{", "[")):
-                        try:
-                            return json.loads(payload)
-                        except Exception:
-                            pass
-                    log.warning(f"FlareSolverr returned non-JSON for {url[:80]}")
-                    return None
-            elif status == 404:
-                return None
-            else:
-                log.warning(f"FlareSolverr {url[:80]} status={status} (attempt {attempt+1}/{retries})")
-                time.sleep(2 * (attempt + 1))
-        return None
-
-    # Non-Sofascore URLs use the existing curl_cffi session
     if _session is None:
         _init_client()
+
+    # Sofascore upgraded their API anti-bot in May 2026. The website now
+    # passes the TLS check but api.sofascore.com still 403s unless the
+    # request looks like a same-site fetch from the SPA (proper Origin,
+    # Referer, Sec-Fetch-* headers). curl_cffi's impersonation provides
+    # the right browser fingerprint but does not auto-set these for raw
+    # API calls — we add them explicitly for any sofascore.com URL.
     extra_headers = None
+    if "sofascore.com" in url:
+        extra_headers = {
+            "Origin":          "https://www.sofascore.com",
+            "Referer":         "https://www.sofascore.com/",
+            "Accept":          "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Site":  "same-site",
+            "Sec-Fetch-Mode":  "cors",
+            "Sec-Fetch-Dest":  "empty",
+        }
 
     for attempt in range(retries):
         wait = REQ_GAP - (time.time() - _last_req)
