@@ -2814,19 +2814,37 @@ def get_full_odds_analysis(match, shots, api_key=None):
 def _init_client():
     global _client_type, _session
 
-    # 1) curl_cffi
+    # 1) curl_cffi — try multiple impersonation profiles, newest first.
+    # Sofascore upgrades their TLS fingerprint detection periodically; when
+    # they do, the generic "chrome" profile starts returning 403. Trying
+    # specific recent versions + non-Chrome browsers gives us redundancy.
+    # As of 2026-05, Sofascore was blocking the default "chrome" profile.
     try:
         from curl_cffi.requests import Session as CffiSession
-        _session = CffiSession(impersonate="chrome")
-        resp = _session.get(SOFASCORE_WEB, timeout=15)
-        if resp.status_code == 200:
-            _client_type = "curl_cffi"
-            log.info("Using curl_cffi (Chrome TLS impersonation)")
-            return True
+        profiles_to_try = [
+            "chrome136", "chrome133a", "chrome131", "chrome124", "chrome123",
+            "chrome120", "chrome119", "chrome116",
+            "safari18_0", "safari17_0", "safari17_2_ios",
+            "firefox133", "edge101",
+            "chrome",  # fallback to generic
+        ]
+        for profile in profiles_to_try:
+            try:
+                _session = CffiSession(impersonate=profile)
+                resp = _session.get(SOFASCORE_WEB, timeout=15)
+                if resp.status_code == 200:
+                    _client_type = f"curl_cffi:{profile}"
+                    log.info(f"Using curl_cffi (TLS impersonation: {profile})")
+                    return True
+                else:
+                    log.info(f"curl_cffi profile '{profile}' got status {resp.status_code}, trying next")
+            except Exception as e:
+                log.info(f"curl_cffi profile '{profile}' failed: {type(e).__name__}: {e}")
+                continue
     except ImportError:
         log.info("curl_cffi not available")
     except Exception as e:
-        log.warning(f"curl_cffi failed: {e}")
+        log.warning(f"curl_cffi outer failed: {e}")
 
     # 2) cloudscraper
     try:
