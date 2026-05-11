@@ -6413,6 +6413,23 @@ def _slug(text: str) -> str:
     return text.strip("-")
 
 
+def _match_url(match_id, home: str = "", away: str = "") -> str:
+    """
+    Canonical URL for a match page, including the home-vs-away slug.
+
+    Use this everywhere internal links to /match/<id> are emitted so they
+    line up with the URLs in /sitemap.xml. Without the slug the bare-id
+    form returns the same content but Google sees two URLs for one page,
+    splits authority, and may pick the wrong one as canonical.
+
+    Falls back to the bare-id form if team names aren't available — better
+    than a broken link.
+    """
+    if home and away:
+        return f"{SITE_URL}/match/{match_id}/{_slug(home)}-vs-{_slug(away)}"
+    return f"{SITE_URL}/match/{match_id}"
+
+
 @app.route("/robots.txt")
 def r_robots():
     """robots.txt — points crawlers to the sitemap index, blocks API/admin paths."""
@@ -8053,7 +8070,7 @@ def _render_history() -> str:
               <tr>
                 <td class="pr-meta">{date_str}</td>
                 <td class="pr-meta">{league}</td>
-                <td><a href="{SITE_URL}/match/{r['match_id']}" style="color:#fff">{match}</a></td>
+                <td><a href="{_match_url(r['match_id'], r['home_team'], r['away_team'])}" style="color:#fff">{match}</a></td>
                 <td class="pr-meta">{score}</td>
                 <td class="pr-meta">{r['market']} — {r['label']}</td>
                 <td class="pr-meta">@{r['odd_entry']:.2f}</td>
@@ -8171,7 +8188,7 @@ def _render_tomorrow() -> str:
                 kickoff = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M") if ts else "—"
                 rows.append(f"""
                   <div class="pr-row">
-                    <a href="{SITE_URL}/match/{m['id']}">{m['homeTeam']} <span class="pr-meta">vs</span> {m['awayTeam']}</a>
+                    <a href="{_match_url(m['id'], m['homeTeam'], m['awayTeam'])}">{m['homeTeam']} <span class="pr-meta">vs</span> {m['awayTeam']}</a>
                     <span class="pr-meta">{kickoff} UTC</span>
                   </div>""")
             groups_html.append(f"""
@@ -8408,7 +8425,7 @@ def _render_team(slug: str) -> tuple:
             rows_html.append(f"""
               <tr>
                 <td class="pr-meta">{date_str}</td>
-                <td><a href="{SITE_URL}/match/{p['match_id']}" style="color:#fff">vs {opponent}</a></td>
+                <td><a href="{_match_url(p['match_id'], p['home_team'], p['away_team'])}" style="color:#fff">vs {opponent}</a></td>
                 <td class="pr-meta">{score}</td>
                 <td class="pr-meta">{p['market']} — {p['label']}</td>
                 <td class="pr-meta">@{(p['odd_entry'] or 0):.2f}</td>
@@ -8421,7 +8438,7 @@ def _render_team(slug: str) -> tuple:
             kickoff = _dt.fromtimestamp(next_fixture["kickoff_ts"], tz=_tz.utc).strftime("%b %d, %H:%M UTC")
             next_html = f"""
             <h2 class="pr-h2">Next fixture</h2>
-            <p><a href="{SITE_URL}/match/{next_fixture['match_id']}" style="color:#22d3ee">
+            <p><a href="{_match_url(next_fixture['match_id'], next_fixture['home_team'], next_fixture['away_team'])}" style="color:#22d3ee">
               {next_fixture['home_team']} vs {next_fixture['away_team']}
             </a> — {next_fixture['tournament'] or ''} · {kickoff}</p>"""
         else:
@@ -8527,7 +8544,7 @@ def _render_league(slug: str) -> tuple:
             fixt_rows.append(f"""
               <tr>
                 <td class="pr-meta">{ko}</td>
-                <td><a href="{SITE_URL}/match/{r['match_id']}" style="color:#fff">{r['home_team']} vs {r['away_team']}</a></td>
+                <td><a href="{_match_url(r['match_id'], r['home_team'], r['away_team'])}" style="color:#fff">{r['home_team']} vs {r['away_team']}</a></td>
               </tr>""")
 
         # Recent picks table
@@ -8546,7 +8563,7 @@ def _render_league(slug: str) -> tuple:
             pick_rows.append(f"""
               <tr>
                 <td class="pr-meta">{date_str}</td>
-                <td><a href="{SITE_URL}/match/{p['match_id']}" style="color:#fff">{match}</a></td>
+                <td><a href="{_match_url(p['match_id'], p['home_team'], p['away_team'])}" style="color:#fff">{match}</a></td>
                 <td class="pr-meta">{score}</td>
                 <td class="pr-meta">{p['market']} — {p['label']}</td>
                 <td class="pr-meta">@{(p['odd_entry'] or 0):.2f}</td>
@@ -8668,7 +8685,7 @@ def _render_tips_market(market_slug: str) -> tuple:
               <tr>
                 <td class="pr-meta">{date_str}</td>
                 <td class="pr-meta">{r['tournament'] or '—'}</td>
-                <td><a href="{SITE_URL}/match/{r['match_id']}" style="color:#fff">{match}</a></td>
+                <td><a href="{_match_url(r['match_id'], r['home_team'], r['away_team'])}" style="color:#fff">{match}</a></td>
                 <td class="pr-meta">{score}</td>
                 <td class="pr-meta">{r['label']}</td>
                 <td class="pr-meta">@{(r['odd_entry'] or 0):.2f}</td>
@@ -8745,7 +8762,7 @@ def _render_today() -> str:
               <tr>
                 <td class="pr-meta">{ko}</td>
                 <td class="pr-meta">{m.get('tournament','')}</td>
-                <td><a href="{SITE_URL}/match/{m['id']}" style="color:#fff">{m['homeTeam']} vs {m['awayTeam']}</a></td>
+                <td><a href="{_match_url(m['id'], m['homeTeam'], m['awayTeam'])}" style="color:#fff">{m['homeTeam']} vs {m['awayTeam']}</a></td>
               </tr>""")
 
         body = f"""
