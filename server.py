@@ -7905,19 +7905,22 @@ def prerender_blog(slug: str):
         # ── Markdown → HTML ─────────────────────────────────────────────────
         article_html = _md_to_html(content_md) if content_md else "<p>Article coming soon.</p>"
 
-        # ── JSON-LD BlogPosting ─────────────────────────────────────────────
-        jsonld = json.dumps({
-            "@context":       "https://schema.org",
-            "@type":          "BlogPosting",
-            "headline":       title,
-            "description":    description,
-            "author":         {"@type": "Person", "name": author},
-            "publisher":      {"@type": "Organization", "name": "WebPronos", "url": SITE_URL},
-            "datePublished":  published_at[:10] if published_at else "",
-            "url":            canonical,
-            "image":          og_image,
-            "mainEntityOfPage": {"@type": "WebPage", "@id": canonical},
-        }, ensure_ascii=False)
+        # ── JSON-LD BlogPosting + BreadcrumbList ────────────────────────────
+        jsonld = json.dumps([
+            {
+                "@context":       "https://schema.org",
+                "@type":          "BlogPosting",
+                "headline":       title,
+                "description":    description,
+                "author":         {"@type": "Person", "name": author},
+                "publisher":      {"@type": "Organization", "name": "WebPronos", "url": SITE_URL},
+                "datePublished":  published_at[:10] if published_at else "",
+                "url":            canonical,
+                "image":          og_image,
+                "mainEntityOfPage": {"@type": "WebPage", "@id": canonical},
+            },
+            _breadcrumb_jsonld([("WebPronos", "/"), ("Blog", "/blog"), (title, f"/blog/{slug}")]),
+        ], ensure_ascii=False)
 
         meta = {"title": title, "description": description, "og_image": og_image}
 
@@ -8083,22 +8086,32 @@ def prerender_match(match_id: int):
         # 7. Body
         body_html = _render_match_body(event, odds, match_id)
 
-        # 8. SportsEvent JSON-LD for rich results
+        # 8. SportsEvent + BreadcrumbList JSON-LD for rich results
         try:
             from datetime import datetime as _dt, timezone as _tz
             ts = event.get("startTimestamp", 0)
             iso_start = _dt.fromtimestamp(ts, tz=_tz.utc).isoformat() if ts else ""
-            jsonld = json.dumps({
-                "@context":  "https://schema.org",
-                "@type":     "SportsEvent",
-                "name":      f"{event.get('homeTeam','')} vs {event.get('awayTeam','')}",
-                "startDate": iso_start,
-                "sport":     "Soccer",
-                "url":       canonical,
-                "homeTeam":  {"@type": "SportsTeam", "name": event.get('homeTeam', '')},
-                "awayTeam":  {"@type": "SportsTeam", "name": event.get('awayTeam', '')},
-                "location":  {"@type": "Place", "name": event.get('tournament', '')},
-            }, ensure_ascii=False)
+            home = event.get('homeTeam', '')
+            away = event.get('awayTeam', '')
+            tourn_name = event.get('tournament', '')
+            jsonld = json.dumps([
+                {
+                    "@context":  "https://schema.org",
+                    "@type":     "SportsEvent",
+                    "name":      f"{home} vs {away}",
+                    "startDate": iso_start,
+                    "sport":     "Soccer",
+                    "url":       canonical,
+                    "homeTeam":  {"@type": "SportsTeam", "name": home},
+                    "awayTeam":  {"@type": "SportsTeam", "name": away},
+                    "location":  {"@type": "Place", "name": tourn_name},
+                },
+                _breadcrumb_jsonld([
+                    ("WebPronos", "/"),
+                    *([(tourn_name, f"/league/{_slug(tourn_name)}")] if tourn_name else []),
+                    (f"{home} vs {away}", canonical.replace(SITE_URL, "")),
+                ]),
+            ], ensure_ascii=False)
         except Exception:
             jsonld = ""
 
@@ -8359,14 +8372,17 @@ def _render_blog_listing() -> str:
             "url": f"{SITE_URL}/blog/{p.get('slug','')}",
             "name": p.get("title", ""),
         })
-    jsonld = json.dumps({
-        "@context": "https://schema.org",
-        "@type":    "Blog",
-        "name":     "WebPronos Blog",
-        "url":      f"{SITE_URL}/blog",
-        "description": "Guides on xG, live betting strategy and AI football predictions.",
-        "blogPost": items_jsonld,
-    }, ensure_ascii=False)
+    jsonld = json.dumps([
+        {
+            "@context": "https://schema.org",
+            "@type":    "Blog",
+            "name":     "WebPronos Blog",
+            "url":      f"{SITE_URL}/blog",
+            "description": "Guides on xG, live betting strategy and AI football predictions.",
+            "blogPost": items_jsonld,
+        },
+        _breadcrumb_jsonld([("WebPronos", "/"), ("Blog", "/blog")]),
+    ], ensure_ascii=False)
 
     return _build_html_page(
         title       = "Blog — Live Betting Strategy, xG & AI Predictions | WebPronos",
@@ -8478,20 +8494,23 @@ def _render_history() -> str:
         {_render_pr_footer()}
         """
 
-        jsonld = json.dumps({
-            "@context": "https://schema.org",
-            "@type":    "Dataset",
-            "name":     "WebPronos prediction track record",
-            "description": f"Public history of {total} AI-generated football predictions with results and P&L.",
-            "url":      f"{SITE_URL}/history",
-            "creator":  {"@type": "Organization", "name": "WebPronos", "url": SITE_URL},
-            # Required by Google's Dataset structured data spec — flagged in
-            # Search Console as "Missing field 'license'". Points to the site
-            # terms which describe permitted reuse of the prediction history.
-            "license":  f"{SITE_URL}/terms",
-            "isAccessibleForFree": True,
-            "keywords": ["football predictions", "AI tips", "track record", "betting analytics", "xG model"],
-        }, ensure_ascii=False)
+        jsonld = json.dumps([
+            {
+                "@context": "https://schema.org",
+                "@type":    "Dataset",
+                "name":     "WebPronos prediction track record",
+                "description": f"Public history of {total} AI-generated football predictions with results and P&L.",
+                "url":      f"{SITE_URL}/history",
+                "creator":  {"@type": "Organization", "name": "WebPronos", "url": SITE_URL},
+                # Required by Google's Dataset structured data spec — flagged in
+                # Search Console as "Missing field 'license'". Points to the site
+                # terms which describe permitted reuse of the prediction history.
+                "license":  f"{SITE_URL}/terms",
+                "isAccessibleForFree": True,
+                "keywords": ["football predictions", "AI tips", "track record", "betting analytics", "xG model"],
+            },
+            _breadcrumb_jsonld([("WebPronos", "/"), ("History", "/history")]),
+        ], ensure_ascii=False)
 
         return _build_html_page(
             title       = f"History — Track Record of {total} AI Football Predictions | WebPronos",
@@ -8600,16 +8619,19 @@ def _render_tomorrow() -> str:
                 "homeTeam":  {"@type": "SportsTeam", "name": m['homeTeam']},
                 "awayTeam":  {"@type": "SportsTeam", "name": m['awayTeam']},
             })
-        jsonld = json.dumps({
-            "@context": "https://schema.org",
-            "@type":    "ItemList",
-            "name":     f"Tomorrow's football matches — {date_human}",
-            "numberOfItems": len(matches),
-            "itemListElement": [
-                {"@type": "ListItem", "position": i+1, "item": e}
-                for i, e in enumerate(events_jsonld)
-            ],
-        }, ensure_ascii=False)
+        jsonld = json.dumps([
+            {
+                "@context": "https://schema.org",
+                "@type":    "ItemList",
+                "name":     f"Tomorrow's football matches — {date_human}",
+                "numberOfItems": len(matches),
+                "itemListElement": [
+                    {"@type": "ListItem", "position": i+1, "item": e}
+                    for i, e in enumerate(events_jsonld)
+                ],
+            },
+            _breadcrumb_jsonld([("WebPronos", "/"), ("Tomorrow", "/tomorrow")]),
+        ], ensure_ascii=False)
 
         return _build_html_page(
             title       = f"Tomorrow's Football Matches — {date_human} | WebPronos",
@@ -8670,13 +8692,23 @@ def _render_match_body(event: dict, odds: dict | None, match_id: int) -> str:
             </div>
             """
 
+    # Build internal-link URLs so the match page links out to the league
+    # and to each team page (boosts crawl depth and PageRank flow).
+    home_url  = f"{SITE_URL}/team/{_slug(home)}"   if home  else ""
+    away_url  = f"{SITE_URL}/team/{_slug(away)}"   if away  else ""
+    tourn_url = f"{SITE_URL}/league/{_slug(tourn)}" if tourn else ""
+
+    # Make the league line clickable; teams clickable in the "About" copy
+    league_meta = (f'{country} · <a href="{tourn_url}" style="color:#22d3ee">{tourn}</a>'
+                   if tourn else f'{country}')
+
     body = f"""
     <nav class="pr-nav">
       <a href="{SITE_URL}/">WebPronos</a> ›
-      <a href="{SITE_URL}/history">Matches</a> › {home} vs {away}
+      {f'<a href="{tourn_url}" style="color:#22d3ee">{tourn}</a> › ' if tourn else ''}{home} vs {away}
     </nav>
 
-    <p class="pr-meta">{country} · {tourn}</p>
+    <p class="pr-meta">{league_meta}</p>
     <h1 class="pr-h1">{home} vs {away} — Live Football Predictions</h1>
     {status_pill}
     {score_html}
@@ -8695,7 +8727,26 @@ def _render_match_body(event: dict, odds: dict | None, match_id: int) -> str:
     </ul>
 
     <h2 class="pr-h2">About this match</h2>
-    <p>{home} take on {away} in the {tourn}. WebPronos publishes live in-play tips for this fixture — every prediction is generated after kickoff, when the model can react to the actual flow of the game. Open the live page during kickoff to see real-time win probabilities, value bets and the full xG shot map.</p>
+    <p><a href="{home_url}" style="color:#22d3ee">{home}</a> take on <a href="{away_url}" style="color:#22d3ee">{away}</a> in the <a href="{tourn_url}" style="color:#22d3ee">{tourn}</a>. WebPronos publishes live in-play tips for this fixture — every prediction is generated after kickoff, when the model can react to the actual flow of the game. Open the live page during kickoff to see real-time win probabilities, value bets and the full xG shot map.</p>
+
+    <h2 class="pr-h2">Related pages</h2>
+    <div class="pr-grid">
+      <a href="{home_url}" class="pr-card" style="text-decoration:none;color:inherit;display:block">
+        <div class="pr-meta">Team page</div>
+        <div style="font-weight:700;color:#fff">{home}</div>
+        <div class="pr-meta">Recent form, xG averages & full pick history</div>
+      </a>
+      <a href="{away_url}" class="pr-card" style="text-decoration:none;color:inherit;display:block">
+        <div class="pr-meta">Team page</div>
+        <div style="font-weight:700;color:#fff">{away}</div>
+        <div class="pr-meta">Recent form, xG averages & full pick history</div>
+      </a>
+      <a href="{tourn_url}" class="pr-card" style="text-decoration:none;color:inherit;display:block">
+        <div class="pr-meta">Competition page</div>
+        <div style="font-weight:700;color:#fff">{tourn}</div>
+        <div class="pr-meta">Upcoming fixtures & league-wide track record</div>
+      </a>
+    </div>
 
     {_render_pr_footer()}
     """
@@ -9082,14 +9133,17 @@ def _render_league(slug: str) -> tuple:
         {_render_pr_footer()}
         """
 
-        jsonld = json.dumps({
-            "@context": "https://schema.org",
-            "@type": "SportsLeague",
-            "name": name,
-            "sport": "Soccer",
-            "url": f"{SITE_URL}/league/{slug}",
-            **({"location": {"@type": "Country", "name": country}} if country else {}),
-        }, ensure_ascii=False)
+        jsonld = json.dumps([
+            {
+                "@context": "https://schema.org",
+                "@type": "SportsLeague",
+                "name": name,
+                "sport": "Soccer",
+                "url": f"{SITE_URL}/league/{slug}",
+                **({"location": {"@type": "Country", "name": country}} if country else {}),
+            },
+            _breadcrumb_jsonld([("WebPronos", "/"), (name, f"/league/{slug}")]),
+        ], ensure_ascii=False)
 
         html = _build_html_page(
             title=f"{name} — Live Football Tips & Predictions | WebPronos",
@@ -9198,13 +9252,16 @@ def _render_tips_market(market_slug: str) -> tuple:
         {_render_pr_footer()}
         """
 
-        jsonld = json.dumps({
-            "@context": "https://schema.org",
-            "@type": "CollectionPage",
-            "name": f"{pretty_name} football tips — WebPronos",
-            "url": f"{SITE_URL}/tips/{market_slug}",
-            "about": pretty_name,
-        }, ensure_ascii=False)
+        jsonld = json.dumps([
+            {
+                "@context": "https://schema.org",
+                "@type": "CollectionPage",
+                "name": f"{pretty_name} football tips — WebPronos",
+                "url": f"{SITE_URL}/tips/{market_slug}",
+                "about": pretty_name,
+            },
+            _breadcrumb_jsonld([("WebPronos", "/"), ("Tips", "/"), (pretty_name, f"/tips/{market_slug}")]),
+        ], ensure_ascii=False)
 
         html = _build_html_page(
             title=f"{pretty_name} Tips — Live AI Predictions | WebPronos",
@@ -9262,18 +9319,21 @@ def _render_today() -> str:
         {_render_pr_footer()}
         """
 
-        jsonld = json.dumps({
-            "@context": "https://schema.org",
-            "@type": "ItemList",
-            "name": f"Football matches today — {date_str}",
-            "numberOfItems": len(matches),
-            "itemListElement": [{
-                "@type": "ListItem",
-                "position": i + 1,
-                "url": f"{SITE_URL}/match/{m['id']}",
-                "name": f"{m['homeTeam']} vs {m['awayTeam']}",
-            } for i, m in enumerate(matches[:50])],
-        }, ensure_ascii=False)
+        jsonld = json.dumps([
+            {
+                "@context": "https://schema.org",
+                "@type": "ItemList",
+                "name": f"Football matches today — {date_str}",
+                "numberOfItems": len(matches),
+                "itemListElement": [{
+                    "@type": "ListItem",
+                    "position": i + 1,
+                    "url": _match_url(m['id'], m['homeTeam'], m['awayTeam']),
+                    "name": f"{m['homeTeam']} vs {m['awayTeam']}",
+                } for i, m in enumerate(matches[:50])],
+            },
+            _breadcrumb_jsonld([("WebPronos", "/"), ("Today", "/today")]),
+        ], ensure_ascii=False)
 
         html = _build_html_page(
             title=f"Today's Football Tips & Live Predictions | WebPronos",
@@ -9359,8 +9419,33 @@ def _render_homepage() -> str:
 
 
 # ── Static-content pages (about, terms, etc.) ─────────────────────────────
+def _breadcrumb_jsonld(items: list[tuple[str, str]]) -> dict:
+    """
+    Build a Schema.org BreadcrumbList JSON-LD dict.
+
+    `items` is a list of (name, url_path) tuples in order from root to leaf.
+    Example:
+        _breadcrumb_jsonld([("WebPronos", "/"), ("Leagues", "/leagues"), ("Premier League", "/league/premier-league")])
+
+    Use by combining with the page's primary JSON-LD into an array:
+        jsonld = json.dumps([primary_dict, _breadcrumb_jsonld([...])])
+
+    Returning a dict (not a JSON string) keeps the caller in control of
+    serialization — most pages embed multiple JSON-LD types as an array.
+    """
+    return {
+        "@context": "https://schema.org",
+        "@type":    "BreadcrumbList",
+        "itemListElement": [
+            {"@type": "ListItem", "position": i + 1, "name": name,
+             "item": f"{SITE_URL}{path}" if not path.startswith("http") else path}
+            for i, (name, path) in enumerate(items)
+        ],
+    }
+
+
 def _render_passthrough(canonical_path: str = "/") -> str:
-    """For static pages — serve Lovable shell unchanged (it has good content already)."""
+    """For unknown/fallback paths — serve Lovable shell unchanged."""
     base_html = _get_base_html()
     if base_html:
         return base_html
@@ -9369,6 +9454,133 @@ def _render_passthrough(canonical_path: str = "/") -> str:
         description="AI-powered football tips across 25 competitions.",
         canonical=f"{SITE_URL}{canonical_path}",
         body_html=f"<h1>WebPronos</h1>{_render_pr_footer()}",
+    )
+
+
+# ── Static legal/info pages — proper SSR (not SPA shell) ────────────────────
+# Each page has self-canonical, descriptive H1, factual body copy, and a
+# BreadcrumbList JSON-LD. Previously these served the SPA shell with the
+# homepage canonical, which signaled Google to deindex them as duplicates.
+_STATIC_PAGES: dict = {
+    "/about": {
+        "title":       f"About WebPronos — How Our AI Football Prediction Model Works",
+        "description": "WebPronos is an AI-powered football tips platform. Our xG model identifies positive-EV value bets in real time across 25+ leagues and publishes every pick with a full audit trail.",
+        "h1":          "About WebPronos",
+        "breadcrumb":  "About",
+        "body":        """
+            <p>WebPronos is a live football prediction platform powered by a proprietary AI model built around <strong>Expected Goals (xG)</strong>. We monitor live matches across more than 25 competitions, ingest shot-by-shot data, and identify positive-expected-value bets the moment the bookmaker odds diverge from the model's probabilities.</p>
+            <h2 class="pr-h2">What we do</h2>
+            <p>Every pick our model generates is logged the instant the value appears — never edited, never deleted. We publish the entry odds, the live in-game state at the moment of the pick, the running result, and a settled profit/loss summary. The full track record lives at <a href="/history">webpronos.com/history</a>.</p>
+            <h2 class="pr-h2">How the model works</h2>
+            <p>The core engine is an xG model trained on shot-level data. For every shot in a match, the model computes its expected goal probability based on position, body part, situation, and defensive pressure. These per-shot probabilities aggregate into live win/draw/loss, over/under, and handicap probabilities, which are then compared to the live bookmaker odds using a Benter-style edge calculation. Any market where the model's implied probability exceeds the bookmaker's (after vig adjustment) is flagged as a value pick.</p>
+            <h2 class="pr-h2">Why publish everything</h2>
+            <p>Most tipsters cherry-pick wins and hide losses. By publishing every single settled pick — including the bad ones — we let anyone audit our edge. If the long-term ROI stays positive across thousands of picks, the model is genuinely beating the market.</p>
+            <p>Browse the <a href="/today">live picks today</a>, the <a href="/tomorrow">tomorrow's fixtures</a>, the <a href="/history">full audit history</a>, or read our <a href="/blog">blog</a> for deeper xG explainers.</p>
+        """,
+    },
+    "/terms": {
+        "title":       "Terms of Service | WebPronos",
+        "description": "Terms of Service for WebPronos. By using our site you accept these terms. We provide statistical football predictions for informational purposes only — no outcome is guaranteed.",
+        "h1":          "Terms of Service",
+        "breadcrumb":  "Terms",
+        "body":        """
+            <p>By accessing or using WebPronos you agree to these terms. WebPronos publishes statistical football predictions and historical performance data <strong>for informational purposes only</strong>. We do not offer betting, gambling, or financial advice.</p>
+            <h2 class="pr-h2">No guaranteed outcomes</h2>
+            <p>Every prediction on WebPronos is a probabilistic estimate generated by an AI model based on publicly available match data. No outcome is guaranteed. Past performance — including any positive ROI shown in our <a href="/history">track record</a> — does not predict future results.</p>
+            <h2 class="pr-h2">User responsibility</h2>
+            <p>You are solely responsible for any betting decisions you make. WebPronos is not a bookmaker and accepts no liability for any financial loss arising from the use of our predictions.</p>
+            <h2 class="pr-h2">Age restriction</h2>
+            <p>You must be at least 18 years old to use this site. See our <a href="/responsible-gambling">responsible gambling page</a> for help and support resources.</p>
+            <h2 class="pr-h2">Intellectual property</h2>
+            <p>The predictions, datasets, and analytical commentary on WebPronos are the intellectual property of WebPronos. Reuse for non-commercial purposes is permitted with attribution and a backlink to the source page.</p>
+            <h2 class="pr-h2">Changes to these terms</h2>
+            <p>We may update these terms periodically. Material changes will be noted at the top of this page with the effective date.</p>
+        """,
+    },
+    "/privacy": {
+        "title":       "Privacy Policy | WebPronos",
+        "description": "WebPronos privacy policy. We collect minimal analytics to improve the service. We do not sell user data and we comply with GDPR.",
+        "h1":          "Privacy Policy",
+        "breadcrumb":  "Privacy",
+        "body":        """
+            <p>WebPronos respects your privacy. This page explains what data we collect, why, and how we handle it.</p>
+            <h2 class="pr-h2">What we collect</h2>
+            <p>We collect minimal first-party analytics: page views, referrer, browser type, and approximate geographic region. We do not collect names, email addresses, or payment data unless you explicitly provide them (for example, by subscribing to the Telegram channel).</p>
+            <h2 class="pr-h2">Third-party services</h2>
+            <p>Some content is served via Cloudflare (CDN), Lovable (hosting), and Fly.io (backend). These providers may set technical cookies necessary for the site to function.</p>
+            <h2 class="pr-h2">Your rights (GDPR)</h2>
+            <p>If you are in the EU/EEA, you have the right to access, correct, or delete any data we hold about you. Contact us through the link in the footer.</p>
+            <h2 class="pr-h2">Data retention</h2>
+            <p>Analytics data is retained for a maximum of 12 months and then automatically aggregated and anonymized.</p>
+        """,
+    },
+    "/responsible-gambling": {
+        "title":       "Responsible Gambling — Bet Safely | WebPronos",
+        "description": "Help and resources for safe betting. If gambling is no longer fun, please seek help. 18+ only. Resources include BeGambleAware, GamCare, and SOS Jogador.",
+        "h1":          "Responsible Gambling",
+        "breadcrumb":  "Responsible Gambling",
+        "body":        """
+            <p>WebPronos publishes football predictions for informational and entertainment purposes only. <strong>Betting carries risk.</strong> Never bet more than you can afford to lose.</p>
+            <h2 class="pr-h2">Signs of a problem</h2>
+            <ul>
+              <li>Betting more than you intended, or chasing losses</li>
+              <li>Hiding gambling activity from friends and family</li>
+              <li>Borrowing money to gamble</li>
+              <li>Feeling anxious or depressed about your gambling</li>
+              <li>Gambling interfering with work, school, or relationships</li>
+            </ul>
+            <h2 class="pr-h2">Where to get help</h2>
+            <ul>
+              <li><strong>BeGambleAware</strong> (UK) — <a href="https://www.begambleaware.org" rel="noopener noreferrer">begambleaware.org</a> · 0808 8020 133</li>
+              <li><strong>GamCare</strong> (UK) — <a href="https://www.gamcare.org.uk" rel="noopener noreferrer">gamcare.org.uk</a></li>
+              <li><strong>SOS Jogador</strong> (Portugal) — <a href="https://www.sosjogador.org" rel="noopener noreferrer">sosjogador.org</a> · 813 211 311</li>
+              <li><strong>National Council on Problem Gambling</strong> (US) — <a href="https://www.ncpgambling.org" rel="noopener noreferrer">ncpgambling.org</a> · 1-800-522-4700</li>
+            </ul>
+            <h2 class="pr-h2">Bet sensibly</h2>
+            <p>Set a daily/weekly budget and stick to it. Take regular breaks. Treat betting as entertainment — not a way to make money. If you find yourself struggling, please reach out to one of the resources above.</p>
+            <p><strong>18+ only.</strong> If you suspect you have a gambling problem, please stop immediately and seek help.</p>
+        """,
+    },
+}
+
+
+def _render_static_page(path: str) -> str:
+    """
+    SSR for /about, /terms, /privacy, /responsible-gambling.
+
+    Replaces the old `_render_passthrough` for these pages, which served
+    the Lovable SPA shell with the WRONG canonical (pointing to homepage)
+    and the WRONG title (homepage title). Google interpreted this as
+    duplicate content and would deindex these URLs.
+
+    Now each page gets its own title, description, self-canonical, body
+    copy, and BreadcrumbList JSON-LD.
+    """
+    page = _STATIC_PAGES.get(path)
+    if not page:
+        return _render_passthrough(path)
+    body = f"""
+        <nav class="pr-nav">
+          <a href="{SITE_URL}/">WebPronos</a> › {page['breadcrumb']}
+        </nav>
+        <h1 class="pr-h1">{page['h1']}</h1>
+        {page['body']}
+        {_render_pr_footer()}
+    """
+    jsonld = json.dumps({
+        "@context": "https://schema.org",
+        "@type":    "BreadcrumbList",
+        "itemListElement": [
+            {"@type": "ListItem", "position": 1, "name": "WebPronos",         "item": SITE_URL},
+            {"@type": "ListItem", "position": 2, "name": page['breadcrumb'],   "item": f"{SITE_URL}{path}"},
+        ],
+    }, ensure_ascii=False)
+    return _build_html_page(
+        title       = page['title'],
+        description = page['description'],
+        canonical   = f"{SITE_URL}{path}",
+        body_html   = body,
+        jsonld      = jsonld,
     )
 
 
@@ -9756,7 +9968,7 @@ def prerender_dispatch():
         elif path == "/tomorrow" or path == "/upcoming":
             html = _render_tomorrow()
         elif path in ("/about", "/terms", "/privacy", "/responsible-gambling"):
-            html = _render_passthrough(path)
+            html = _render_static_page(path)
         else:
             # Unknown path — pass through Lovable shell
             html = _render_passthrough(path)
