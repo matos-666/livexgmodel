@@ -7607,7 +7607,16 @@ def _build_meta_tags(match: dict, odds: dict | None, override: dict | None) -> d
     # defeating the SEO-stability rule above. Odds belong in the page
     # body, not in <meta>.
 
-    og_image = (override or {}).get("og_image") or "https://webpronos.com/og-default.png"
+    # Prefer (in order):
+    #   1. Manually-set override image from Supabase admin
+    #   2. Home-team crest — recognizable to fans, gives match cards real identity
+    #   3. Generic site default
+    home = match.get("homeTeam", "")
+    og_image = (
+        (override or {}).get("og_image")
+        or (_quick_logo(home) if home else None)
+        or "https://webpronos.com/og-default.png"
+    )
 
     return {"title": title, "description": desc, "og_image": og_image}
 
@@ -7935,9 +7944,16 @@ def prerender_blog(slug: str):
         base_html = _get_base_html()
         if base_html:
             rendered = _inject_blog_content(base_html, meta, canonical, article_html, published_at, author, jsonld)
+            # Best-effort Last-Modified: parse published_at if available
+            try:
+                from email.utils import parsedate_to_datetime
+                blog_lm = int(parsedate_to_datetime(published_at).timestamp()) if published_at else _BUILD_TIME_TS
+            except Exception:
+                blog_lm = _BUILD_TIME_TS
             return rendered, 200, {
                 "Content-Type":  "text/html; charset=utf-8",
                 "Cache-Control": "public, max-age=3600",   # cache 1h — articles don't change often
+                "Last-Modified": _http_date(blog_lm),
             }
 
         # Fallback standalone page (Lovable unreachable)
@@ -8134,9 +8150,11 @@ def prerender_match(match_id: int):
         # Shorter cache on fallback so we retry live data sooner once Sofascore
         # comes back. Live path keeps the original 2-min cache.
         cache_max_age = 600 if used_fallback else 120
+        last_mod_ts = _newest_pick_ts("t.match_id = ?", (match_id,))
         return html, 200, {
             "Content-Type":  "text/html; charset=utf-8",
             "Cache-Control": f"public, max-age={cache_max_age}",
+            "Last-Modified": _http_date(last_mod_ts),
             "X-Source":      "db-fallback" if used_fallback else "live",
         }
 
@@ -9029,8 +9047,10 @@ def _render_team(slug: str) -> tuple:
             og_image=logo_url or None,
         )
         _seo_cache_put(cache_key, html)
+        last_mod_ts = _newest_pick_ts("(g.home_team = ? OR g.away_team = ?)", (name, name))
         return html, 200, {"Content-Type": "text/html; charset=utf-8",
                             "Cache-Control": "public, max-age=600",
+                            "Last-Modified": _http_date(last_mod_ts),
                             "X-Prerender": "webpronos-team"}
     except Exception as e:
         log.exception(f"[prerender/team] Error for slug={slug}: {e}")
@@ -9158,10 +9178,16 @@ def _render_league(slug: str) -> tuple:
             canonical=f"{SITE_URL}/league/{slug}",
             body_html=body,
             jsonld=jsonld,
+            og_image=_league_logo(name) or None,
         )
         _seo_cache_put(cache_key, html)
+        # Last-Modified = most recent pick in any tournament variant of this league
+        variants_for_lm = _league_variants_for(name)
+        ph_lm = ",".join("?" * len(variants_for_lm))
+        last_mod_ts = _newest_pick_ts(f"g.tournament IN ({ph_lm})", tuple(variants_for_lm))
         return html, 200, {"Content-Type": "text/html; charset=utf-8",
                             "Cache-Control": "public, max-age=600",
+                            "Last-Modified": _http_date(last_mod_ts),
                             "X-Prerender": "webpronos-league"}
     except Exception as e:
         log.exception(f"[prerender/league] Error for slug={slug}: {e}")
@@ -9278,8 +9304,12 @@ def _render_tips_market(market_slug: str) -> tuple:
             jsonld=jsonld,
         )
         _seo_cache_put(cache_key, html)
+        # Last-Modified = newest pick matching ANY of this market's LIKE patterns
+        like_where = " OR ".join("t.market LIKE ?" for _ in like_patterns)
+        last_mod_ts = _newest_pick_ts(like_where, tuple(like_patterns))
         return html, 200, {"Content-Type": "text/html; charset=utf-8",
                             "Cache-Control": "public, max-age=600",
+                            "Last-Modified": _http_date(last_mod_ts),
                             "X-Prerender": "webpronos-tips-market"}
     except Exception as e:
         log.exception(f"[prerender/tips-market] Error for {market_slug}: {e}")
@@ -9426,6 +9456,51 @@ def _render_homepage() -> str:
 
 
 # ── Static-content pages (about, terms, etc.) ─────────────────────────────
+def _http_date(ts: int | float | None) -> str:
+    """
+    Format a unix timestamp as an RFC 1123 / HTTP-date string.
+    Example: 'Mon, 11 May 2026 14:30:00 GMT'.
+
+    Used to set the `Last-Modified` response header on prerendered pages
+    so Googlebot can issue conditional `If-Modified-Since` requests on
+    subsequent crawls — saves crawl budget on unchanged pages.
+
+    Falls back to "now" if the timestamp is missing or invalid.
+    """
+    try:
+        from email.utils import formatdate
+        return formatdate(timeval=float(ts) if ts else None, usegmt=True)
+    except Exception:
+        from email.utils import formatdate
+        return formatdate(usegmt=True)
+
+
+# Build time: epoch when this Python process started. Used as a stable
+# Last-Modified for pages that don't have per-row data freshness (homepage,
+# legal pages, blog index, etc). Resets on each deploy, which is exactly
+# what we want — Googlebot will refresh those pages then but not between.
+_BUILD_TIME_TS = int(time.time())
+
+
+def _newest_pick_ts(where_clause: str = "1=1", params: tuple = ()) -> int:
+    """
+    Return the wall_ts of the newest tip matching the optional WHERE
+    clause (joined with `tips t JOIN games g ON g.id = t.match_id`).
+    Falls back to _BUILD_TIME_TS if no rows match. Cheap query — fully
+    indexed on tips(wall_ts) / tips(match_id).
+    """
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                f"SELECT MAX(t.wall_ts) AS m FROM tips t "
+                f"JOIN games g ON g.id = t.match_id WHERE {where_clause}",
+                params,
+            ).fetchone()
+        return int(row["m"]) if row and row["m"] else _BUILD_TIME_TS
+    except Exception:
+        return _BUILD_TIME_TS
+
+
 def _breadcrumb_jsonld(items: list[tuple[str, str]]) -> dict:
     """
     Build a Schema.org BreadcrumbList JSON-LD dict.
@@ -9951,11 +10026,16 @@ def prerender_dispatch():
         if len(path) > 1 and path.endswith("/"):
             path = path.rstrip("/")
 
-        # Route patterns
+        # Route patterns. `last_mod_ts` is set per path so each page gets
+        # an accurate Last-Modified header — Googlebot can then short-circuit
+        # subsequent crawls with If-Modified-Since on pages that haven't changed.
+        last_mod_ts = _BUILD_TIME_TS
         if path == "/" or path == "":
             html = _render_homepage()
+            last_mod_ts = _newest_pick_ts()
         elif path == "/blog":
             html = _render_blog_listing()
+            # blog index lastmod = newest post's published_at (best-effort)
         elif _re.match(r'^/blog/[^/]+$', path):
             slug = path[len("/blog/"):]
             return prerender_blog(slug)
@@ -9970,12 +10050,18 @@ def prerender_dispatch():
             return _render_tips_market(path[len("/tips/"):])
         elif path == "/today":
             html = _render_today()
+            # Pages-of-fixtures recencey ≈ when the upcoming cache last
+            # refreshed. _last_cycle_ts updates every BG cycle (~2 min).
+            last_mod_ts = int(_last_cycle_ts) if _last_cycle_ts else _BUILD_TIME_TS
         elif path == "/history":
             html = _render_history()
+            last_mod_ts = _newest_pick_ts()  # newest pick anywhere
         elif path == "/tomorrow" or path == "/upcoming":
             html = _render_tomorrow()
+            last_mod_ts = int(_last_cycle_ts) if _last_cycle_ts else _BUILD_TIME_TS
         elif path in ("/about", "/terms", "/privacy", "/responsible-gambling"):
             html = _render_static_page(path)
+            # Static legal copy — only changes on deploy
         else:
             # Unknown path — pass through Lovable shell
             html = _render_passthrough(path)
@@ -9983,6 +10069,7 @@ def prerender_dispatch():
         return html, 200, {
             "Content-Type":  "text/html; charset=utf-8",
             "Cache-Control": "public, max-age=300",   # 5min cache
+            "Last-Modified": _http_date(last_mod_ts),
             "X-Prerender":   "webpronos-v1",
         }
     except Exception as e:
