@@ -5138,26 +5138,44 @@ _FOOTER_TTL = 300            # 5 minutes
 
 def _compute_footer_data() -> dict:
     """
-    Build the 4 columns for the dynamic footer:
+    Build the 3 columns for the dynamic footer:
 
-      live_now      — currently-live monitored matches (with score + minute)
-      today_picks   — currently-valid value picks (fresh, not expired) ordered by edge
-      week_leagues  — leagues with scheduled fixtures in the next 7 days
-      markets       — tip markets with POSITIVE all-time ROI (only)
+      live_now      — currently-live matches, ordered by league priority
+                      (Premier League before Brazilian 2nd division), max 5
+      next_kickoff  — next monitored matches starting within the next 24h,
+                      ordered by kickoff time ascending, max 5
+      week_leagues  — leagues by # of fixtures in the next 7 days, max 6
 
     Wording rules (per user feedback 2026-05-11):
-      * Never show "win rate" — only profit (€) or ROI (%); only if positive
       * Always UTC timestamps — never local timezones
-      * "picks" count only for currently-LIVE matches; not for upcoming/finished
+      * "picks" count only for currently-LIVE matches; not for upcoming
+      * Never show win-rate; ROI/profit only, only if positive
+      * Markets column dropped — didn't add value to the footer experience
     """
     out = {
         "live_now":     [],
-        "today_picks":  [],
+        "next_kickoff": [],
         "week_leagues": [],
-        "markets":      [],
     }
 
-    # ── 1. LIVE NOW — read from _live_state (in-memory, populated by BG loop)
+    # ── Build league priority map from the competitions table
+    #    (lower priority number = more important league)
+    priority_by_sk: dict = {}
+    try:
+        with _db() as conn:
+            for r in conn.execute("SELECT sport_key, priority FROM competitions"):
+                priority_by_sk[r["sport_key"]] = r["priority"] or 99
+    except Exception as e:
+        log.warning(f"footer: priority map fetch failed: {e}")
+
+    def _priority_for(tournament: str, country: str) -> int:
+        try:
+            sk = _resolve_sport_key(tournament, country)
+            return priority_by_sk.get(sk, 99)
+        except Exception:
+            return 99
+
+    # ── 1. LIVE NOW — sorted by league priority, then by kick-off recency
     try:
         with _state_lock:
             live_snapshot = list(_live_state.values())
@@ -5166,60 +5184,77 @@ def _compute_footer_data() -> dict:
             m = entry.get("match") or {}
             if m.get("isFinished") or m.get("homeGoals") is None:
                 continue
-            home = m.get("homeTeam", "")
-            away = m.get("awayTeam", "")
-            hg   = m.get("homeGoals", 0) or 0
-            ag   = m.get("awayGoals", 0) or 0
-            mid  = m.get("id")
+            home   = m.get("homeTeam", "")
+            away   = m.get("awayTeam", "")
+            hg     = m.get("homeGoals", 0) or 0
+            ag     = m.get("awayGoals", 0) or 0
+            mid    = m.get("id")
             minute = m.get("minute")
+            tourn  = m.get("tournament", "")
+            country = m.get("country", "")
             picks_now = len(entry.get("livePicks") or entry.get("tips") or [])
             subtitle_bits = []
             if minute is not None:
                 subtitle_bits.append(f"{minute}'")
+            if tourn:
+                subtitle_bits.append(tourn)
             if picks_now > 0:
                 subtitle_bits.append(f"{picks_now} pick" + ("s" if picks_now != 1 else ""))
             live_items.append({
-                "title":    f"{home} {hg}-{ag} {away}",
-                "subtitle": " · ".join(subtitle_bits),
-                "url":      _match_url(mid, home, away),
-                "_minute":  minute or 0,
+                "title":     f"{home} {hg}-{ag} {away}",
+                "subtitle":  " · ".join(subtitle_bits),
+                "url":       _match_url(mid, home, away),
+                "_priority": _priority_for(tourn, country),
+                "_minute":   minute or 0,
             })
-        # Most-recently-started first (high minute)
-        live_items.sort(key=lambda x: -x["_minute"])
+        # Lower priority number = better. Tie-break: more recent (higher minute) first.
+        live_items.sort(key=lambda x: (x["_priority"], -x["_minute"]))
         for it in live_items[:5]:
+            it.pop("_priority", None)
             it.pop("_minute", None)
         out["live_now"] = live_items[:5]
     except Exception as e:
         log.warning(f"footer.live_now build failed: {e}")
 
-    # ── 2. TODAY'S PICKS — fresh, currently-valid value picks across live matches
+    # ── 2. NEXT KICKOFF — upcoming monitored matches in the next 24h
     try:
+        now_ts    = int(time.time())
+        cutoff_ts = now_ts + 24 * 3600
         candidates = []
-        with _state_lock:
-            for entry in _live_state.values():
-                m = entry.get("match") or {}
-                if m.get("isFinished"):
+        now_utc = datetime.now(timezone.utc)
+        for offset in range(2):  # today + tomorrow covers any 24h window
+            date_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
+            cached = _upcoming_cache.get(date_str)
+            if not cached:
+                continue
+            for m in cached.get("matches", []):
+                ts = m.get("startTimestamp", 0) or 0
+                if ts <= now_ts or ts > cutoff_ts:
                     continue
-                home = m.get("homeTeam", "")
-                away = m.get("awayTeam", "")
-                mid  = m.get("id")
-                for p in (entry.get("livePicks") or []):
-                    edge = p.get("edge") or p.get("edge_entry") or 0
-                    odd  = p.get("odd")  or p.get("odd_entry")  or 0
-                    if edge <= 0 or odd <= 1.0:
-                        continue
-                    candidates.append({
-                        "title":    f"{p.get('label','?')} @ {odd:.2f}",
-                        "subtitle": f"+{edge:.1f}% edge · {home} vs {away}",
-                        "url":      _match_url(mid, home, away),
-                        "_edge":    edge,
-                    })
-        candidates.sort(key=lambda x: -x["_edge"])
+                sk = m.get("_sport_key")
+                # Only show matches in our monitored leagues — avoids
+                # Norwegian 3rd division etc cluttering the footer.
+                if sk not in MONITORED_SPORT_KEYS:
+                    continue
+                home  = m.get("homeTeam", "")
+                away  = m.get("awayTeam", "")
+                tourn = m.get("tournament", "")
+                kick_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M UTC")
+                candidates.append({
+                    "title":    f"{home} vs {away}",
+                    "subtitle": f"{kick_str}" + (f" · {tourn}" if tourn else ""),
+                    "url":      _match_url(m.get("id"), home, away),
+                    "_ts":      ts,
+                    "_priority": priority_by_sk.get(sk, 99),
+                })
+        # Soonest first; tie-break by league priority
+        candidates.sort(key=lambda x: (x["_ts"], x["_priority"]))
         for it in candidates[:5]:
-            it.pop("_edge", None)
-        out["today_picks"] = candidates[:5]
+            it.pop("_ts", None)
+            it.pop("_priority", None)
+        out["next_kickoff"] = candidates[:5]
     except Exception as e:
-        log.warning(f"footer.today_picks build failed: {e}")
+        log.warning(f"footer.next_kickoff build failed: {e}")
 
     # ── 3. WEEK LEAGUES — aggregate next 7 days from _upcoming_cache
     try:
@@ -5245,45 +5280,6 @@ def _compute_footer_data() -> dict:
     except Exception as e:
         log.warning(f"footer.week_leagues build failed: {e}")
 
-    # ── 4. MARKETS — only positive-ROI markets (no win-rate ever, per user)
-    try:
-        STAKE = get_setting("stake_per_bet", 100.0) or 100.0
-        rows = []
-        with _db() as conn:
-            rows = conn.execute("""
-                SELECT market,
-                       SUM(CASE WHEN result = 'green' THEN (odd_entry - 1) * ?
-                                WHEN result = 'red'   THEN -1 * ?
-                                ELSE 0 END)            AS profit,
-                       COUNT(*) FILTER (WHERE result IN ('green','red')) AS settled
-                FROM tips
-                WHERE result IN ('green', 'red')
-                GROUP BY market
-                HAVING settled >= 20
-            """, (STAKE, STAKE)).fetchall()
-        market_items = []
-        for r in rows:
-            settled = r["settled"] or 0
-            profit  = r["profit"] or 0.0
-            if settled <= 0:
-                continue
-            roi = (profit / (settled * STAKE)) * 100
-            if roi <= 0:           # user rule: only show positive markets
-                continue
-            market_slug = _slug(r["market"])
-            market_items.append({
-                "title":    r["market"],
-                "subtitle": f"+{roi:.1f}% ROI",
-                "url":      f"{SITE_URL}/tips/{market_slug}",
-                "_roi":     roi,
-            })
-        market_items.sort(key=lambda x: -x["_roi"])
-        for it in market_items[:5]:
-            it.pop("_roi", None)
-        out["markets"] = market_items[:5]
-    except Exception as e:
-        log.warning(f"footer.markets build failed: {e}")
-
     return out
 
 
@@ -5302,11 +5298,10 @@ def r_footer_dynamic():
     Returns a 4-column payload for the site footer. Pure read of the
     in-memory `_footer_cache`, populated by the background loop.
 
-    Frontend (Lovable) calls this once per page load and renders:
-      live_now      — Live matches happening right now (with score + minute)
-      today_picks   — Best currently-valid value picks (highest edge)
-      week_leagues  — Top leagues by # of fixtures in next 7 days
-      markets       — Markets with positive all-time ROI
+    Frontend (Lovable) calls this once per page load and renders 3 columns:
+      live_now      — Live matches now, ordered by league priority (max 5)
+      next_kickoff  — Next monitored matches starting in <24h (max 5)
+      week_leagues  — Top leagues by # of fixtures in next 7 days (max 6)
     """
     data = _footer_cache.get("data")
     if data is None:
@@ -5317,7 +5312,7 @@ def r_footer_dynamic():
             _footer_cache["ts"]   = time.time()
         except Exception as e:
             log.warning(f"r_footer_dynamic cold build failed: {e}")
-            data = {"live_now": [], "today_picks": [], "week_leagues": [], "markets": []}
+            data = {"live_now": [], "next_kickoff": [], "week_leagues": []}
 
     return jsonify({
         **data,
