@@ -5938,6 +5938,128 @@ def _team_performance(name: str, recent_n: int = 5) -> dict:
     return out
 
 
+def _league_performance(variants: list[str], recent_days: int = 30) -> dict:
+    """
+    Aggregate league-wide stats from our local DB. Mirrors the shape of
+    `_team_performance` but at competition level. Drives the SEO copy on
+    /league/<slug> pages.
+
+    Returns:
+      matches_tracked:     number of finished games we observed
+      goals_per_match:     average total goals across observed games
+      avg_xg_per_match:    average TOTAL xG per game (home + away)
+      track_record:        {settled, wins, losses, pnl, roi, avg_odds}
+      top_attack:          [{team, avg_goals_for}, ...] top 3 scorers we saw
+      recent_form_text:    short factual sentence about the last N days
+      sample_size:         total finished games used
+    """
+    out = {
+        "matches_tracked":  0,
+        "goals_per_match":  None,
+        "avg_xg_per_match": None,
+        "track_record":     None,
+        "top_attack":       [],
+        "recent_form_text": "",
+        "sample_size":      0,
+    }
+    if not variants:
+        return out
+    placeholders = ",".join("?" * len(variants))
+    try:
+        with _db() as conn:
+            # 1. Finished games in this league
+            games = conn.execute(
+                f"SELECT id, home_team, away_team, home_goals, away_goals, start_ts "
+                f"FROM games WHERE is_finished = 1 "
+                f"AND home_goals IS NOT NULL AND away_goals IS NOT NULL "
+                f"AND tournament IN ({placeholders})",
+                tuple(variants)
+            ).fetchall()
+            if not games:
+                return out
+            out["matches_tracked"] = len(games)
+            out["sample_size"]     = len(games)
+            total_goals = sum((g["home_goals"] or 0) + (g["away_goals"] or 0) for g in games)
+            out["goals_per_match"] = round(total_goals / len(games), 2)
+
+            # 2. Average xG per match (only games that have shot data)
+            ids_csv = ",".join(str(g["id"]) for g in games)
+            xg_rows = conn.execute(
+                f"SELECT match_id, SUM(xg) AS total_xg "
+                f"FROM match_shots WHERE match_id IN ({ids_csv}) "
+                f"GROUP BY match_id"
+            ).fetchall()
+            if xg_rows:
+                avg_xg = sum((r["total_xg"] or 0) for r in xg_rows) / len(xg_rows)
+                out["avg_xg_per_match"] = round(avg_xg, 2)
+
+            # 3. Track record on picks for this league
+            STAKE = get_setting("stake_per_bet", 100.0) or 100.0
+            tip_rows = conn.execute(
+                f"SELECT t.result, t.odd_entry FROM tips t "
+                f"JOIN games g ON g.id = t.match_id "
+                f"WHERE g.tournament IN ({placeholders}) "
+                f"AND t.result IN ('green', 'red', 'win', 'loss', 'void')",
+                tuple(variants)
+            ).fetchall()
+            if tip_rows:
+                wins   = sum(1 for r in tip_rows if (r["result"] or "").lower() in ("green", "win"))
+                losses = sum(1 for r in tip_rows if (r["result"] or "").lower() in ("red", "loss"))
+                voids  = sum(1 for r in tip_rows if (r["result"] or "").lower() == "void")
+                settled_for_pnl = wins + losses  # voids contribute 0 to pnl
+                pnl = 0.0
+                odd_sum, odd_n = 0.0, 0
+                for r in tip_rows:
+                    if r["odd_entry"]:
+                        odd_sum += r["odd_entry"]; odd_n += 1
+                    res = (r["result"] or "").lower()
+                    if res in ("green", "win") and r["odd_entry"]:
+                        pnl += (r["odd_entry"] - 1) * STAKE
+                    elif res in ("red", "loss"):
+                        pnl -= STAKE
+                roi = (pnl / (settled_for_pnl * STAKE) * 100) if settled_for_pnl else 0.0
+                out["track_record"] = {
+                    "settled":  wins + losses + voids,
+                    "wins":     wins,
+                    "losses":   losses,
+                    "voids":    voids,
+                    "pnl":      round(pnl, 0),
+                    "roi":      round(roi, 1),
+                    "avg_odds": round(odd_sum / odd_n, 2) if odd_n else 0.0,
+                }
+
+            # 4. Top scoring teams (avg goals for, per match) — needs ≥2 games
+            from collections import defaultdict
+            team_goals = defaultdict(lambda: {"games": 0, "goals": 0})
+            for g in games:
+                team_goals[g["home_team"]]["games"] += 1
+                team_goals[g["home_team"]]["goals"] += g["home_goals"] or 0
+                team_goals[g["away_team"]]["games"] += 1
+                team_goals[g["away_team"]]["goals"] += g["away_goals"] or 0
+            ranked = sorted(
+                ((t, d["games"], d["goals"] / d["games"]) for t, d in team_goals.items() if d["games"] >= 2),
+                key=lambda x: -x[2]
+            )
+            out["top_attack"] = [
+                {"team": t, "matches": n, "avg_goals_for": round(g, 2)}
+                for t, n, g in ranked[:3]
+            ]
+
+            # 5. Recent activity in last N days
+            now_ts = int(time.time())
+            cutoff = now_ts - recent_days * 86400
+            recent = [g for g in games if (g["start_ts"] or 0) >= cutoff]
+            if recent:
+                rg = sum((g["home_goals"] or 0) + (g["away_goals"] or 0) for g in recent) / len(recent)
+                out["recent_form_text"] = (
+                    f"{len(recent)} matches in the last {recent_days} days "
+                    f"averaging {rg:.2f} goals per game"
+                )
+    except Exception as e:
+        log.warning(f"_league_performance failed: {e}")
+    return out
+
+
 def _next_fixture_for_team(name: str) -> dict | None:
     """Earliest upcoming match (any tournament) involving this team."""
     for m in _scan_upcoming():
@@ -9158,12 +9280,103 @@ def _render_league(slug: str) -> tuple:
         logo_img = (f'<img src="{logo_url}" alt="{name} logo" '
                     f'style="width:64px;height:64px;vertical-align:middle;margin-right:.75rem">'
                     if logo_url else "")
+
+        # ── Build rich SEO intro paragraph from real DB data ─────────────
+        perf = _league_performance(variants, recent_days=30)
+        intro_bits = []
+        country_phrase = f" ({country})" if country else ""
+
+        if perf["matches_tracked"] >= 5:
+            # We have enough data to be specific
+            intro_lead = (
+                f"WebPronos publishes AI-generated value picks for {name}{country_phrase} "
+                f"using a live xG model. We've tracked {perf['matches_tracked']} "
+                f"completed matches"
+            )
+            facts = []
+            if perf["goals_per_match"] is not None:
+                facts.append(f"averaging {perf['goals_per_match']} goals per game")
+            if perf["avg_xg_per_match"] is not None:
+                facts.append(f"and {perf['avg_xg_per_match']} total xG")
+            if facts:
+                intro_lead += " — " + " ".join(facts)
+            intro_lead += "."
+            intro_bits.append(intro_lead)
+
+            tr = perf.get("track_record") or {}
+            if tr and tr.get("settled", 0) >= 5:
+                roi_str = f"{tr['roi']:+.1f}% ROI" if tr['roi'] != 0 else "break-even ROI"
+                pnl_str = f"€{tr['pnl']:+.0f}" if tr['pnl'] else "€0"
+                intro_bits.append(
+                    f"Our settled track record in this competition: {tr['settled']} picks, "
+                    f"{tr['wins']} winners and {tr['losses']} losers at {tr['avg_odds']:.2f} avg odds, "
+                    f"closing at {pnl_str} ({roi_str})."
+                )
+
+            if perf["top_attack"]:
+                ta = perf["top_attack"]
+                top_str = ", ".join(
+                    f'<a href="{SITE_URL}/team/{_slug(t["team"])}" style="color:#22d3ee">{t["team"]}</a> ({t["avg_goals_for"]} per game)'
+                    for t in ta[:3]
+                )
+                intro_bits.append(f"Top attacks in our sample: {top_str}.")
+
+            if perf["recent_form_text"]:
+                intro_bits.append(f"Recent activity: {perf['recent_form_text']}.")
+        elif perf["matches_tracked"] > 0:
+            intro_bits.append(
+                f"AI-driven live and pre-match football tips for {name}{country_phrase}. "
+                f"We've tracked {perf['matches_tracked']} completed match"
+                + ("es" if perf['matches_tracked'] != 1 else "")
+                + " in this competition so far — more data accrues with every fixture."
+            )
+        else:
+            intro_bits.append(
+                f"AI-driven live and pre-match football tips for {name}{country_phrase}. "
+                f"Coverage starts the moment the first monitored fixture kicks off."
+            )
+
+        intro_bits.append(
+            f"Browse the {len(upcoming)} upcoming fixture"
+            + ("s" if len(upcoming) != 1 else "")
+            + f" we'll be live-modeling, plus the full audit of every pick we've issued in {name} below."
+        )
+        intro_html = " ".join(intro_bits)
+
+        # ── Stat strip (track-record snapshot)
+        tr = perf.get("track_record") or {}
+        if tr and tr.get("settled", 0) > 0:
+            stat_strip = (
+                f'<span class="pr-stat">Picks tracked: <strong>{tr["settled"]}</strong></span>'
+                f'<span class="pr-stat">Wins: <strong>{tr["wins"]}</strong></span>'
+                f'<span class="pr-stat">Losses: <strong>{tr["losses"]}</strong></span>'
+                + (f'<span class="pr-stat">Push: <strong>{tr["voids"]}</strong></span>' if tr.get("voids") else '')
+                + f'<span class="pr-stat">Avg odds: <strong>@{tr["avg_odds"]:.2f}</strong></span>'
+                + f'<span class="pr-stat">P&amp;L: <strong>{"+" if tr["pnl"] > 0 else ""}{tr["pnl"]:.0f}€</strong></span>'
+            )
+        else:
+            stat_strip = ""
+
+        # ── League stat strip (on-pitch averages, separate from pick track record)
+        if perf["matches_tracked"] >= 3:
+            pitch_bits = [f'<span class="pr-stat">Matches tracked: <strong>{perf["matches_tracked"]}</strong></span>']
+            if perf["goals_per_match"] is not None:
+                pitch_bits.append(f'<span class="pr-stat">Goals/match: <strong>{perf["goals_per_match"]}</strong></span>')
+            if perf["avg_xg_per_match"] is not None:
+                pitch_bits.append(f'<span class="pr-stat">xG/match: <strong>{perf["avg_xg_per_match"]}</strong></span>')
+            pitch_strip = "".join(pitch_bits)
+        else:
+            pitch_strip = ""
+
         body = f"""
         <nav class="pr-nav">
-          <a href="{SITE_URL}/">WebPronos</a> › <a href="{SITE_URL}/leagues" style="color:#22d3ee">Leagues</a> › {name}
+          <a href="{SITE_URL}/">WebPronos</a> › {name}
         </nav>
-        <h1 class="pr-h1">{logo_img}{name}</h1>
-        <p class="pr-lead">AI-driven live and pre-match football tips for {name}{f" ({country})" if country else ""}. Upcoming fixtures and the latest recorded picks below.</p>
+        <h1 class="pr-h1">{logo_img}{name} — AI Football Tips, xG Analysis & Track Record</h1>
+        <p class="pr-lead">{intro_html}</p>
+
+        {f'<div style="margin:1.5rem 0">{pitch_strip}</div>' if pitch_strip else ''}
+        {f'<div style="margin:1rem 0 1.5rem">{stat_strip}</div>' if stat_strip else ''}
 
         <h2 class="pr-h2">Upcoming fixtures</h2>
         <table class="pr-table">
@@ -9198,9 +9411,29 @@ def _render_league(slug: str) -> tuple:
             _breadcrumb_jsonld([("WebPronos", "/"), (name, f"/league/{slug}")]),
         ], ensure_ascii=False)
 
+        # Meta description: prioritise the strongest factual signal we have
+        # (xG/goal averages or track-record), fall back to generic if data thin.
+        if perf["matches_tracked"] >= 5 and perf["goals_per_match"] is not None:
+            meta_desc = (
+                f"AI football tips & xG analysis for {name}. {perf['matches_tracked']} matches tracked, "
+                f"averaging {perf['goals_per_match']} goals per game. "
+                f"{len(upcoming)} upcoming fixtures with live picks and full audit trail."
+            )
+        elif tr and tr.get("settled", 0) >= 5:
+            meta_desc = (
+                f"AI football tips for {name}. {tr['settled']} settled picks at {tr['avg_odds']:.2f} avg odds, "
+                f"running {'+' if tr['pnl'] > 0 else ''}{tr['pnl']:.0f}€ P&L ({tr['roi']:+.1f}% ROI). "
+                f"{len(upcoming)} upcoming fixtures."
+            )
+        else:
+            meta_desc = (
+                f"AI football tips and predictions for {name}{country_phrase}. "
+                f"{len(upcoming)} upcoming fixtures with live xG picks and full audit trail."
+            )
+
         html = _build_html_page(
-            title=f"{name} — Live Football Tips & Predictions | WebPronos",
-            description=f"AI-generated tips and predictions for {name}. {len(upcoming)} upcoming fixtures and {len(recent_picks)} recent picks with full results.",
+            title=f"{name} — AI Football Tips, xG Analysis & Predictions | WebPronos",
+            description=meta_desc,
             canonical=f"{SITE_URL}/league/{slug}",
             body_html=body,
             jsonld=jsonld,
@@ -9846,6 +10079,9 @@ def r_seo_league(slug: str):
 
         upcoming = _upcoming_for_league(name, limit=20)
         picks = [_format_pick_row(r) for r in picks_rows]
+        # League-wide on-pitch stats — same data the prerender uses to build
+        # the SEO copy. Exposed here so Lovable can render the enriched view.
+        performance = _league_performance(variants, recent_days=30)
         payload = {
             "league_name":  name,
             "slug":         slug,
@@ -9854,6 +10090,7 @@ def r_seo_league(slug: str):
             "upcoming":     upcoming,
             "recent_picks": picks,
             "stats":        _calc_stats(picks),
+            "performance":  performance,
         }
         body = json.dumps(payload, ensure_ascii=False)
         _seo_cache_put(cache_key, body)
