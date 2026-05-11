@@ -213,6 +213,16 @@ _COUNTRY_FLAGS = {
     "usa": "🇺🇸", "brazil": "🇧🇷", "argentina": "🇦🇷", "mexico": "🇲🇽",
     "colombia": "🇨🇴", "chile": "🇨🇱", "japan": "🇯🇵", "south korea": "🇰🇷",
     "australia": "🇦🇺", "china": "🇨🇳",
+    "saudi arabia": "🇸🇦", "uae": "🇦🇪", "qatar": "🇶🇦", "iran": "🇮🇷",
+    "ireland": "🇮🇪", "wales": "🏴󠁧󠁢󠁷󠁬󠁳󠁿", "northern ireland": "🇬🇧",
+    "finland": "🇫🇮", "iceland": "🇮🇸", "romania": "🇷🇴", "hungary": "🇭🇺",
+    "croatia": "🇭🇷", "serbia": "🇷🇸", "slovenia": "🇸🇮", "slovakia": "🇸🇰",
+    "bulgaria": "🇧🇬", "israel": "🇮🇱", "cyprus": "🇨🇾",
+    "uruguay": "🇺🇾", "paraguay": "🇵🇾", "peru": "🇵🇪", "ecuador": "🇪🇨",
+    "venezuela": "🇻🇪", "bolivia": "🇧🇴", "canada": "🇨🇦",
+    "south africa": "🇿🇦", "morocco": "🇲🇦", "egypt": "🇪🇬", "nigeria": "🇳🇬",
+    "india": "🇮🇳", "thailand": "🇹🇭", "vietnam": "🇻🇳", "indonesia": "🇮🇩",
+    "malaysia": "🇲🇾",
     # Confederations / international competitions
     "europe": "🇪🇺", "international": "🌍", "world": "🌍",
     "south america": "🌎", "north america": "🌎", "americas": "🌎",
@@ -5371,8 +5381,14 @@ def _fetch_day_matches(date_str: str) -> list:
 
         tourn        = m.get("tournament", {})
         tourn_name   = tourn.get("name", "") if isinstance(tourn, dict) else str(tourn or "")
-        country      = m.get("country", {})
-        country_name = country.get("name", "") if isinstance(country, dict) else str(country or "")
+        # Sofascore exposes country as `tournament.category.name`, NOT as a
+        # top-level `event.country` field. The previous code read
+        # `m.get("country", {})` and got empty strings — which broke the
+        # country flag emoji on the daily preview message and elsewhere.
+        if isinstance(tourn, dict):
+            country_name = (tourn.get("category") or {}).get("name", "")
+        else:
+            country_name = ""
 
         if not _is_monitored_league_strict(tourn_name, country_name):
             continue
