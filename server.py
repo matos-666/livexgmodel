@@ -787,28 +787,38 @@ def _send_daily_summary(days_back: int = 0, force_send: bool = False):
         avg_odds = odds_sum / settled if settled > 0 else 0.0
         roi = (lucro / (settled * STAKE) * 100) if settled > 0 else 0.0
 
-        # Find the bet with the highest odd, with match info
-        # NOTE: tips are sqlite3.Row objects — no .get(), use indexing with try/except
-        max_odd_tip = max(tips, key=lambda t: t["odd_entry"] or 0)
+        # Find the WIN with the highest odd — the day's biggest hit.
+        # User clarification (2026-05-11): "Maior Odd do Dia" must be the
+        # biggest GREEN of the day, not just the highest odds overall (a
+        # losing bet with 3.85 odds isn't a "maior odd" highlight, it's
+        # a -€100 line). If there are no wins, skip this section entirely.
+        # NOTE: tips are sqlite3.Row objects — no .get(), use indexing
         def _row_get(row, key, default=""):
             try:
                 v = row[key]
                 return v if v is not None else default
             except (IndexError, KeyError):
                 return default
-        maior_odd  = max_odd_tip["odd_entry"]
-        bet_label  = _row_get(max_odd_tip, 'label', '?')
-        bet_market = _row_get(max_odd_tip, 'market', '?')
-        home_team  = _row_get(max_odd_tip, 'home_team', '')
-        away_team  = _row_get(max_odd_tip, 'away_team', '')
 
-        # Build match string
-        if home_team and away_team:
-            match_str = f"{home_team} vs {away_team}"
-        else:
-            match_str = "Match desconhecido"
+        winning_tips = [t for t in tips if (t["result"] or "").lower() in ("green", "win")]
+        biggest_win = max(winning_tips, key=lambda t: t["odd_entry"] or 0) if winning_tips else None
 
-        bet_with_maior_odd = f"{bet_label} ({bet_market})"
+        biggest_win_block = []
+        if biggest_win:
+            bw_odd    = biggest_win["odd_entry"] or 0
+            bw_label  = _row_get(biggest_win, 'label', '?')
+            bw_market = _row_get(biggest_win, 'market', '?')
+            bw_home   = _row_get(biggest_win, 'home_team', '')
+            bw_away   = _row_get(biggest_win, 'away_team', '')
+            bw_match  = f"{bw_home} vs {bw_away}" if bw_home and bw_away else "Match desconhecido"
+            bw_profit = (bw_odd - 1) * STAKE
+            biggest_win_block = [
+                "",
+                f"🎯 <b>Maior Odd do Dia:</b> {bw_odd:.2f}",
+                f"   <i>{bw_label} ({bw_market})</i>",
+                f"   <i>{bw_match}</i>",
+                f"   💰 Lucro gerado: <b>+€{bw_profit:.2f}</b>",
+            ]
 
         # Format the message with match context and encouragement
         date_str = target_start.strftime("%d/%m/%Y")
@@ -820,10 +830,7 @@ def _send_daily_summary(days_back: int = 0, force_send: bool = False):
             f"💶 <b>Lucro:</b> €{lucro:.2f}",
             f"📊 <b>Odds Médias:</b> {avg_odds:.2f}",
             f"📈 <b>ROI:</b> {roi:.1f}%",
-            "",
-            f"🎯 <b>Maior Odd do Dia:</b> {maior_odd:.2f}",
-            f"   <i>{bet_with_maior_odd}</i>",
-            f"   <i>{match_str}</i>",
+            *biggest_win_block,
             "",
             f"<i>Mantém a vigilância nas entradas de amanhã — o edge está lá! 🚀</i>",
         ]
