@@ -7582,38 +7582,129 @@ def prerender_blog(slug: str):
 
 
 @app.route("/prerender/match/<int:match_id>")
+def _event_from_db(match_id: int) -> dict | None:
+    """
+    Reconstruct an event-shaped dict from the local `games` table.
+
+    Used as a fallback by `prerender_match` when Sofascore is unreachable
+    (rate-limited, region-blocked, network error). Output shape matches
+    what `_parse_event()` returns so downstream renderers don't care
+    whether the data came from Sofascore or the DB.
+
+    Caveats — these are acceptable for SEO bots but not for live UX:
+      - `minute` is None (DB has no live clock)
+      - `currentPeriodStartTimestamp` is None
+      - `statusCode` is a best-guess (100 if finished, 0 if pre-kickoff,
+        7 = "second half" if in-progress as a benign default)
+      - `tournamentId` is None (not stored in DB)
+
+    Returns None if the match is not in the DB at all (= genuine 404).
+    """
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT id, home_team, away_team, home_goals, away_goals, "
+                "tournament, country, is_finished, start_ts, "
+                "home_team_id, away_team_id "
+                "FROM games WHERE id = ?",
+                (match_id,)
+            ).fetchone()
+        if not row:
+            return None
+
+        now      = int(time.time())
+        is_fin   = bool(row["is_finished"])
+        st_ts    = row["start_ts"] or 0
+
+        if is_fin:
+            status_type, status_code = "finished", 100
+        elif st_ts > now:
+            status_type, status_code = "notstarted", 0
+        else:
+            status_type, status_code = "inprogress", 7
+
+        slug = f"{_slug(row['home_team'])}-vs-{_slug(row['away_team'])}"
+
+        return {
+            "id":             row["id"],
+            "slug":           slug,
+            "homeTeam":       row["home_team"],
+            "homeTeamId":     row["home_team_id"],
+            "awayTeam":       row["away_team"],
+            "awayTeamId":     row["away_team_id"],
+            "homeGoals":      row["home_goals"] or 0,
+            "awayGoals":      row["away_goals"] or 0,
+            "statusCode":     status_code,
+            "statusType":     status_type,
+            "statusDesc":     "",
+            "minute":         None,
+            "injuryTime":     0,
+            "startTimestamp": st_ts,
+            "currentPeriodStartTimestamp": None,
+            "tournament":     row["tournament"] or "",
+            "tournamentId":   None,
+            "country":        row["country"] or "",
+            "isLive":         status_type == "inprogress",
+            "isFinished":     is_fin,
+            "isScheduled":    status_type == "notstarted",
+            "_db_fallback":   True,
+        }
+    except Exception as e:
+        log.warning(f"_event_from_db({match_id}) failed: {e}")
+        return None
+
+
 def prerender_match(match_id: int):
     """
     SEO prerender endpoint for match pages.
     Called by the Cloudflare Worker when a bot (Googlebot, Twitterbot, etc.) requests /match/:id.
-    Returns the Lovable SPA shell with dynamic meta tags injected for the specific match.
+    Returns fully-rendered HTML with meta tags + body content for the match.
+
+    Strategy:
+      1. Try Sofascore live for fresh data (live score, current minute, odds).
+      2. If Sofascore is unavailable (region-blocked, network down), fall back
+         to the `games` table which has the last-known data — this keeps SEO
+         pages indexable even during anti-bot lockouts. Stale data is
+         infinitely better than a 404 (which would lead to deindexing).
+      3. Only return 404 if the match genuinely doesn't exist in either source.
     """
     try:
-        # 1. Fetch match data
+        used_fallback = False
+
+        # 1. Try live Sofascore first
         event = get_event(match_id)
+
+        # 2. Fall back to local DB if live fetch failed
+        if not event:
+            event = _event_from_db(match_id)
+            used_fallback = True
+            if event:
+                log.info(f"[prerender_match {match_id}] using DB fallback (Sofascore unavailable)")
+
+        # 3. Genuine 404 — match not in Sofascore AND not in our DB
         if not event:
             return "Not found", 404
 
-        # 2. Fetch odds (best-effort, don't block on failure)
-        try:
-            from flask import g as _g
-            odds = get_full_odds_analysis(event, get_shotmap(match_id))
-        except Exception:
-            odds = None
+        # 4. Odds: only attempt with fresh event data (live odds require live event context)
+        odds = None
+        if not used_fallback:
+            try:
+                odds = get_full_odds_analysis(event, get_shotmap(match_id))
+            except Exception:
+                odds = None
 
-        # 3. Check for manual Supabase override
+        # 5. Manual Supabase override (preserves admin-set titles/descriptions)
         override = _supabase_get_seo_override(match_id)
 
-        # 4. Build meta
+        # 6. Meta + canonical
         meta = _build_meta_tags(event, odds, override)
-        # Use slug in canonical URL if available (better SEO)
         slug = event.get("slug", "")
         canonical = f"{SITE_URL}/match/{match_id}/{slug}" if slug else f"{SITE_URL}/match/{match_id}"
 
-        # 5. Build the visible body content (NEW: full match info, not just meta)
+        # 7. Body
         body_html = _render_match_body(event, odds, match_id)
 
-        # 6. SportsEvent JSON-LD for rich results
+        # 8. SportsEvent JSON-LD for rich results
         try:
             from datetime import datetime as _dt, timezone as _tz
             ts = event.get("startTimestamp", 0)
@@ -7632,7 +7723,7 @@ def prerender_match(match_id: int):
         except Exception:
             jsonld = ""
 
-        # 7. Render with full meta + body
+        # 9. Render
         html = _build_html_page(
             title       = meta["title"],
             description = meta["description"],
@@ -7641,9 +7732,13 @@ def prerender_match(match_id: int):
             jsonld      = jsonld,
             og_image    = meta.get("og_image"),
         )
+        # Shorter cache on fallback so we retry live data sooner once Sofascore
+        # comes back. Live path keeps the original 2-min cache.
+        cache_max_age = 600 if used_fallback else 120
         return html, 200, {
             "Content-Type":  "text/html; charset=utf-8",
-            "Cache-Control": "public, max-age=120",  # 2min — match data changes during games
+            "Cache-Control": f"public, max-age={cache_max_age}",
+            "X-Source":      "db-fallback" if used_fallback else "live",
         }
 
     except Exception as e:
