@@ -5784,6 +5784,153 @@ def _upcoming_for_league(name: str, limit: int = 20) -> list[dict]:
     return out
 
 
+def _team_performance(name: str, recent_n: int = 5) -> dict:
+    """
+    Aggregate recent on-pitch performance for a team from our local DB.
+
+    Pulls the last `recent_n` finished games involving this team and computes:
+      - recent_games:   list of {date, opponent, was_home, score, result, xg_for, xg_against}
+      - form_letters:   chronological string of W/D/L for those games (e.g. "WWLDW")
+      - streak:         {type: "win"|"loss"|"unbeaten"|"draw"|"none", length, text}
+      - xg_summary:     {avg_for, avg_against, avg_goals_for, avg_goals_against,
+                         sample_size, overperforming: bool|None}
+      - sample_size:    how many tracked games we found (caller can adapt copy)
+
+    All numbers are derived from data we actually observed (games + match_shots
+    tables); we don't make up season totals or league standings.
+    """
+    out = {
+        "recent_games":  [],
+        "form_letters":  "",
+        "streak":        {"type": "none", "length": 0, "text": ""},
+        "xg_summary":    None,
+        "sample_size":   0,
+    }
+    try:
+        with _db() as conn:
+            games = conn.execute("""
+                SELECT id, home_team, away_team, home_goals, away_goals,
+                       start_ts, tournament
+                FROM games
+                WHERE is_finished = 1
+                  AND home_goals IS NOT NULL AND away_goals IS NOT NULL
+                  AND (home_team = ? OR away_team = ?)
+                ORDER BY start_ts DESC
+                LIMIT ?
+            """, (name, name, recent_n)).fetchall()
+
+            if not games:
+                return out
+            out["sample_size"] = len(games)
+
+            # Aggregate xG for/against from match_shots, keyed by match_id
+            ids_csv = ",".join(str(g["id"]) for g in games)
+            xg_rows = conn.execute(
+                f"SELECT match_id, is_home, SUM(xg) AS sum_xg "
+                f"FROM match_shots WHERE match_id IN ({ids_csv}) "
+                f"GROUP BY match_id, is_home"
+            ).fetchall()
+            xg_by = {}
+            for r in xg_rows:
+                xg_by.setdefault(r["match_id"], {})[bool(r["is_home"])] = r["sum_xg"] or 0.0
+
+        recent = []
+        for g in games:  # already DESC by start_ts (most recent first)
+            was_home = (g["home_team"] == name)
+            opponent = g["away_team"] if was_home else g["home_team"]
+            gf = g["home_goals"] if was_home else g["away_goals"]
+            ga = g["away_goals"] if was_home else g["home_goals"]
+            if gf > ga:    result = "W"
+            elif gf < ga:  result = "L"
+            else:          result = "D"
+
+            xg_pair = xg_by.get(g["id"], {})
+            xg_for     = xg_pair.get(was_home)         # team's own xG
+            xg_against = xg_pair.get(not was_home)     # opponent's xG
+
+            from datetime import datetime as _dt, timezone as _tz
+            date_str = _dt.fromtimestamp(g["start_ts"], tz=_tz.utc).strftime("%b %d") if g["start_ts"] else ""
+
+            recent.append({
+                "match_id":   g["id"],
+                "date":       date_str,
+                "opponent":   opponent,
+                "was_home":   was_home,
+                "score":      f"{gf}-{ga}",     # always team's perspective
+                "result":     result,
+                "xg_for":     round(xg_for, 2)     if xg_for     is not None else None,
+                "xg_against": round(xg_against, 2) if xg_against is not None else None,
+                "tournament": g["tournament"] or "",
+            })
+
+        out["recent_games"] = recent
+        # Form letters chronological (oldest → newest, like "WWLDW")
+        out["form_letters"] = "".join(r["result"] for r in reversed(recent))
+
+        # Streak — count consecutive most-recent results matching some category
+        # Most recent first
+        first = recent[0]["result"]
+        if first == "W":
+            i = 0
+            while i < len(recent) and recent[i]["result"] == "W":
+                i += 1
+            out["streak"] = {
+                "type": "win", "length": i,
+                "text": (f"on a {i}-game winning run" if i >= 2 else "coming off a win"),
+            }
+        elif first == "L":
+            i = 0
+            while i < len(recent) and recent[i]["result"] == "L":
+                i += 1
+            out["streak"] = {
+                "type": "loss", "length": i,
+                "text": (f"coming off {i} consecutive losses" if i >= 2 else "coming off a defeat"),
+            }
+        else:  # first is "D"
+            # Unbeaten run? Count consecutive non-losses
+            i = 0
+            while i < len(recent) and recent[i]["result"] in ("W", "D"):
+                i += 1
+            if i >= 2:
+                out["streak"] = {
+                    "type": "unbeaten", "length": i,
+                    "text": f"unbeaten in their last {i}",
+                }
+            else:
+                out["streak"] = {"type": "draw", "length": 1, "text": "drawing their last match"}
+
+        # xG aggregates — only include matches where we have shot data on both sides
+        valid_xg = [r for r in recent if r["xg_for"] is not None and r["xg_against"] is not None]
+        if valid_xg:
+            n = len(valid_xg)
+            avg_for     = sum(r["xg_for"]     for r in valid_xg) / n
+            avg_against = sum(r["xg_against"] for r in valid_xg) / n
+            # Goals on the same sample for like-for-like comparison
+            goals_for = []
+            goals_against = []
+            for r in valid_xg:
+                gf, ga = r["score"].split("-")
+                goals_for.append(int(gf))
+                goals_against.append(int(ga))
+            avg_gf = sum(goals_for) / n
+            avg_ga = sum(goals_against) / n
+            # Overperforming if scoring noticeably more than xG suggests
+            overperforming = None
+            if n >= 3 and abs(avg_gf - avg_for) > 0.3:
+                overperforming = avg_gf > avg_for
+            out["xg_summary"] = {
+                "sample_size":       n,
+                "avg_for":           round(avg_for, 2),
+                "avg_against":       round(avg_against, 2),
+                "avg_goals_for":     round(avg_gf, 2),
+                "avg_goals_against": round(avg_ga, 2),
+                "overperforming":    overperforming,
+            }
+    except Exception as e:
+        log.warning(f"_team_performance({name}) failed: {e}")
+    return out
+
+
 def _next_fixture_for_team(name: str) -> dict | None:
     """Earliest upcoming match (any tournament) involving this team."""
     for m in _scan_upcoming():
@@ -8602,19 +8749,27 @@ def _render_team(slug: str) -> tuple:
 
         # Next fixture from in-memory cache (today + next 2 days)
         next_fixture = _next_fixture_for_team(name)
+        # Recent on-pitch performance (form, xG, streaks) — drives the SEO copy
+        perf = _team_performance(name, recent_n=5)
 
         # Stats
         settled = [p for p in picks if p["result"] is not None]
-        wins  = sum(1 for p in settled if p["result"] in ("win", "green"))
+        wins   = sum(1 for p in settled if p["result"] in ("win", "green"))
         losses = sum(1 for p in settled if p["result"] in ("loss", "red"))
-        total = len(settled)
+        voids  = sum(1 for p in settled if p["result"] == "void")
+        total  = len(settled)
         winrate = (wins / total * 100) if total else 0
         pnl = 0.0
+        odd_sum = 0.0
+        odd_n = 0
         for p in settled:
+            if p["odd_entry"]:
+                odd_sum += p["odd_entry"]; odd_n += 1
             if p["result"] in ("win", "green") and p["odd_entry"]:
                 pnl += (p["odd_entry"] - 1) * STAKE
             elif p["result"] in ("loss", "red"):
                 pnl -= STAKE
+        avg_odd = (odd_sum / odd_n) if odd_n else 0.0
 
         # Logo
         logo_url = _quick_logo(name) or ""
@@ -8659,21 +8814,101 @@ def _render_team(slug: str) -> tuple:
         else:
             next_html = ""
 
+        # ── Build rich SEO intro paragraph from real DB data ────────────────
+        # We assemble multiple sentences referring to actual observed metrics
+        # (no made-up "season" stats — only what we tracked). Each sentence is
+        # only included when the underlying data is present.
+        intro_bits = []
+        n_obs = perf.get("sample_size") or 0
+        xg = perf.get("xg_summary")
+        streak = perf.get("streak") or {}
+        form_letters = perf.get("form_letters") or ""
+
+        if n_obs == 0:
+            intro_bits.append(
+                f"This page tracks every AI-generated football pick "
+                f"that involves {name}, alongside live xG analysis when the team plays."
+            )
+        else:
+            if xg:
+                intro_bits.append(
+                    f"Across the last {xg['sample_size']} tracked match"
+                    + ("es" if xg['sample_size'] != 1 else "")
+                    + f", {name} have averaged {xg['avg_for']} xG created and "
+                    f"{xg['avg_against']} xG conceded per game, scoring "
+                    f"{xg['avg_goals_for']:.1f} and conceding {xg['avg_goals_against']:.1f} on average."
+                )
+                if xg.get("overperforming") is True:
+                    intro_bits.append(
+                        f"Their goal output has been outpacing the underlying chance quality — "
+                        f"a sign the finishing has been sharp, but expected to regress over time."
+                    )
+                elif xg.get("overperforming") is False:
+                    intro_bits.append(
+                        f"They've been generating more chances than the scoreboard reflects — "
+                        f"underperforming xG suggests positive regression is likely."
+                    )
+            if streak.get("text"):
+                intro_bits.append(f"{name} arrive {streak['text']}, with a recent form line of {form_letters}.")
+            else:
+                intro_bits.append(f"Recent form line: {form_letters}.")
+            intro_bits.append(
+                f"Below you'll find every AI pick our model has issued on {name} — "
+                "with entry odds, live results, and the running profit/loss audit."
+            )
+
+        intro_html = " ".join(intro_bits)
+
+        # ── Recent form table (compact, with xG when we have it)
+        if perf["recent_games"]:
+            form_rows = []
+            for g in perf["recent_games"]:
+                badge = ('<span class="pr-win">W</span>' if g["result"] == "W"
+                         else '<span class="pr-lose">L</span>' if g["result"] == "L"
+                         else '<span class="pr-meta">D</span>')
+                xg_cell = (f'{g["xg_for"]} – {g["xg_against"]}'
+                           if g["xg_for"] is not None and g["xg_against"] is not None
+                           else '<span class="pr-meta">—</span>')
+                ha   = "(H)" if g["was_home"] else "(A)"
+                form_rows.append(f"""
+                  <tr>
+                    <td class="pr-meta">{g['date']}</td>
+                    <td><a href="{_match_url(g['match_id'], (name if g['was_home'] else g['opponent']), (g['opponent'] if g['was_home'] else name))}" style="color:#fff">vs {g['opponent']} <span class="pr-meta">{ha}</span></a></td>
+                    <td class="pr-meta">{g['score']}</td>
+                    <td class="pr-meta">{xg_cell}</td>
+                    <td>{badge}</td>
+                  </tr>""")
+            recent_form_html = f"""
+            <h2 class="pr-h2">Recent form (last {len(perf['recent_games'])} matches)</h2>
+            <table class="pr-table">
+              <thead><tr><th>Date</th><th>Match</th><th>Score</th><th>xG (for–against)</th><th>Result</th></tr></thead>
+              <tbody>{''.join(form_rows)}</tbody>
+            </table>"""
+        else:
+            recent_form_html = ""
+
+        # ── Track-record stat strip (no win-rate; use avg odds + P&L)
+        stat_strip = (
+            f'<span class="pr-stat">Settled picks: <strong>{total}</strong></span>'
+            f'<span class="pr-stat">Wins: <strong>{wins}</strong></span>'
+            f'<span class="pr-stat">Losses: <strong>{losses}</strong></span>'
+            + (f'<span class="pr-stat">Push: <strong>{voids}</strong></span>' if voids else '')
+            + f'<span class="pr-stat">Avg odds: <strong>@{avg_odd:.2f}</strong></span>'
+            + f'<span class="pr-stat">P&amp;L: <strong>{"+" if pnl > 0 else ""}{pnl:.0f}€</strong></span>'
+        )
+
         body = f"""
         <nav class="pr-nav">
-          <a href="{SITE_URL}/">WebPronos</a> › <a href="{SITE_URL}/teams" style="color:#22d3ee">Teams</a> › {name}
+          <a href="{SITE_URL}/">WebPronos</a> › {name}
         </nav>
-        <h1 class="pr-h1">{logo_img}{name}</h1>
-        <p class="pr-lead">All AI-generated football tips and historical picks for {name}, plus their next scheduled fixture.</p>
+        <h1 class="pr-h1">{logo_img}{name} — AI Football Predictions, xG Analysis & Track Record</h1>
+        <p class="pr-lead">{intro_html}</p>
 
-        <div style="margin:1.5rem 0">
-          <span class="pr-stat">Settled picks: <strong>{total}</strong></span>
-          <span class="pr-stat">Wins / Losses: <strong>{wins} / {losses}</strong></span>
-          <span class="pr-stat">Win rate: <strong>{winrate:.1f}%</strong></span>
-          <span class="pr-stat">P&amp;L: <strong>{'+' if pnl > 0 else ''}{pnl:.0f}€</strong></span>
-        </div>
+        <div style="margin:1.5rem 0">{stat_strip}</div>
 
         {next_html}
+
+        {recent_form_html}
 
         <h2 class="pr-h2">Last picks involving {name}</h2>
         <table class="pr-table">
@@ -8688,18 +8923,48 @@ def _render_team(slug: str) -> tuple:
         {_render_pr_footer()}
         """
 
-        jsonld = json.dumps({
+        # JSON-LD: SportsTeam + BreadcrumbList (helps SERP breadcrumb display)
+        jsonld_team = {
             "@context": "https://schema.org",
             "@type": "SportsTeam",
             "name": name,
             "sport": "Soccer",
             "url": f"{SITE_URL}/team/{slug}",
             "logo": logo_url or f"{SITE_URL}/og/default.png",
-        }, ensure_ascii=False)
+        }
+        jsonld_breadcrumbs = {
+            "@context": "https://schema.org",
+            "@type": "BreadcrumbList",
+            "itemListElement": [
+                {"@type": "ListItem", "position": 1, "name": "WebPronos", "item": SITE_URL},
+                {"@type": "ListItem", "position": 2, "name": name,        "item": f"{SITE_URL}/team/{slug}"},
+            ],
+        }
+        jsonld = json.dumps([jsonld_team, jsonld_breadcrumbs], ensure_ascii=False)
+
+        # Meta description: include the strongest factual signal we have
+        # (xG averages or recent streak) so the SERP snippet is informative.
+        if perf.get("xg_summary"):
+            xs = perf["xg_summary"]
+            meta_desc = (
+                f"AI football predictions and xG analysis for {name}. "
+                f"Last {xs['sample_size']} matches: {xs['avg_for']} xG created, "
+                f"{xs['avg_against']} xG conceded per game. {total} tracked picks with full audit trail."
+            )
+        elif perf.get("streak", {}).get("text"):
+            meta_desc = (
+                f"AI football predictions for {name} — {perf['streak']['text']} "
+                f"(form: {perf['form_letters']}). {total} tracked picks with entry odds and live results."
+            )
+        else:
+            meta_desc = (
+                f"Live and historical AI football predictions for {name}. "
+                f"{total} tracked picks with entry odds, live results, and a public profit/loss audit."
+            )
 
         html = _build_html_page(
-            title=f"{name} — AI Football Tips & Track Record | WebPronos",
-            description=f"Live and historical AI predictions for {name}. {total} settled picks, {winrate:.0f}% win rate. Next fixture and full audit trail.",
+            title=f"{name} — AI Football Predictions & xG Analysis | WebPronos",
+            description=meta_desc,
             canonical=f"{SITE_URL}/team/{slug}",
             body_html=body,
             jsonld=jsonld,
@@ -9203,6 +9468,10 @@ def r_seo_team(slug: str):
         next_fix = _next_fixture_for_team(name)
 
         picks = [_format_pick_row(r, perspective_team=name) for r in picks_rows]
+        # On-pitch performance (form, xG averages, streak) — same data the
+        # prerender uses to build its SEO copy. Exposed here so the Lovable
+        # React app can render the same enriched view to human users.
+        performance = _team_performance(name, recent_n=5)
         payload = {
             "team_name":    name,
             "slug":         slug,
@@ -9210,6 +9479,7 @@ def r_seo_team(slug: str):
             "stats":        _calc_stats(picks),
             "next_fixture": next_fix,
             "picks":        picks,
+            "performance":  performance,
         }
         body = json.dumps(payload, ensure_ascii=False)
         _seo_cache_put(cache_key, body)
