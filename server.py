@@ -4635,15 +4635,30 @@ def _run_background_cycle():
     if not monitored:
         with _state_lock:
             _live_state.clear()
-        # CRITICAL: even with 0 monitored live games, we MUST still finalize
-        # and resolve tips for games that finished while we weren't looking.
-        # Without this, picks for finished games stay "pending" forever any time
-        # there happens to be no monitored match live (common late at night).
+        # CRITICAL: even with 0 monitored live games, we MUST still:
+        #   - finalize/resolve tips for games that finished off-camera
+        #   - refresh the upcoming cache (powers league/team pages + footer)
+        #   - refresh the footer cache itself
+        # Otherwise, every period with no monitored game live (common during
+        # weekday daytimes, post-deploy, etc.) leaves all our cached UI
+        # data empty until the next monitored kickoff — sometimes hours later.
         try:
             _finalize_dropped_games(set())
             _resolve_finished_tips()
         except Exception as e:
             log.warning(f"BG: post-empty finalize/resolve failed: {e}")
+        try:
+            _refresh_upcoming_cache(days_ahead=3)
+        except Exception as e:
+            log.warning(f"BG: post-empty _refresh_upcoming_cache failed: {e}")
+        try:
+            _refresh_slug_index()
+        except Exception as e:
+            log.warning(f"BG: post-empty _refresh_slug_index failed: {e}")
+        try:
+            _refresh_footer_cache()
+        except Exception as e:
+            log.warning(f"BG: post-empty _refresh_footer_cache failed: {e}")
         _last_cycle_ts = time.time()
         return
 
