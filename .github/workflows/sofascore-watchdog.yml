@@ -1,0 +1,147 @@
+name: Sofascore Watchdog
+
+# Runs every hour. Curls /api/health/sofascore on the live app. If the
+# response says unhealthy AND the previous 2 hourly runs were also
+# unhealthy (= 3 consecutive failures, ≈3h of broken pipeline), invokes
+# tools/auto_failover.sh to migrate the Fly.io app to a working region.
+#
+# Required GitHub Secrets:
+#   FLY_API_TOKEN              — fly.io token (get with `flyctl auth token`)
+#   TELEGRAM_BOT_TOKEN         — optional, same one the app uses
+#   TELEGRAM_ADMIN_CHAT_ID     — optional, your personal Telegram chat ID
+#
+# The workflow self-determines "consecutive failures" by querying the past
+# workflow runs via the gh CLI — no artifacts, no committed counter file.
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # every hour at :00 UTC
+  workflow_dispatch:        # manual trigger button (for debugging)
+    inputs:
+      force_failover:
+        description: "Skip the 3-strike check, migrate immediately"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write          # needed to push fly.toml change
+  actions:  read           # needed to read previous run conclusions
+
+concurrency:
+  group: sofascore-watchdog
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 1. Healthcheck ──────────────────────────────────────────────────
+      - name: Query /api/health/sofascore
+        id: health
+        run: |
+          set -e
+          resp="$(curl -fsS --max-time 30 https://livexgmodel-pt.fly.dev/api/health/sofascore || echo '{"healthy":false,"error":"curl_failed"}')"
+          echo "raw=$resp"
+          healthy="$(echo "$resp" | python3 -c 'import sys,json; print(str(json.load(sys.stdin).get("healthy", False)).lower())')"
+          live="$(echo "$resp"    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("live_games", 0))')"
+          today="$(echo "$resp"   | python3 -c 'import sys,json; print(json.load(sys.stdin).get("upcoming_today", 0))')"
+          tomor="$(echo "$resp"   | python3 -c 'import sys,json; print(json.load(sys.stdin).get("upcoming_tomorrow", 0))')"
+          age="$(echo "$resp"     | python3 -c 'import sys,json; print(json.load(sys.stdin).get("last_cycle_age_s", -1))')"
+          {
+            echo "healthy=$healthy"
+            echo "live_games=$live"
+            echo "upcoming_today=$today"
+            echo "upcoming_tomorrow=$tomor"
+            echo "last_cycle_age_s=$age"
+          } >> "$GITHUB_OUTPUT"
+          echo "## Healthcheck" >> "$GITHUB_STEP_SUMMARY"
+          echo "- healthy: \`$healthy\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- live_games: \`$live\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- upcoming_today: \`$today\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- upcoming_tomorrow: \`$tomor\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- last_cycle_age_s: \`$age\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 2. Decide whether to trigger failover ──────────────────────────
+      - name: Check past runs (3-strike rule)
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          force="${{ inputs.force_failover }}"
+          healthy="${{ steps.health.outputs.healthy }}"
+
+          if [[ "$force" == "true" ]]; then
+              echo "decision=migrate" >> "$GITHUB_OUTPUT"
+              echo "reason=manual force_failover=true" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+          fi
+
+          if [[ "$healthy" == "true" ]]; then
+              echo "decision=skip" >> "$GITHUB_OUTPUT"
+              echo "reason=current run is healthy" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+          fi
+
+          # Look at the previous 2 scheduled runs (excluding this one).
+          # Both must have failed (= conclusion=failure) for the strike to count.
+          # We treat a missing/stale healthcheck step as failure.
+          prior_failures="$(
+              gh run list \
+                --workflow sofascore-watchdog.yml \
+                --status completed \
+                --limit 2 \
+                --json conclusion \
+                --jq '[.[] | select(.conclusion == "failure")] | length'
+          )"
+          echo "prior_failures (last 2 runs)=$prior_failures" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$prior_failures" -ge 2 ]]; then
+              echo "decision=migrate" >> "$GITHUB_OUTPUT"
+              echo "reason=3 consecutive failures (this + previous 2)" >> "$GITHUB_STEP_SUMMARY"
+          else
+              echo "decision=fail-no-migrate" >> "$GITHUB_OUTPUT"
+              echo "reason=unhealthy but only $((prior_failures+1)) of last 3 failed; need 3" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── 3a. If unhealthy but no migrate yet — exit 1 to record failure ─
+      - name: Mark failure (no migrate yet)
+        if: steps.decide.outputs.decision == 'fail-no-migrate'
+        run: |
+          echo "Unhealthy this hour — strike counted, will migrate after 3 in a row"
+          exit 1
+
+      # ── 3b. Migrate ────────────────────────────────────────────────────
+      - name: Setup flyctl
+        if: steps.decide.outputs.decision == 'migrate'
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Run auto_failover.sh
+        if: steps.decide.outputs.decision == 'migrate'
+        env:
+          FLY_API_TOKEN:          ${{ secrets.FLY_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          APP_NAME:               livexgmodel-pt
+        run: |
+          bash tools/auto_failover.sh
+
+      # ── 4. On any failure, notify via Telegram ─────────────────────────
+      - name: Telegram alert on failover failure
+        if: failure() && steps.decide.outputs.decision == 'migrate'
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:  ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+        run: |
+          if [[ -z "$TG_TOKEN" || -z "$TG_CHAT" ]]; then exit 0; fi
+          msg="🔴 *Sofascore auto-failover FAILED*%0A%0AAll candidate regions blocked or migration script errored. Manual intervention needed.%0A%0ARun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d "chat_id=${TG_CHAT}" \
+              -d "text=$msg" \
+              -d "parse_mode=Markdown" >/dev/null || true

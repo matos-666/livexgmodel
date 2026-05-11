@@ -5595,6 +5595,60 @@ def _seo_cache_put(key: str, html: str) -> None:
     _seo_cache[key] = {"html": html, "ts": time.time()}
 
 
+@app.route("/api/health/sofascore")
+def r_health_sofascore():
+    """
+    Lightweight healthcheck for the Sofascore data pipeline. Used by the
+    external auto-failover GitHub Action to decide whether to migrate the
+    Fly.io app to a different region.
+
+    Returns:
+      live_games            — # of live monitored matches with score data
+      upcoming_today        — # cached upcoming matches starting today (UTC)
+      upcoming_tomorrow     — # cached upcoming matches starting tomorrow (UTC)
+      last_cycle_age_s      — seconds since the last successful BG cycle
+      healthy               — true if Sofascore looks reachable. False means
+                              the watchdog should consider migrating regions.
+
+    The "healthy" boolean is true when EITHER:
+      - there is at least one live monitored match with score data, OR
+      - there are upcoming matches in the next 2 days,
+    AND the last BG cycle ran in the past 5 minutes.
+    """
+    try:
+        now_utc       = datetime.now(timezone.utc)
+        today_str     = now_utc.strftime("%Y-%m-%d")
+        tomorrow_str  = (now_utc + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        with _state_lock:
+            live_games = sum(
+                1 for m in _live_state.values()
+                if m.get("match", {}).get("homeGoals") is not None
+                and not m.get("match", {}).get("isFinished", False)
+            )
+
+        up_today = len((_upcoming_cache.get(today_str)    or {}).get("matches", []))
+        up_tomor = len((_upcoming_cache.get(tomorrow_str) or {}).get("matches", []))
+        cycle_age = (time.time() - _last_cycle_ts) if _last_cycle_ts else 99999
+
+        healthy = (
+            (live_games > 0 or up_today > 0 or up_tomor > 0)
+            and cycle_age < 300
+        )
+
+        return jsonify({
+            "healthy":            healthy,
+            "live_games":         live_games,
+            "upcoming_today":     up_today,
+            "upcoming_tomorrow":  up_tomor,
+            "last_cycle_age_s":   round(cycle_age, 1),
+            "ts":                 int(time.time()),
+        })
+    except Exception as e:
+        log.error(f"r_health_sofascore error: {e}")
+        return jsonify({"healthy": False, "error": str(e)}), 500
+
+
 @app.route("/api/upcoming")
 def r_upcoming():
     """
