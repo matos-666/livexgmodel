@@ -1,5 +1,5 @@
 app = "livexgmodel-pt"
-primary_region = "yyz"
+primary_region = "cdg"
 
 [build]
   dockerfile = "Dockerfile"

@@ -97,9 +97,15 @@ deadline=$(( $(date +%s) + TEST_WAIT_SECONDS ))
 while [[ $(date +%s) -lt $deadline ]]; do
     for region in "${!TEST_MACHINES[@]}"; do
         mid="${TEST_MACHINES[$region]}"
-        # "BG cycle done" with at least 1 game processed = Sofascore reachable
+        # Sofascore reachable from this region if EITHER:
+        #   1. "BG cycle done ... N games processed" with N >= 1 (full cycle ran), OR
+        #   2. "BG cycle: N live total" with N >= 1 (Sofascore returned events,
+        #      even if none are in our monitored leagues at this exact moment)
+        # Both signals prove Sofascore isn't 403'ing this region. Originally we
+        # only checked #1, but the full cycle requires monitored leagues to be
+        # live — false negative when only un-monitored leagues are in play.
         if flyctl logs -a "$APP_NAME" -i "$mid" --no-tail 2>/dev/null \
-             | grep -qE 'BG cycle done in [0-9.]+s — [1-9][0-9]* games processed'; then
+             | grep -qE 'BG cycle done in [0-9.]+s — [1-9][0-9]* games processed|BG cycle: [1-9][0-9]* live total'; then
             WINNER_REGION=$region
             break 2
         fi
