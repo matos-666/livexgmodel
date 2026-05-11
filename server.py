@@ -7383,6 +7383,32 @@ def r_admin_health():
     })
 
 
+@app.route("/api/admin/send-admin-stats", methods=["POST"])
+def r_admin_send_admin_stats():
+    """
+    Manually trigger the daily admin-stats Telegram message. Same content
+    as the cron job that runs at 09:00 Lisbon. Useful for verifying the
+    message format / contents on demand.
+    """
+    if not _check_admin_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    if not TELEGRAM_ADMIN_CHAT_IDS:
+        return jsonify({"error": "TELEGRAM_ADMIN_CHAT_IDS not configured"}), 400
+    try:
+        report = _tg_admin_stats()
+        sent_to = []
+        for cid in TELEGRAM_ADMIN_CHAT_IDS:
+            try:
+                _send_telegram(report, chat_id=cid)
+                sent_to.append(cid)
+            except Exception as e:
+                log.error(f"send-admin-stats: send to {cid} failed: {e}")
+        return jsonify({"ok": True, "sent_to": sent_to, "count": len(sent_to)})
+    except Exception as e:
+        log.error(f"r_admin_send_admin_stats error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/admin/send-daily-summary", methods=["POST"])
 def r_admin_send_daily_summary():
     """Send daily summary for a specific day (days_back parameter, default=1 for yesterday)."""
@@ -10083,7 +10109,7 @@ def prerender_dispatch():
 
 def _init_scheduler():
     """
-    Initialize APScheduler for daily summary messages.
+    Initialize APScheduler for daily summary + admin stats messages.
 
     Hardening (2026-05-08): previous version had three issues that caused
     the 07/05 summary to be skipped:
@@ -10099,20 +10125,30 @@ def _init_scheduler():
     summarising the current Lisbon day (now nearly complete).
     """
     scheduler = BackgroundScheduler()
-    # 23:55 Lisbon — late enough to capture nearly all settled tips,
-    # before Lisbon midnight rolls the date.
-    trigger = CronTrigger(hour=23, minute=55, timezone='Europe/Lisbon')
+    # Job 1 — Public daily summary at 23:55 Lisbon (subscribers)
     scheduler.add_job(
         _send_daily_summary_locked,
-        trigger=trigger,
+        trigger=CronTrigger(hour=23, minute=55, timezone='Europe/Lisbon'),
         id='daily_summary',
         replace_existing=True,
-        misfire_grace_time=3600,  # 1h: still fires if process restarted late
-        coalesce=True,            # collapse multiple pending fires into one
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+    # Job 2 — Admin-only daily stats at 09:00 Lisbon
+    # Fires AFTER the public summary so admin sees yesterday's numbers in
+    # the morning along with subscriber growth, attribution funnel, etc.
+    scheduler.add_job(
+        _send_admin_stats_locked,
+        trigger=CronTrigger(hour=9, minute=0, timezone='Europe/Lisbon'),
+        id='admin_stats',
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
         max_instances=1,
     )
     scheduler.start()
-    log.info("Scheduler started: daily summary at 23:55 Lisbon time (1h grace, DB-locked)")
+    log.info("Scheduler started: daily summary 23:55 Lisbon + admin stats 09:00 Lisbon (1h grace, DB-locked)")
     return scheduler
 
 
@@ -10146,6 +10182,54 @@ def _send_daily_summary_locked():
         _send_daily_summary(days_back=0, force_send=False)
     except Exception as e:
         log.error(f"_send_daily_summary_locked error: {e}", exc_info=True)
+
+
+def _send_admin_stats_locked():
+    """
+    Send the /admin_stats report to every chat_id in TELEGRAM_ADMIN_CHAT_IDS.
+
+    Runs daily at 09:00 Lisbon (1h after the public summary at 23:55 the night
+    before). Same DB-lock pattern as _send_daily_summary_locked to prevent
+    duplicate sends across gunicorn workers.
+
+    No-op if no admin chat IDs are configured (TELEGRAM_ADMIN_CHAT_IDS env
+    var) — there's no public/general audience for this; the report contains
+    subscriber breakdowns, attribution funnel, and other internal metrics.
+    """
+    from datetime import datetime
+    if not TELEGRAM_ADMIN_CHAT_IDS:
+        log.info("_send_admin_stats_locked: no TELEGRAM_ADMIN_CHAT_IDS configured, skipping")
+        return
+    lisbon_tz = pytz.timezone('Europe/Lisbon')
+    today_str = datetime.now(lisbon_tz).strftime("%Y-%m-%d")
+    try:
+        with _db() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS admin_stats_locks (
+                    day TEXT PRIMARY KEY,
+                    sent_at INTEGER NOT NULL
+                )
+            """)
+            try:
+                conn.execute(
+                    "INSERT INTO admin_stats_locks (day, sent_at) VALUES (?, ?)",
+                    (today_str, int(datetime.utcnow().timestamp()))
+                )
+            except sqlite3.IntegrityError:
+                log.info(f"_send_admin_stats_locked: another worker already sent for {today_str}")
+                return
+        # Lock acquired → build the same text /admin_stats produces, send it
+        # to every configured admin chat_id. _send_telegram takes a single
+        # chat_id at a time when the kwarg is provided.
+        report = _tg_admin_stats()
+        for cid in TELEGRAM_ADMIN_CHAT_IDS:
+            try:
+                _send_telegram(report, chat_id=cid)
+            except Exception as e:
+                log.error(f"_send_admin_stats_locked: send to {cid} failed: {e}")
+        log.info(f"_send_admin_stats_locked: sent to {len(TELEGRAM_ADMIN_CHAT_IDS)} admin(s) for {today_str}")
+    except Exception as e:
+        log.error(f"_send_admin_stats_locked error: {e}", exc_info=True)
 
 
 _scheduler = None
