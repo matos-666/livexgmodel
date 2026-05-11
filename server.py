@@ -7505,6 +7505,31 @@ def r_admin_health():
     })
 
 
+@app.route("/api/admin/send-daily-preview", methods=["POST"])
+def r_admin_send_daily_preview():
+    """
+    Manually trigger the daily 12:00 Lisbon teaser message. Same content
+    the cron job sends. Useful for sending today's preview if the daily
+    cron missed it, or for previewing the wording on demand.
+
+    Query params:
+      preview=1  → return the message text without sending (dry-run)
+    """
+    if not _check_admin_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        msg = _build_daily_preview_message()
+        if not msg:
+            return jsonify({"ok": False, "reason": "no eligible matches"}), 200
+        if flask_request.args.get("preview") == "1":
+            return jsonify({"ok": True, "preview": msg})
+        _send_telegram(msg)
+        return jsonify({"ok": True, "subscribers": len(_tg_subscribers())})
+    except Exception as e:
+        log.error(f"r_admin_send_daily_preview error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/admin/send-admin-stats", methods=["POST"])
 def r_admin_send_admin_stats():
     """
@@ -10384,8 +10409,20 @@ def _init_scheduler():
         coalesce=True,
         max_instances=1,
     )
+    # Job 3 — Public daily preview at 12:00 Lisbon (teaser: top 3 matches of the day)
+    # Designed to drive notification opt-ins and remind subscribers there's
+    # action coming this afternoon/evening.
+    scheduler.add_job(
+        _send_daily_preview_locked,
+        trigger=CronTrigger(hour=12, minute=0, timezone='Europe/Lisbon'),
+        id='daily_preview',
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
     scheduler.start()
-    log.info("Scheduler started: daily summary 23:55 Lisbon + admin stats 09:00 Lisbon (1h grace, DB-locked)")
+    log.info("Scheduler started: daily summary 23:55 + admin stats 09:00 + daily preview 12:00 (Lisbon, 1h grace, DB-locked)")
     return scheduler
 
 
@@ -10419,6 +10456,147 @@ def _send_daily_summary_locked():
         _send_daily_summary(days_back=0, force_send=False)
     except Exception as e:
         log.error(f"_send_daily_summary_locked error: {e}", exc_info=True)
+
+
+def _build_daily_preview_message() -> str | None:
+    """
+    Build the "top 3 matches of the day" teaser message.
+
+    Pulls today's monitored fixtures (UTC) from _upcoming_cache, sorts by
+    league priority (Premier League before lower divisions) and then by
+    kickoff time, and picks the top 3.
+
+    Copy varies day-to-day via a deterministic rotation of intro/outro
+    templates keyed on day-of-year — same day always renders the same
+    template (idempotent), but consecutive days look different.
+
+    Returns the HTML-formatted message string, or None if there are no
+    eligible matches (in which case the caller should skip sending).
+    """
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc)
+    today_str = now_utc.strftime("%Y-%m-%d")
+    today_cache = _upcoming_cache.get(today_str)
+    if not today_cache or not today_cache.get("matches"):
+        log.info("_build_daily_preview_message: no upcoming cache for today, skipping")
+        return None
+
+    now_ts = int(now_utc.timestamp())
+
+    # Build league priority lookup (lower number = more important)
+    priority_by_sk: dict = {}
+    try:
+        with _db() as conn:
+            for r in conn.execute("SELECT sport_key, priority FROM competitions"):
+                priority_by_sk[r["sport_key"]] = r["priority"] or 99
+    except Exception:
+        pass
+
+    candidates = []
+    for m in today_cache["matches"]:
+        ts = m.get("startTimestamp") or 0
+        if ts <= now_ts:
+            continue  # already started or in the past
+        sk = m.get("_sport_key")
+        if sk not in MONITORED_SPORT_KEYS:
+            continue  # ignore unmonitored leagues
+        candidates.append({
+            "id":          m["id"],
+            "home":        m.get("homeTeam", ""),
+            "away":        m.get("awayTeam", ""),
+            "tournament":  m.get("tournament", ""),
+            "country":     m.get("country", ""),
+            "kickoff_ts":  ts,
+            "_priority":   priority_by_sk.get(sk, 99),
+        })
+
+    if not candidates:
+        log.info("_build_daily_preview_message: no upcoming monitored matches left today")
+        return None
+
+    candidates.sort(key=lambda x: (x["_priority"], x["kickoff_ts"]))
+    top3 = candidates[:3]
+
+    # Deterministic per-day template rotation (idempotent if re-sent same day)
+    templates = [
+        {
+            "intro": "🔥 <b>Os 3 jogos mais aguardados de hoje:</b>",
+            "outro": "💡 <i>Ativa as notificações do bot para receberes os picks no momento do kickoff.</i>",
+        },
+        {
+            "intro": "⚡ <b>Em radar hoje:</b>",
+            "outro": "🎯 <i>O modelo entra em modo live a cada apito inicial — não percas o ponto de entrada.</i>",
+        },
+        {
+            "intro": "👀 <b>Os jogos que vamos seguir hoje:</b>",
+            "outro": "🚀 <i>Quem está pronto? Ativa as notificações para receberes os picks ao vivo.</i>",
+        },
+        {
+            "intro": "🎯 <b>Top 3 do dia:</b>",
+            "outro": "📲 <i>Ativa os alertas e recebe cada value pick no segundo em que aparecer.</i>",
+        },
+        {
+            "intro": "🏆 <b>Hoje em destaque no nosso radar:</b>",
+            "outro": "💪 <i>Picks live geradas em tempo real — ativa as notificações para não falhares nenhuma.</i>",
+        },
+        {
+            "intro": "📅 <b>Hoje na nossa lista:</b>",
+            "outro": "🔔 <i>Notificações ativas = picks no momento exato. Não percas o edge.</i>",
+        },
+        {
+            "intro": "⚽ <b>Os jogos de hoje que merecem atenção:</b>",
+            "outro": "🚀 <i>O modelo entra ao vivo no apito inicial. Ativa as alertas para receberes o sinal.</i>",
+        },
+    ]
+    day_of_year = now_utc.timetuple().tm_yday
+    tpl = templates[day_of_year % len(templates)]
+
+    lines = [tpl["intro"], ""]
+    for i, m in enumerate(top3, 1):
+        ko_str = datetime.fromtimestamp(m["kickoff_ts"], tz=timezone.utc).strftime("%H:%M UTC")
+        flag = _country_flag(m["country"])
+        match_url = f"{SITE_URL}/match/{m['id']}/{_slug(m['home'])}-vs-{_slug(m['away'])}"
+        lines.append(f"{i}️⃣ {flag} <b>{m['home']} vs {m['away']}</b>")
+        lines.append(f"   <i>{m['tournament']}</i> · {ko_str}")
+        lines.append(f"   🔗 <a href=\"{match_url}\">Análise & xG ao vivo</a>")
+        lines.append("")
+    lines.append(tpl["outro"])
+    return "\n".join(lines)
+
+
+def _send_daily_preview_locked():
+    """
+    Daily noon teaser sender. Posts the top-3-matches preview to every
+    Telegram subscriber. DB-locked via daily_preview_locks to keep behaviour
+    idempotent across gunicorn workers (same pattern as the public summary).
+    """
+    from datetime import datetime
+    lisbon_tz = pytz.timezone('Europe/Lisbon')
+    today_str = datetime.now(lisbon_tz).strftime("%Y-%m-%d")
+    try:
+        msg = _build_daily_preview_message()
+        if not msg:
+            log.info(f"_send_daily_preview_locked: no message to send for {today_str}")
+            return
+        with _db() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_preview_locks (
+                    day TEXT PRIMARY KEY,
+                    sent_at INTEGER NOT NULL
+                )
+            """)
+            try:
+                conn.execute(
+                    "INSERT INTO daily_preview_locks (day, sent_at) VALUES (?, ?)",
+                    (today_str, int(datetime.utcnow().timestamp()))
+                )
+            except sqlite3.IntegrityError:
+                log.info(f"_send_daily_preview_locked: another worker already sent for {today_str}")
+                return
+        log.info(f"_send_daily_preview_locked: sending preview for {today_str}")
+        _send_telegram(msg)
+    except Exception as e:
+        log.error(f"_send_daily_preview_locked error: {e}", exc_info=True)
 
 
 def _send_admin_stats_locked():
