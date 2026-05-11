@@ -10571,10 +10571,11 @@ def _build_daily_preview_message() -> str | None:
     for i, m in enumerate(top3, 1):
         ko_str = datetime.fromtimestamp(m["kickoff_ts"], tz=timezone.utc).strftime("%H:%M UTC")
         flag = _country_flag(m["country"])
-        match_url = f"{SITE_URL}/match/{m['id']}/{_slug(m['home'])}-vs-{_slug(m['away'])}"
+        # No CTA / link to webpronos here — this is a Telegram teaser, not
+        # a traffic redirect. Keep the user inside the bot conversation so
+        # the call-to-action of the outro (enabling notifications) lands.
         lines.append(f"{i}️⃣ {flag} <b>{m['home']} vs {m['away']}</b>")
         lines.append(f"   <i>{m['tournament']}</i> · {ko_str}")
-        lines.append(f"   🔗 <a href=\"{match_url}\">Análise & xG ao vivo</a>")
         lines.append("")
     lines.append(tpl["outro"])
     return "\n".join(lines)
