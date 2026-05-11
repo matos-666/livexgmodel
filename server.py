@@ -4744,6 +4744,12 @@ def _run_background_cycle():
     except Exception as e:
         log.warning(f"BG: _refresh_upcoming_cache failed: {e}")
 
+    # Refresh dynamic footer payload for /api/footer/dynamic (cheap, all in-memory + 1 DB query)
+    try:
+        _refresh_footer_cache()
+    except Exception as e:
+        log.warning(f"BG: _refresh_footer_cache failed: {e}")
+
     # Keep SEO slug index fresh (cheap, one DB query)
     try:
         _refresh_slug_index()
@@ -5120,6 +5126,203 @@ def r_today_monitored():
 # Dict operations in CPython are GIL-protected; no lock needed for basic get/set.
 _upcoming_cache: dict = {}   # date_str → {"matches": [...], "ts": float}
 _UPCOMING_TTL = 900          # 15 minutes; background loop refreshes every cycle
+
+
+# ── Footer "dynamic" cache ──────────────────────────────────────────────────
+# Powers the /api/footer/dynamic endpoint that the Lovable footer calls.
+# Refreshed by the background loop alongside _upcoming_cache so the request
+# path never blocks on DB or live data computation.
+_footer_cache: dict = {"data": None, "ts": 0.0}
+_FOOTER_TTL = 300            # 5 minutes
+
+
+def _compute_footer_data() -> dict:
+    """
+    Build the 4 columns for the dynamic footer:
+
+      live_now      — currently-live monitored matches (with score + minute)
+      today_picks   — currently-valid value picks (fresh, not expired) ordered by edge
+      week_leagues  — leagues with scheduled fixtures in the next 7 days
+      markets       — tip markets with POSITIVE all-time ROI (only)
+
+    Wording rules (per user feedback 2026-05-11):
+      * Never show "win rate" — only profit (€) or ROI (%); only if positive
+      * Always UTC timestamps — never local timezones
+      * "picks" count only for currently-LIVE matches; not for upcoming/finished
+    """
+    out = {
+        "live_now":     [],
+        "today_picks":  [],
+        "week_leagues": [],
+        "markets":      [],
+    }
+
+    # ── 1. LIVE NOW — read from _live_state (in-memory, populated by BG loop)
+    try:
+        with _state_lock:
+            live_snapshot = list(_live_state.values())
+        live_items = []
+        for entry in live_snapshot:
+            m = entry.get("match") or {}
+            if m.get("isFinished") or m.get("homeGoals") is None:
+                continue
+            home = m.get("homeTeam", "")
+            away = m.get("awayTeam", "")
+            hg   = m.get("homeGoals", 0) or 0
+            ag   = m.get("awayGoals", 0) or 0
+            mid  = m.get("id")
+            minute = m.get("minute")
+            picks_now = len(entry.get("livePicks") or entry.get("tips") or [])
+            subtitle_bits = []
+            if minute is not None:
+                subtitle_bits.append(f"{minute}'")
+            if picks_now > 0:
+                subtitle_bits.append(f"{picks_now} pick" + ("s" if picks_now != 1 else ""))
+            live_items.append({
+                "title":    f"{home} {hg}-{ag} {away}",
+                "subtitle": " · ".join(subtitle_bits),
+                "url":      _match_url(mid, home, away),
+                "_minute":  minute or 0,
+            })
+        # Most-recently-started first (high minute)
+        live_items.sort(key=lambda x: -x["_minute"])
+        for it in live_items[:5]:
+            it.pop("_minute", None)
+        out["live_now"] = live_items[:5]
+    except Exception as e:
+        log.warning(f"footer.live_now build failed: {e}")
+
+    # ── 2. TODAY'S PICKS — fresh, currently-valid value picks across live matches
+    try:
+        candidates = []
+        with _state_lock:
+            for entry in _live_state.values():
+                m = entry.get("match") or {}
+                if m.get("isFinished"):
+                    continue
+                home = m.get("homeTeam", "")
+                away = m.get("awayTeam", "")
+                mid  = m.get("id")
+                for p in (entry.get("livePicks") or []):
+                    edge = p.get("edge") or p.get("edge_entry") or 0
+                    odd  = p.get("odd")  or p.get("odd_entry")  or 0
+                    if edge <= 0 or odd <= 1.0:
+                        continue
+                    candidates.append({
+                        "title":    f"{p.get('label','?')} @ {odd:.2f}",
+                        "subtitle": f"+{edge:.1f}% edge · {home} vs {away}",
+                        "url":      _match_url(mid, home, away),
+                        "_edge":    edge,
+                    })
+        candidates.sort(key=lambda x: -x["_edge"])
+        for it in candidates[:5]:
+            it.pop("_edge", None)
+        out["today_picks"] = candidates[:5]
+    except Exception as e:
+        log.warning(f"footer.today_picks build failed: {e}")
+
+    # ── 3. WEEK LEAGUES — aggregate next 7 days from _upcoming_cache
+    try:
+        now_utc = datetime.now(timezone.utc)
+        league_counts = {}
+        for offset in range(7):
+            date_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
+            cached = _upcoming_cache.get(date_str)
+            if not cached:
+                continue
+            for m in cached.get("matches", []):
+                tourn = m.get("tournament", "").strip()
+                if not tourn:
+                    continue
+                league_counts[tourn] = league_counts.get(tourn, 0) + 1
+        ranked = sorted(league_counts.items(), key=lambda x: -x[1])[:6]
+        for tourn, count in ranked:
+            out["week_leagues"].append({
+                "title":    tourn,
+                "subtitle": f"{count} match" + ("es" if count != 1 else "") + " this week",
+                "url":      f"{SITE_URL}/league/{_slug(tourn)}",
+            })
+    except Exception as e:
+        log.warning(f"footer.week_leagues build failed: {e}")
+
+    # ── 4. MARKETS — only positive-ROI markets (no win-rate ever, per user)
+    try:
+        STAKE = get_setting("stake_per_bet", 100.0) or 100.0
+        rows = []
+        with _db() as conn:
+            rows = conn.execute("""
+                SELECT market,
+                       SUM(CASE WHEN result = 'green' THEN (odd_entry - 1) * ?
+                                WHEN result = 'red'   THEN -1 * ?
+                                ELSE 0 END)            AS profit,
+                       COUNT(*) FILTER (WHERE result IN ('green','red')) AS settled
+                FROM tips
+                WHERE result IN ('green', 'red')
+                GROUP BY market
+                HAVING settled >= 20
+            """, (STAKE, STAKE)).fetchall()
+        market_items = []
+        for r in rows:
+            settled = r["settled"] or 0
+            profit  = r["profit"] or 0.0
+            if settled <= 0:
+                continue
+            roi = (profit / (settled * STAKE)) * 100
+            if roi <= 0:           # user rule: only show positive markets
+                continue
+            market_slug = _slug(r["market"])
+            market_items.append({
+                "title":    r["market"],
+                "subtitle": f"+{roi:.1f}% ROI",
+                "url":      f"{SITE_URL}/tips/{market_slug}",
+                "_roi":     roi,
+            })
+        market_items.sort(key=lambda x: -x["_roi"])
+        for it in market_items[:5]:
+            it.pop("_roi", None)
+        out["markets"] = market_items[:5]
+    except Exception as e:
+        log.warning(f"footer.markets build failed: {e}")
+
+    return out
+
+
+def _refresh_footer_cache():
+    """Recompute the footer payload and store in cache. Called by BG loop."""
+    try:
+        _footer_cache["data"] = _compute_footer_data()
+        _footer_cache["ts"]   = time.time()
+    except Exception as e:
+        log.warning(f"_refresh_footer_cache failed: {e}")
+
+
+@app.route("/api/footer/dynamic")
+def r_footer_dynamic():
+    """
+    Returns a 4-column payload for the site footer. Pure read of the
+    in-memory `_footer_cache`, populated by the background loop.
+
+    Frontend (Lovable) calls this once per page load and renders:
+      live_now      — Live matches happening right now (with score + minute)
+      today_picks   — Best currently-valid value picks (highest edge)
+      week_leagues  — Top leagues by # of fixtures in next 7 days
+      markets       — Markets with positive all-time ROI
+    """
+    data = _footer_cache.get("data")
+    if data is None:
+        # Cold cache — best-effort synchronous build (~50-200ms)
+        try:
+            data = _compute_footer_data()
+            _footer_cache["data"] = data
+            _footer_cache["ts"]   = time.time()
+        except Exception as e:
+            log.warning(f"r_footer_dynamic cold build failed: {e}")
+            data = {"live_now": [], "today_picks": [], "week_leagues": [], "markets": []}
+
+    return jsonify({
+        **data,
+        "cached_at": int(_footer_cache.get("ts") or 0),
+    })
 
 
 def _fetch_day_matches(date_str: str) -> list:
