@@ -8795,7 +8795,7 @@ def _render_team(slug: str) -> tuple:
             rows_html.append(f"""
               <tr>
                 <td class="pr-meta">{date_str}</td>
-                <td><a href="{_match_url(p['match_id'], p['home_team'], p['away_team'])}" style="color:#fff">vs {opponent}</a></td>
+                <td><a href="{_match_url(p['match_id'], p['home_team'], p['away_team'])}" style="color:#fff">{p['home_team']} vs {p['away_team']}</a></td>
                 <td class="pr-meta">{score}</td>
                 <td class="pr-meta">{p['market']} — {p['label']}</td>
                 <td class="pr-meta">@{(p['odd_entry'] or 0):.2f}</td>
@@ -8873,7 +8873,7 @@ def _render_team(slug: str) -> tuple:
                 form_rows.append(f"""
                   <tr>
                     <td class="pr-meta">{g['date']}</td>
-                    <td><a href="{_match_url(g['match_id'], (name if g['was_home'] else g['opponent']), (g['opponent'] if g['was_home'] else name))}" style="color:#fff">vs {g['opponent']} <span class="pr-meta">{ha}</span></a></td>
+                    <td><a href="{_match_url(g['match_id'], (name if g['was_home'] else g['opponent']), (g['opponent'] if g['was_home'] else name))}" style="color:#fff">{name if g['was_home'] else g['opponent']} vs {g['opponent'] if g['was_home'] else name} <span class="pr-meta">{ha}</span></a></td>
                     <td class="pr-meta">{g['score']}</td>
                     <td class="pr-meta">{xg_cell}</td>
                     <td>{badge}</td>
