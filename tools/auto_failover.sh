@@ -157,6 +157,46 @@ $WINNER_REGION after parallel testing all candidate regions." || log "nothing to
 git push origin HEAD || log "git push failed (non-fatal)"
 
 # ─── 9. Cleanup: destroy old production + all test machines/volumes ──────────
+# ─── 9a. Verify the new production machine actually reaches Sofascore ────────
+# Important: in the same region, different machines get DIFFERENT IPs from
+# Fly's pool. The test machine had IP_A (passed), but the freshly-cloned
+# production machine has a DIFFERENT IP that might be blocked. Wait for
+# the first BG cycle on the new machine and confirm Sofascore is reachable
+# before we destroy the old production. If the new IP is blocked, abort
+# the cleanup so we can roll forward / retry in a different region.
+log "verifying new production machine $NEW_MACHINE_ID can reach Sofascore"
+verify_deadline=$(( $(date +%s) + 180 ))   # up to 3 min
+verified=false
+while [[ $(date +%s) -lt $verify_deadline ]]; do
+    if flyctl logs -a "$APP_NAME" -i "$NEW_MACHINE_ID" --no-tail 2>/dev/null \
+         | grep -qE 'BG cycle done in [0-9.]+s — [1-9][0-9]* games processed|BG cycle: [1-9][0-9]* live total'; then
+        verified=true
+        break
+    fi
+    sleep 10
+done
+
+if [[ "$verified" != "true" ]]; then
+    log "VERIFY FAILED: new machine in $WINNER_REGION (id=$NEW_MACHINE_ID) didn't reach Sofascore within 180s. Likely got a blocked IP."
+    log "ABORT cleanup: leaving old production ($PROD_MACHINE_ID in $CURRENT_REGION) running."
+    log "Destroying the failed new machine + its volume so next failover run can pick a fresh region."
+    flyctl machine destroy "$NEW_MACHINE_ID" --force -a "$APP_NAME" 2>&1 | tail -1 || true
+    sleep 3
+    flyctl volumes destroy "$NEW_VOLUME_ID" -y -a "$APP_NAME" 2>&1 | tail -1 || true
+    # Also cleanup test machines/volumes
+    for region in "${!TEST_MACHINES[@]}"; do
+        flyctl machine destroy "${TEST_MACHINES[$region]}" --force -a "$APP_NAME" 2>&1 | tail -1 || true
+    done
+    for region in "${!TEST_VOLUMES[@]}"; do
+        flyctl volumes destroy "${TEST_VOLUMES[$region]}" -y -a "$APP_NAME" 2>&1 | tail -1 || true
+    done
+    # Revert the fly.toml change since we didn't actually migrate
+    git checkout fly.toml || true
+    fail "verify post-migration failed for $WINNER_REGION — rolled back, old prod still running"
+fi
+log "VERIFIED: new production reaches Sofascore. Safe to clean up old production."
+
+# ─── 9b. Cleanup: destroy old production + all test machines/volumes ─────────
 log "cleanup: destroy old production machine + test machines"
 flyctl machine destroy "$PROD_MACHINE_ID" --force -a "$APP_NAME" 2>&1 | tail -1 || true
 for region in "${!TEST_MACHINES[@]}"; do
