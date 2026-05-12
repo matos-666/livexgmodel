@@ -3736,6 +3736,99 @@ MONITORED_SPORT_KEYS = {
     "soccer_japan_j_league",
 }
 
+
+# ── Hardcoded league priority by sport_key ────────────────────────────────────
+# Used by anything that needs to sort matches by importance:
+#   - Telegram daily preview teaser (top 3 of the day)
+#   - Footer live_now column (max 5 with priority tie-break)
+#   - Internal admin views
+#
+# Lower number = MORE IMPORTANT. The DB `competitions.priority` table
+# overrides this (admin-editable), but the table is sometimes empty after
+# a fresh deploy / volume migration — this hardcoded map guarantees a
+# sensible ordering at all times.
+LEAGUE_PRIORITY_BY_SPORT_KEY: dict = {
+    # Tier 1 — global flagship competitions
+    "soccer_uefa_champs_league":                  1,
+    "soccer_uefa_europa_league":                  2,
+    "soccer_uefa_europa_conference_league":       3,
+    "soccer_fifa_world_cup":                      1,
+    "soccer_uefa_european_championship":          2,
+    "soccer_uefa_nations_league":                 8,
+    "soccer_uefa_champs_league_qualification":    10,
+    "soccer_uefa_champs_league_women":            15,
+    "soccer_uefa_euro_qualification":             12,
+    "soccer_fifa_world_cup_qualifiers_europe":    9,
+    "soccer_fifa_world_cup_qualifiers_south_america": 11,
+    "soccer_fifa_world_cup_womens":               16,
+    "soccer_fifa_club_world_cup":                 6,
+
+    # Tier 2 — Top 5 European domestic leagues
+    "soccer_epl":                                 5,
+    "soccer_spain_la_liga":                       5,
+    "soccer_italy_serie_a":                       5,
+    "soccer_germany_bundesliga":                  5,
+    "soccer_france_ligue_one":                    5,
+
+    # Tier 3 — Strong second European leagues + second tiers
+    "soccer_portugal_primeira_liga":              15,
+    "soccer_netherlands_eredivisie":              16,
+    "soccer_belgium_first_div":                   17,
+    "soccer_turkey_super_league":                 18,
+    "soccer_germany_bundesliga2":                 20,
+    "soccer_efl_champ":                           20,
+    "soccer_spl":                                 22,  # Scottish Premiership
+    "soccer_greece_super_league":                 25,
+    "soccer_austria_bundesliga":                  28,
+    "soccer_switzerland_superleague":             28,
+    "soccer_russia_premier_league":               30,
+
+    # Tier 4 — South America top flights
+    "soccer_brazil_campeonato":                   14,
+    "soccer_brazil_serie_b":                      32,
+    "soccer_chile_campeonato":                    35,
+    "soccer_mexico_ligamx":                       19,
+    "soccer_conmebol_copa_libertadores":          7,
+    "soccer_conmebol_copa_sudamericana":          13,
+    "soccer_conmebol_copa_america":               4,
+
+    # Tier 5 — North America / Asia top flights
+    "soccer_usa_mls":                             21,
+    "soccer_japan_j_league":                      33,
+    "soccer_saudi_arabia_pro_league":             34,
+
+    # Tier 6 — Nordic + Eastern European top flights
+    "soccer_sweden_allsvenskan":                  40,
+    "soccer_norway_eliteserien":                  40,
+    "soccer_denmark_superliga":                   40,
+    "soccer_finland_veikkausliiga":               45,
+    "soccer_poland_ekstraklasa":                  42,
+    "soccer_league_of_ireland":                   48,
+}
+
+
+def _league_priority(sport_key: str | None) -> int:
+    """
+    Resolve the priority for a league. Lookup order:
+      1. competitions DB table (admin-editable)
+      2. hardcoded LEAGUE_PRIORITY_BY_SPORT_KEY map
+      3. default 99 (unknown / unranked)
+    Lower number = MORE IMPORTANT.
+    """
+    if not sport_key:
+        return 99
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT priority FROM competitions WHERE sport_key = ?",
+                (sport_key,)
+            ).fetchone()
+        if row and row["priority"]:
+            return int(row["priority"])
+    except Exception:
+        pass
+    return LEAGUE_PRIORITY_BY_SPORT_KEY.get(sport_key, 99)
+
 BG_INTERVAL   = 120   # seconds between cycles (2 minutes)
 ODDS_MIN_PICK = 1.40  # minimum odds to flag as value pick
 ODDS_MAX_PICK = 4.00  # maximum odds to flag as value pick
@@ -5192,20 +5285,11 @@ def _compute_footer_data() -> dict:
         "week_leagues": [],
     }
 
-    # ── Build league priority map from the competitions table
-    #    (lower priority number = more important league)
-    priority_by_sk: dict = {}
-    try:
-        with _db() as conn:
-            for r in conn.execute("SELECT sport_key, priority FROM competitions"):
-                priority_by_sk[r["sport_key"]] = r["priority"] or 99
-    except Exception as e:
-        log.warning(f"footer: priority map fetch failed: {e}")
-
+    # Resolve a league priority for any tournament — falls back through
+    # competitions DB → hardcoded map → 99 (see _league_priority()).
     def _priority_for(tournament: str, country: str) -> int:
         try:
-            sk = _resolve_sport_key(tournament, country)
-            return priority_by_sk.get(sk, 99)
+            return _league_priority(_resolve_sport_key(tournament, country))
         except Exception:
             return 99
 
@@ -5279,7 +5363,7 @@ def _compute_footer_data() -> dict:
                     "subtitle": f"{kick_str}" + (f" · {tourn}" if tourn else ""),
                     "url":      _match_url(m.get("id"), home, away),
                     "_ts":      ts,
-                    "_priority": priority_by_sk.get(sk, 99),
+                    "_priority": _league_priority(sk),
                 })
         # Soonest first; tie-break by league priority
         candidates.sort(key=lambda x: (x["_ts"], x["_priority"]))
@@ -10499,15 +10583,6 @@ def _build_daily_preview_message() -> str | None:
 
     now_ts = int(now_utc.timestamp())
 
-    # Build league priority lookup (lower number = more important)
-    priority_by_sk: dict = {}
-    try:
-        with _db() as conn:
-            for r in conn.execute("SELECT sport_key, priority FROM competitions"):
-                priority_by_sk[r["sport_key"]] = r["priority"] or 99
-    except Exception:
-        pass
-
     candidates = []
     for m in today_cache["matches"]:
         ts = m.get("startTimestamp") or 0
@@ -10523,7 +10598,7 @@ def _build_daily_preview_message() -> str | None:
             "tournament":  m.get("tournament", ""),
             "country":     m.get("country", ""),
             "kickoff_ts":  ts,
-            "_priority":   priority_by_sk.get(sk, 99),
+            "_priority":   _league_priority(sk),
         })
 
     if not candidates:
