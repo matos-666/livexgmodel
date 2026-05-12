@@ -48,9 +48,19 @@ command -v flyctl >/dev/null || fail "flyctl not installed" 2
 [[ -f "$FLY_TOML" ]] || fail "fly.toml not found at $FLY_TOML" 2
 [[ -n "${FLY_API_TOKEN:-}" ]] || fail "FLY_API_TOKEN env var is required" 2
 
-# ─── 1. Read current primary_region ──────────────────────────────────────────
-CURRENT_REGION="$(grep -E '^\s*primary_region' "$FLY_TOML" | sed -E 's/.*"([^"]+)".*/\1/')"
-[[ -n "$CURRENT_REGION" ]] || fail "could not parse primary_region from fly.toml"
+# ─── 1. Determine current production region ─────────────────────────────────
+# Authoritative source: the region of the running production machine, not
+# fly.toml. fly.toml can lag during back-to-back migrations (checkout may
+# happen before the previous run's git push lands). The live machine state
+# is always correct.
+PROD_MACHINE_REGION="$(flyctl machines list -a "$APP_NAME" --json 2>/dev/null \
+  | python3 -c "import sys,json; m=[x for x in json.load(sys.stdin) if x.get('state')=='started']; print(m[0]['region'] if m else '')" )"
+TOML_REGION="$(grep -E '^\s*primary_region' "$FLY_TOML" | sed -E 's/.*"([^"]+)".*/\1/')"
+CURRENT_REGION="${PROD_MACHINE_REGION:-$TOML_REGION}"
+[[ -n "$CURRENT_REGION" ]] || fail "could not determine current region (no started machine + fly.toml unparseable)"
+if [[ -n "$PROD_MACHINE_REGION" && "$PROD_MACHINE_REGION" != "$TOML_REGION" ]]; then
+    log "WARN: fly.toml says '$TOML_REGION' but live prod machine is in '$PROD_MACHINE_REGION' — using machine region"
+fi
 log "current primary_region: $CURRENT_REGION"
 
 # ─── 2. Get current production machine + volume IDs ──────────────────────────
