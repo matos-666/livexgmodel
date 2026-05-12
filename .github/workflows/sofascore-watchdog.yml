@@ -2,7 +2,7 @@ name: Sofascore Watchdog
 
 # Runs every hour. Curls /api/health/sofascore on the live app. If the
 # response says unhealthy AND the previous 2 hourly runs were also
-# unhealthy (= 3 consecutive failures, ≈3h of broken pipeline), invokes
+# unhealthy (= 2 consecutive failures, ≈2h of broken pipeline), invokes
 # tools/auto_failover.sh to migrate the Fly.io app to a working region.
 #
 # Required GitHub Secrets:
@@ -90,24 +90,27 @@ jobs:
               exit 0
           fi
 
-          # Look at the previous 2 scheduled runs (excluding this one).
-          # Both must have failed (= conclusion=failure) for the strike to count.
+          # Look at the previous scheduled run (excluding this one).
+          # If it also failed → 2 consecutive failures → migrate.
           # We treat a missing/stale healthcheck step as failure.
+          # Tightened from 3-strike to 2-strike (2026-05-12) — reduces
+          # max downtime window from ~3h to ~2h. Sofascore region blocks
+          # rarely recover within 1h so we don't gain much by waiting.
           prior_failures="$(
               gh run list \
                 --workflow sofascore-watchdog.yml \
                 --status completed \
-                --limit 2 \
+                --limit 1 \
                 --json conclusion \
                 --jq '[.[] | select(.conclusion == "failure")] | length'
           )"
-          echo "prior_failures (last 2 runs)=$prior_failures" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$prior_failures" -ge 2 ]]; then
+          echo "prior_failures (last 1 run)=$prior_failures" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$prior_failures" -ge 1 ]]; then
               echo "decision=migrate" >> "$GITHUB_OUTPUT"
-              echo "reason=3 consecutive failures (this + previous 2)" >> "$GITHUB_STEP_SUMMARY"
+              echo "reason=2 consecutive failures (this + previous)" >> "$GITHUB_STEP_SUMMARY"
           else
               echo "decision=fail-no-migrate" >> "$GITHUB_OUTPUT"
-              echo "reason=unhealthy but only $((prior_failures+1)) of last 3 failed; need 3" >> "$GITHUB_STEP_SUMMARY"
+              echo "reason=first failure; need 1 more consecutive failure to trigger migration" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # ── 3a. If unhealthy but no migrate yet — exit 1 to record failure ─
