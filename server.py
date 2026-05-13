@@ -6846,12 +6846,50 @@ def _wc2026_performance() -> dict:
 #                        before the World Cup kicks off.
 # Both are opt-in via explicit query param — production traffic is untouched.
 
+# Country / national-team name translations for mock payloads. Real Sofascore
+# data is English-only, so this only applies to ?mock= responses. Keys are the
+# canonical English form used in the hardcoded mock structures below.
+_COUNTRY_I18N = {
+    "en": {},  # identity
+    "es": {
+        "England": "Inglaterra", "Brazil": "Brasil", "Argentina": "Argentina",
+        "Spain": "España", "Germany": "Alemania", "Mexico": "México",
+        "Portugal": "Portugal", "Croatia": "Croacia",
+        "South Africa": "Sudáfrica", "France": "Francia",
+        "Netherlands": "Países Bajos", "Uruguay": "Uruguay",
+    },
+    "pt-pt": {
+        "England": "Inglaterra", "Brazil": "Brasil", "Argentina": "Argentina",
+        "Spain": "Espanha", "Germany": "Alemanha", "Mexico": "México",
+        "Portugal": "Portugal", "Croatia": "Croácia",
+        "South Africa": "África do Sul", "France": "França",
+        "Netherlands": "Países Baixos", "Uruguay": "Uruguai",
+    },
+    "pt-br": {
+        "England": "Inglaterra", "Brazil": "Brasil", "Argentina": "Argentina",
+        "Spain": "Espanha", "Germany": "Alemanha", "Mexico": "México",
+        "Portugal": "Portugal", "Croatia": "Croácia",
+        "South Africa": "África do Sul", "France": "França",
+        "Netherlands": "Holanda", "Uruguay": "Uruguai",
+    },
+}
+
+
+def _xlate(name: str, locale: str) -> str:
+    """Translate a country name to the given locale (mock data only)."""
+    if not name:
+        return name
+    return _COUNTRY_I18N.get(locale, {}).get(name, name)
+
+
 def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
     """Return a synthetic, realistic-looking payload for one of the 5 states.
 
     Used by inbet devs and us for visual QA / screenshots before the WC begins.
-    Numbers, teams and minutes are hardcoded. Touches no DB, no live state.
+    Numbers and minutes are hardcoded. Team/country names are translated to
+    the requested locale so screenshots look native. Touches no DB.
     """
+    xl = lambda n: _xlate(n, locale)
     now_ts = int(time.time())
     base = {
         "lang":              locale,
@@ -6873,7 +6911,7 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
             "state": "live",
             "match": {
                 "id": 99000001,
-                "home": "England", "away": "Brazil",
+                "home": xl("England"), "away": xl("Brazil"),
                 "home_goals": 1, "away_goals": 1, "minute": 67,
                 "country": "QAT (Mock)",
                 "tournament": "FIFA World Cup 2026 — Group Stage",
@@ -6881,7 +6919,7 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
             },
             "picks": [
                 {"market": "Over/Under 2.5", "label": "Over 2.5",   "odds": 1.85, "edge": 8.2, "minute": 34, "result": None},
-                {"market": "1X2",            "label": "Brazil",     "odds": 2.40, "edge": 5.1, "minute": 52, "result": None},
+                {"market": "1X2",            "label": xl("Brazil"), "odds": 2.40, "edge": 5.1, "minute": 52, "result": None},
                 {"market": "BTTS",           "label": "Yes",        "odds": 1.55, "edge": 4.3, "minute": 11, "result": None},
             ],
             # Cumulative xG over match minutes — realistic-looking curve for an
@@ -6910,20 +6948,20 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
             "state": "results_profitable",
             "match": {
                 "id": 99000002,
-                "home": "Argentina", "away": "Spain",
+                "home": xl("Argentina"), "away": xl("Spain"),
                 "home_goals": 2, "away_goals": 1, "minute": None,
                 "country": "USA (Mock)",
                 "tournament": "FIFA World Cup 2026 — Group Stage",
                 "is_finished": True,
             },
             "picks": [
-                {"market": "1X2",            "label": "Argentina", "odds": 2.10, "edge": 6.4, "minute": 18, "result": "won"},
-                {"market": "Over/Under 2.5", "label": "Over 2.5",  "odds": 1.95, "edge": 5.2, "minute": 41, "result": "won"},
-                {"market": "BTTS",           "label": "Yes",       "odds": 1.65, "edge": 3.8, "minute": 12, "result": "won"},
+                {"market": "1X2",            "label": xl("Argentina"), "odds": 2.10, "edge": 6.4, "minute": 18, "result": "won"},
+                {"market": "Over/Under 2.5", "label": "Over 2.5",      "odds": 1.95, "edge": 5.2, "minute": 41, "result": "won"},
+                {"market": "BTTS",           "label": "Yes",           "odds": 1.65, "edge": 3.8, "minute": 12, "result": "won"},
             ],
             "match_pnl": 187,
             "next_match": {
-                "id": 99000099, "home": "France", "away": "Netherlands",
+                "id": 99000099, "home": xl("France"), "away": xl("Netherlands"),
                 "country": "USA (Mock)",
                 "tournament": "FIFA World Cup 2026 — Group Stage",
                 "kickoff_ts": now_ts + 3 * 3600 + 14 * 60,
@@ -6937,19 +6975,19 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
             "state": "results_losing",
             "match": {
                 "id": 99000003,
-                "home": "Germany", "away": "Mexico",
+                "home": xl("Germany"), "away": xl("Mexico"),
                 "home_goals": 0, "away_goals": 2, "minute": None,
                 "country": "CAN (Mock)",
                 "tournament": "FIFA World Cup 2026 — Group Stage",
                 "is_finished": True,
             },
             "picks": [
-                {"market": "1X2",            "label": "Germany",   "odds": 1.80, "edge": 5.0, "minute": 22, "result": "lost"},
-                {"market": "Over/Under 2.5", "label": "Over 2.5",  "odds": 1.95, "edge": 4.1, "minute": 38, "result": "lost"},
+                {"market": "1X2",            "label": xl("Germany"), "odds": 1.80, "edge": 5.0, "minute": 22, "result": "lost"},
+                {"market": "Over/Under 2.5", "label": "Over 2.5",    "odds": 1.95, "edge": 4.1, "minute": 38, "result": "lost"},
             ],
             "match_pnl": -200,
             "next_match": {
-                "id": 99000099, "home": "Portugal", "away": "Uruguay",
+                "id": 99000099, "home": xl("Portugal"), "away": xl("Uruguay"),
                 "country": "MEX (Mock)",
                 "tournament": "FIFA World Cup 2026 — Group Stage",
                 "kickoff_ts": now_ts + 2 * 3600 + 45 * 60,
@@ -6963,7 +7001,7 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
             "state": "preview",
             "match": None,
             "next_match": {
-                "id": 99000004, "home": "Portugal", "away": "Croatia",
+                "id": 99000004, "home": xl("Portugal"), "away": xl("Croatia"),
                 "country": "USA (Mock)",
                 "tournament": "FIFA World Cup 2026 — Group Stage",
                 "kickoff_ts": now_ts + 2 * 3600 + 14 * 60,
@@ -6977,7 +7015,7 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
         base.update({
             "state": "off_day",
             "next_match": {
-                "id": 99000005, "home": "South Africa", "away": "Mexico",
+                "id": 99000005, "home": xl("South Africa"), "away": xl("Mexico"),
                 "country": "MEX (Mock)",
                 "tournament": "FIFA World Cup 2026 — Opening Match",
                 "kickoff_ts": now_ts + 2 * 86400 + 4 * 3600,
@@ -7076,6 +7114,7 @@ def _wc2026_current_state_for_match(match_id: int, locale: str = "en") -> dict:
 def _wc2026_mock_performance(locale: str = "en") -> dict:
     """Synthetic dashboard payload — fixed numbers for pre-launch QA."""
     now_ts = int(time.time())
+    xl = lambda n: _xlate(n, locale)
     # 14-day rising equity curve (€)
     curve = [0, 35, 88, 64, 142, 198, 264, 312, 388, 421, 510, 612, 698, 783, 904, 1058, 1142, 1208, 1283]
     return {
@@ -7089,11 +7128,11 @@ def _wc2026_mock_performance(locale: str = "en") -> dict:
         "avg_odds":    1.92,
         "equity_curve": [{"ts": now_ts - (len(curve) - i) * 86400, "pnl": v} for i, v in enumerate(curve)],
         "top_greens": [
-            {"home": "Argentina", "away": "Iran",      "market": "Over/Under 2.5", "label": "Over 2.5", "odds": 2.10, "minute": 31, "profit": 110},
-            {"home": "Brazil",    "away": "Serbia",    "market": "1X2",            "label": "Brazil",   "odds": 1.95, "minute": 22, "profit":  95},
-            {"home": "France",    "away": "Tunisia",   "market": "BTTS",           "label": "Yes",      "odds": 1.80, "minute": 14, "profit":  80},
-            {"home": "Portugal",  "away": "Ghana",     "market": "Over/Under 2.5", "label": "Over 2.5", "odds": 1.75, "minute": 38, "profit":  75},
-            {"home": "Spain",     "away": "Morocco",   "market": "Asian Handicap", "label": "Spain -1", "odds": 2.05, "minute": 19, "profit":  70},
+            {"home": xl("Argentina"), "away": "Iran",         "market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 2.10, "minute": 31, "profit": 110},
+            {"home": xl("Brazil"),    "away": "Serbia",       "market": "1X2",            "label": xl("Brazil"),          "odds": 1.95, "minute": 22, "profit":  95},
+            {"home": xl("France"),    "away": "Tunisia",      "market": "BTTS",           "label": "Yes",                 "odds": 1.80, "minute": 14, "profit":  80},
+            {"home": xl("Portugal"),  "away": "Ghana",        "market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 1.75, "minute": 38, "profit":  75},
+            {"home": xl("Spain"),     "away": "Morocco",      "market": "Asian Handicap", "label": xl("Spain") + " -1",   "odds": 2.05, "minute": 19, "profit":  70},
         ],
         "by_market": [
             {"market": "Over/Under 2.5", "picks": 18, "pnl":  642.0},
@@ -7260,9 +7299,10 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
 
   // For a national-team competition the team name IS the country, so this
   // same map works for both flagFor(country) and flagFor(teamName). The map
-  // includes every nation that could plausibly qualify for the 2026 WC plus
-  // common alt spellings ("usa" / "united states", "south korea" / "korea
-  // republic", etc.) returned by different data sources.
+  // also includes localized variants (Inglaterra / Alemanha / Francia / …)
+  // so that mock payloads served with lang=pt-pt|es|pt-br still render the
+  // right flag even though our backend translates the team names for those
+  // locales.
   const FLAG_MAP = {{
     'south africa':'🇿🇦','mexico':'🇲🇽','argentina':'🇦🇷','brazil':'🇧🇷',
     'france':'🇫🇷','england':'🏴󠁧󠁢󠁥󠁮󠁧󠁿','spain':'🇪🇸','germany':'🇩🇪','italy':'🇮🇹',
@@ -7284,7 +7324,13 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
     'bulgaria':'🇧🇬','ukraine':'🇺🇦','russia':'🇷🇺','greece':'🇬🇷','iceland':'🇮🇸',
     'ireland':'🇮🇪','scotland':'🏴󠁧󠁢󠁳󠁣󠁴󠁿','northern ireland':'🇬🇧','finland':'🇫🇮','albania':'🇦🇱',
     'bosnia':'🇧🇦','bosnia and herzegovina':'🇧🇦','north macedonia':'🇲🇰','slovenia':'🇸🇮',
-    'georgia':'🇬🇪','azerbaijan':'🇦🇿','armenia':'🇦🇲'
+    'georgia':'🇬🇪','azerbaijan':'🇦🇿','armenia':'🇦🇲',
+    // Localized variants used in mock payloads (es / pt-pt / pt-br)
+    'inglaterra':'🏴󠁧󠁢󠁥󠁮󠁧󠁿','brasil':'🇧🇷','espanha':'🇪🇸','españa':'🇪🇸',
+    'alemanha':'🇩🇪','alemania':'🇩🇪','méxico':'🇲🇽','frança':'🇫🇷','francia':'🇫🇷',
+    'croácia':'🇭🇷','croacia':'🇭🇷','áfrica do sul':'🇿🇦','sudáfrica':'🇿🇦',
+    'países baixos':'🇳🇱','países bajos':'🇳🇱','holanda':'🇳🇱',
+    'uruguai':'🇺🇾','turquia':'🇹🇷'
   }};
 
   function flagFor(name){{
