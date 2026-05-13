@@ -7331,12 +7331,20 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
 <style>
   :root{{
     --bg:#0a0e27; --card:#141a3a; --border:#2a2f4a; --text:#e8f0f7;
-    --meta:#9ca3af; --accent:{accent}; --green:#10b981; --red:#ef4444;
-    --amber:#fbbf24; --cyan:#22d3ee;
+    --meta:#9ca3af; --accent:{accent}; --accent-2:#22d3ee;
+    --green:#10b981; --red:#ef4444; --amber:#fbbf24; --cyan:#22d3ee;
   }}
   body[data-theme="light"]{{
     --bg:#f8fafc; --card:#ffffff; --border:#e5e7eb; --text:#0f172a;
     --meta:#64748b;
+  }}
+  /* InBet members-area palette — matches app.inbet.io chrome so the iframe
+     blends in. Deep midnight navy bg, slightly lighter card, warm orange
+     primary accent, royal-blue secondary accent. */
+  body[data-theme="inbet"]{{
+    --bg:#0c1126; --card:#181f38; --border:#252d4a; --text:#ffffff;
+    --meta:#8b95a9; --accent:#ff8a1e; --accent-2:#2667ff;
+    --green:#22c55e; --red:#ef4444; --amber:#fbbf24; --cyan:#3b82f6;
   }}
   *{{box-sizing:border-box}}
   body{{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5;padding:0}}
@@ -7764,8 +7772,11 @@ def r_wc2026_widget_current():
     """Per-match state-machine widget. Self-contained HTML page for <iframe> embed."""
     locale = _widget_locale(flask_request.args.get("lang"))
     theme  = (flask_request.args.get("theme") or "dark").strip().lower()
-    if theme not in ("dark", "light"):
+    if theme not in ("dark", "light", "inbet"):
         theme = "dark"
+    # When theme=inbet, the palette CSS overrides --accent anyway, so any
+    # explicit ?accent= is effectively ignored. Default accent stays green
+    # for dark/light to keep behaviour backwards-compatible.
     accent_raw = (flask_request.args.get("accent") or "#10b981").strip()
     import re as _re
     accent = accent_raw if _re.match(r"^#[0-9a-fA-F]{3,8}$", accent_raw) else "#10b981"
@@ -7845,12 +7856,20 @@ _WC_WIDGET_PERF_HTML = """<!DOCTYPE html>
 <style>
   :root{{
     --bg:#0a0e27; --card:#141a3a; --border:#2a2f4a; --text:#e8f0f7;
-    --meta:#9ca3af; --accent:{accent}; --green:#10b981; --red:#ef4444;
-    --amber:#fbbf24; --cyan:#22d3ee;
+    --meta:#9ca3af; --accent:{accent}; --accent-2:#22d3ee;
+    --green:#10b981; --red:#ef4444; --amber:#fbbf24; --cyan:#22d3ee;
   }}
   body[data-theme="light"]{{
     --bg:#f8fafc; --card:#ffffff; --border:#e5e7eb; --text:#0f172a;
     --meta:#64748b;
+  }}
+  /* InBet members-area palette — matches app.inbet.io chrome so the iframe
+     blends in. Deep midnight navy bg, slightly lighter card, warm orange
+     primary accent, royal-blue secondary accent. */
+  body[data-theme="inbet"]{{
+    --bg:#0c1126; --card:#181f38; --border:#252d4a; --text:#ffffff;
+    --meta:#8b95a9; --accent:#ff8a1e; --accent-2:#2667ff;
+    --green:#22c55e; --red:#ef4444; --amber:#fbbf24; --cyan:#3b82f6;
   }}
   *{{box-sizing:border-box}}
   body{{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}}
@@ -8011,8 +8030,11 @@ def r_wc2026_widget_performance():
     """Performance dashboard widget — self-contained HTML for <iframe> embed."""
     locale = _widget_locale(flask_request.args.get("lang"))
     theme  = (flask_request.args.get("theme") or "dark").strip().lower()
-    if theme not in ("dark", "light"):
+    if theme not in ("dark", "light", "inbet"):
         theme = "dark"
+    # When theme=inbet, the palette CSS overrides --accent anyway, so any
+    # explicit ?accent= is effectively ignored. Default accent stays green
+    # for dark/light to keep behaviour backwards-compatible.
     accent_raw = (flask_request.args.get("accent") or "#10b981").strip()
     import re as _re
     accent = accent_raw if _re.match(r"^#[0-9a-fA-F]{3,8}$", accent_raw) else "#10b981"
