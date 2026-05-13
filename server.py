@@ -9441,7 +9441,10 @@ def _broadcast_inbet_pick(match: dict, pick: dict, minute: int | None):
 
     Eligibility = active=1 AND plan_status IN (premium|trial|demo).
     Tournament restricted to WC 2026 matches only (this is a WC-scoped product).
-    Anti-spam: 1 message per match per 60 s per subscriber, 8 messages/day cap.
+    No per-member throttling: paid members receive every value pick the model
+    surfaces — the algorithm itself is what bounds the frequency (typically
+    1-4 picks per match), so artificial caps would just hide tips users paid
+    for. Members who want fewer notifications can /stop the bot.
     """
     if not INBET_BOT_TOKEN:
         return  # bot not configured — silently skip
