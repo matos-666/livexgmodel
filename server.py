@@ -7512,15 +7512,26 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
     if (!name) return '⚽';
     return FLAG_MAP[_cleanName(name)] || '⚽';
   }}
+  // flagcdn.com only serves a fixed set of heights: h20, h24, h40, h60, h80,
+  // h120, h240. Round the requested source height up to the next supported
+  // bucket so requests don't 404 (which is what broke earlier).
+  const FLAG_CDN_HEIGHTS = [20, 24, 40, 60, 80, 120, 240];
+  function _flagCdnHeight(target){{
+    for (let i = 0; i < FLAG_CDN_HEIGHTS.length; i++) {{
+      if (FLAG_CDN_HEIGHTS[i] >= target) return FLAG_CDN_HEIGHTS[i];
+    }}
+    return 240;
+  }}
   // flagImg: returns an <img> tag pointing at the flagcdn.com CDN.
-  //   sizePx — display height in CSS pixels (the source request asks for 2×
-  //   for retina sharpness, e.g. sizePx=64 → request h128).
+  //   sizePx — display height in CSS pixels. The source request asks for
+  //   ~2× for retina sharpness, snapped to the next valid CDN bucket.
   function flagImg(name, sizePx){{
     if (!name) return '';
     const code = FLAG_CODE_MAP[_cleanName(name)];
     if (!code) return '<span class="flag flag-fallback">⚽</span>';
-    const src2x = 'https://flagcdn.com/h' + (sizePx * 2) + '/' + code + '.png';
-    return '<img class="flag-img" src="' + src2x + '" alt="' + name +
+    const srcH = _flagCdnHeight(sizePx * 2);
+    const src  = 'https://flagcdn.com/h' + srcH + '/' + code + '.png';
+    return '<img class="flag-img" src="' + src + '" alt="' + name +
            '" height="' + sizePx + '" loading="lazy" decoding="async" />';
   }}
 
@@ -7668,10 +7679,11 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
     let next = '';
     if (d.next_match && d.countdown_to_next_kickoff_s != null) {{
       // Inline mini-flag — only emitted when we have a code (no broken-image
-      // placeholder if a country isn't in FLAG_CODE_MAP).
+      // placeholder if a country isn't in FLAG_CODE_MAP). h40 is the smallest
+      // bucket flagcdn.com supports that's still crisp at ~18px display.
       const inlineFlag = (n) => {{
         const c = FLAG_CODE_MAP[_cleanName(n)];
-        return c ? '<img class="flag-inline" src="https://flagcdn.com/h36/' + c + '.png" alt="" />' : '';
+        return c ? '<img class="flag-inline" src="https://flagcdn.com/h40/' + c + '.png" alt="" />' : '';
       }};
       next = '<div class="countdown"><div class="label">' + t('next_up') + ' · ' + inlineFlag(d.next_match.home) + d.next_match.home + ' vs ' + d.next_match.away + inlineFlag(d.next_match.away) + '</div><div class="value">' + t('kickoff_in') + ' ' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div></div>';
     }}
