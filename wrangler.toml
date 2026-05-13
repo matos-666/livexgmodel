@@ -1,0 +1,33 @@
+# Wrangler config for the webpronos.com Cloudflare Worker.
+#
+# After the one-time setup (see WRANGLER_SETUP.md) deploys are a single
+# command:
+#   tools/deploy_worker.sh
+#
+# Or directly:
+#   CLOUDFLARE_API_TOKEN=xxx npx wrangler deploy
+#
+# Three values below must match the boss's Cloudflare account. Fill them
+# in once after the boss sends them (one-time, per CLOUDFLARE_WORKER_HANDOFF.md
+# section "What we need from you"):
+#   - account_id     → bottom-right of the Cloudflare overview page
+#   - name           → the existing worker's name (see Workers & Pages list)
+#   - routes pattern → already correct below (webpronos.com/*)
+
+name        = "webpronos-seo-router"          # ← CHANGE if existing worker has a different name
+main        = "cloudflare-worker.js"
+compatibility_date = "2025-01-01"
+account_id  = "REPLACE_WITH_ACCOUNT_ID"        # ← boss sends this once
+
+# Bind to webpronos.com so all traffic flows through the worker.
+# `zone_name` is the apex domain Cloudflare manages.
+routes = [
+  { pattern = "webpronos.com/*", zone_name = "webpronos.com" },
+  { pattern = "www.webpronos.com/*", zone_name = "webpronos.com" },
+]
+
+# No KV / D1 / R2 bindings — the worker is a pure router (sitemaps + bot
+# prerender + SPA passthrough). Add them here if needed in future.
+
+[observability]
+enabled = true
