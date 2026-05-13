@@ -3874,6 +3874,7 @@ WIDGET_COPY: dict = {
         "algo_picks":      "Algorithm Picks",
         "no_picks_yet":    "Awaiting value picks…",
         "result_timeline": "Pick Timeline",
+        "xg_momentum":     "Live xG momentum",
         "next_up":         "Next up",
         "kickoff_in":      "Kickoff in",
         "model_preview":   "Model preview",
@@ -3911,6 +3912,7 @@ WIDGET_COPY: dict = {
         "algo_picks":      "Picks del Algoritmo",
         "no_picks_yet":    "Esperando picks con valor…",
         "result_timeline": "Línea de picks",
+        "xg_momentum":     "Momentum xG en vivo",
         "next_up":         "A continuación",
         "kickoff_in":      "Inicio en",
         "model_preview":   "Previa del modelo",
@@ -3943,6 +3945,7 @@ WIDGET_COPY: dict = {
         "algo_picks":      "Picks do Algoritmo",
         "no_picks_yet":    "À espera de picks com valor…",
         "result_timeline": "Linha do tempo das picks",
+        "xg_momentum":     "Momentum xG em direto",
         "next_up":         "A seguir",
         "kickoff_in":      "Início em",
         "model_preview":   "Antevisão do modelo",
@@ -3975,6 +3978,7 @@ WIDGET_COPY: dict = {
         "algo_picks":      "Picks do Algoritmo",
         "no_picks_yet":    "Aguardando picks com valor…",
         "result_timeline": "Linha do tempo das picks",
+        "xg_momentum":     "Momentum xG ao vivo",
         "next_up":         "A seguir",
         "kickoff_in":      "Início em",
         "model_preview":   "Prévia do modelo",
@@ -6427,6 +6431,42 @@ def _seo_cache_put(key: str, html: str) -> None:
 #  WC 2026 widget data — state machine + tournament performance
 # ════════════════════════════════════════════════════════════════════════════
 
+def _build_xg_timeline_from_entry(entry: dict) -> list:
+    """Construct a cumulative xG timeline [{minute, home, away}, …] from a live
+    state entry. Returns [] if no usable shots data. Penalties are excluded
+    from the cumulative total to match how we compute team xG elsewhere.
+    """
+    if not entry:
+        return []
+    shots = entry.get("shots") or []
+    if not isinstance(shots, list) or not shots:
+        return []
+    rows = []
+    for s in shots:
+        m = s.get("minute")
+        if m is None:
+            continue
+        if s.get("isPenalty"):
+            continue
+        rows.append((int(m) + (int(s.get("addedTime") or 0) or 0) / 60.0,
+                     bool(s.get("isHome")),
+                     float(s.get("xg") or 0)))
+    rows.sort(key=lambda r: r[0])
+    timeline = [{"minute": 0, "home": 0.0, "away": 0.0}]
+    cum_h, cum_a = 0.0, 0.0
+    for minute, is_home, xg in rows:
+        if is_home:
+            cum_h += xg
+        else:
+            cum_a += xg
+        timeline.append({
+            "minute": int(round(minute)),
+            "home":   round(cum_h, 3),
+            "away":   round(cum_a, 3),
+        })
+    return timeline
+
+
 def _wc2026_current_state(locale: str = "en") -> dict:
     """
     Decide which of the 5 widget states to render for the inbet WC 2026
@@ -6657,6 +6697,11 @@ def _wc2026_current_state(locale: str = "en") -> dict:
     else:  # off_day
         poll_ms = 300_000
 
+    # xG timeline for the chart in renderLive — only meaningful in LIVE state.
+    xg_timeline = []
+    if state == "live" and live_wc_entry is not None:
+        xg_timeline = _build_xg_timeline_from_entry(live_wc_entry)
+
     return {
         "state":                       state,
         "lang":                        locale,
@@ -6670,6 +6715,7 @@ def _wc2026_current_state(locale: str = "en") -> dict:
         "powered_by":                  _t(locale, "powered_by"),
         "next_poll_after_ms":          poll_ms,
         "now_ts":                      now_ts,
+        "xg_timeline":                 xg_timeline,
     }
 
 
@@ -6837,6 +6883,23 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
                 {"market": "Over/Under 2.5", "label": "Over 2.5",   "odds": 1.85, "edge": 8.2, "minute": 34, "result": None},
                 {"market": "1X2",            "label": "Brazil",     "odds": 2.40, "edge": 5.1, "minute": 52, "result": None},
                 {"market": "BTTS",           "label": "Yes",        "odds": 1.55, "edge": 4.3, "minute": 11, "result": None},
+            ],
+            # Cumulative xG over match minutes — realistic-looking curve for an
+            # entertaining open game where both attacks created chances.
+            "xg_timeline": [
+                {"minute":  0, "home": 0.00, "away": 0.00},
+                {"minute":  6, "home": 0.05, "away": 0.10},
+                {"minute": 12, "home": 0.18, "away": 0.14},
+                {"minute": 18, "home": 0.32, "away": 0.20},
+                {"minute": 24, "home": 0.48, "away": 0.32},
+                {"minute": 30, "home": 0.65, "away": 0.42},
+                {"minute": 35, "home": 0.85, "away": 0.55},
+                {"minute": 41, "home": 1.02, "away": 0.68},
+                {"minute": 46, "home": 1.10, "away": 0.78},
+                {"minute": 52, "home": 1.22, "away": 0.95},
+                {"minute": 58, "home": 1.38, "away": 1.12},
+                {"minute": 63, "home": 1.52, "away": 1.28},
+                {"minute": 67, "home": 1.62, "away": 1.38},
             ],
             "countdown_to_next_kickoff_s": 4 * 3600,
             "next_poll_after_ms": 30_000,
@@ -7006,6 +7069,7 @@ def _wc2026_current_state_for_match(match_id: int, locale: str = "en") -> dict:
         "next_poll_after_ms":          30_000 if not is_finished else 60_000,
         "now_ts":                      now_ts,
         "_override_match_id":          int(match_id),
+        "xg_timeline":                 _build_xg_timeline_from_entry(entry) if not is_finished else [],
     }
 
 
@@ -7126,6 +7190,13 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
   .score{{font-size:1.8rem;font-weight:800;letter-spacing:.05em;padding:0 14px;color:var(--text);min-width:90px;text-align:center}}
   .meta-line{{font-size:.78rem;color:var(--meta);text-align:center;margin-top:10px}}
   .section-title{{font-size:.72rem;color:var(--meta);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 8px}}
+  .xg-chart{{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 12px 8px;margin-bottom:14px}}
+  .xg-chart svg{{display:block;width:100%;height:auto}}
+  .xg-chart .legend{{display:flex;gap:14px;justify-content:flex-end;font-size:.72rem;color:var(--meta);margin-top:6px;flex-wrap:wrap}}
+  .xg-chart .legend .dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:middle}}
+  .xg-chart .legend .dot-home{{background:var(--green)}}
+  .xg-chart .legend .dot-away{{background:var(--red)}}
+  .xg-chart .legend .totals{{color:var(--text);font-weight:700}}
   .pick-row{{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:6px;font-size:.9rem;gap:10px}}
   .pick-left{{display:flex;align-items:center;gap:10px;min-width:0;flex:1}}
   .pick-minute{{font-size:.72rem;color:var(--meta);min-width:34px;text-align:center;background:rgba(255,255,255,.04);border-radius:6px;padding:3px 6px}}
@@ -7289,8 +7360,71 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
       + '</div>';
   }}
 
+  // Inline SVG xG chart — cumulative xG line for each team over match minutes.
+  // Sized to fit the iframe column; renders nothing if no timeline data.
+  function renderXgChart(d){{
+    const tl = d && d.xg_timeline;
+    if (!Array.isArray(tl) || tl.length < 2) return '';
+
+    const W = 580, H = 170;
+    const padL = 32, padR = 12, padT = 14, padB = 26;
+
+    const maxMin = Math.max(90, ...tl.map(p => p.minute || 0));
+    const maxXg  = Math.max(0.5, ...tl.map(p => Math.max(p.home || 0, p.away || 0))) + 0.3;
+    const sx = m => padL + (m / maxMin) * (W - padL - padR);
+    const sy = v => H - padB - (v / maxXg) * (H - padT - padB);
+
+    const buildPath = (key) => tl.map(p => sx(p.minute || 0) + ',' + sy(p[key] || 0)).join(' ');
+    const homePts = buildPath('home');
+    const awayPts = buildPath('away');
+
+    // y-axis gridlines (0, 0.5, 1.0, 1.5, 2.0 …)
+    const yStep = maxXg > 2.5 ? 1.0 : 0.5;
+    let grid = '';
+    for (let v = 0; v <= maxXg; v += yStep) {{
+      const y = sy(v);
+      grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="currentColor" stroke-opacity="0.08" stroke-width="1"/>';
+      grid += '<text x="' + (padL - 6) + '" y="' + (y + 3) + '" font-size="9" text-anchor="end" fill="currentColor" opacity="0.5">' + v.toFixed(1) + '</text>';
+    }}
+
+    // x-axis ticks (0, 15, 30, 45, 60, 75, 90)
+    let xticks = '';
+    [0, 15, 30, 45, 60, 75, 90].forEach(m => {{
+      if (m > maxMin) return;
+      const x = sx(m);
+      xticks += '<line x1="' + x + '" y1="' + (H - padB) + '" x2="' + x + '" y2="' + (H - padB + 3) + '" stroke="currentColor" stroke-opacity="0.3"/>';
+      xticks += '<text x="' + x + '" y="' + (H - padB + 14) + '" font-size="9" text-anchor="middle" fill="currentColor" opacity="0.55">' + m + "'" + '</text>';
+    }});
+
+    // Filled area under each line (soft, low opacity)
+    const areaHome = padL + ',' + sy(0) + ' ' + homePts + ' ' + sx(tl[tl.length-1].minute) + ',' + sy(0);
+    const areaAway = padL + ',' + sy(0) + ' ' + awayPts + ' ' + sx(tl[tl.length-1].minute) + ',' + sy(0);
+
+    const last = tl[tl.length - 1] || {{home:0, away:0}};
+    const homeName = (d.match && d.match.home) || 'Home';
+    const awayName = (d.match && d.match.away) || 'Away';
+
+    const svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="xG momentum chart">'
+      + '<rect x="' + padL + '" y="' + padT + '" width="' + (W - padL - padR) + '" height="' + (H - padT - padB) + '" fill="transparent"/>'
+      + grid + xticks
+      + '<polygon points="' + areaHome + '" fill="#10b981" fill-opacity="0.12"/>'
+      + '<polygon points="' + areaAway + '" fill="#ef4444" fill-opacity="0.12"/>'
+      + '<polyline points="' + homePts + '" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>'
+      + '<polyline points="' + awayPts + '" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>'
+      + '</svg>';
+
+    const legend = '<div class="legend">'
+      + '<span><span class="dot dot-home"></span>' + homeName + ' · <span class="totals">' + (last.home || 0).toFixed(2) + ' xG</span></span>'
+      + '<span><span class="dot dot-away"></span>' + awayName + ' · <span class="totals">' + (last.away || 0).toFixed(2) + ' xG</span></span>'
+      + '</div>';
+
+    return '<div class="xg-chart">' + svg + legend + '</div>';
+  }}
+
   function renderLive(d){{
     return renderMatchCard(d.match)
+      + '<div class="section-title">' + t('xg_momentum') + '</div>'
+      + renderXgChart(d)
       + '<div class="section-title">' + t('algo_picks') + '</div>'
       + renderPicks(d.picks);
   }}
