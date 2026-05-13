@@ -8608,7 +8608,12 @@ def _load_logos():
         _logos_cache      = logos
         _logos_norm_cache = logos_norm
         _logos_ts         = time.time()
-        log.info(f"Team logos loaded: {len(logos)} entries ({len(logos_norm)} normalized)")
+        # Bust the long-lived memoization cache so URL edits in the sheet
+        # (e.g. swapping a team's logo to a new file) actually propagate.
+        # Without this, _fuzzy_logo_memo[name] keeps returning the original
+        # URL forever even after the sheet was updated — observed bug.
+        _fuzzy_logo_memo.clear()
+        log.info(f"Team logos loaded: {len(logos)} entries ({len(logos_norm)} normalized); memo cleared")
     except Exception as e:
         log.error(f"Failed to load team logos: {e}")
 
@@ -8812,6 +8817,30 @@ def r_prewarm_logos():
     """Manually trigger the fuzzy logo prewarm (also runs automatically on boot)."""
     threading.Thread(target=_prewarm_fuzzy_logos, daemon=True).start()
     return jsonify({"ok": True, "message": "Prewarm started in background — check logs"})
+
+
+@app.route("/api/admin/refresh-logos", methods=["POST", "GET"])
+def r_refresh_logos():
+    """Force-reload the logo sheet NOW (bypass the 10-min TTL) and clear the
+    per-team memoization cache so a sheet edit propagates immediately.
+
+    Use this whenever you've changed a row in the team-logos Google Sheet
+    and want the new URL live without waiting for the next TTL window.
+    """
+    before_count = len(_logos_cache)
+    _load_logos()  # synchronous so the response reflects the new state
+    after_count = len(_logos_cache)
+    # If the caller asked about a specific team, return that team's new URL
+    name = (flask_request.args.get("team") or "").strip()
+    team_url = _quick_logo(name) if name else None
+    return jsonify({
+        "ok":            True,
+        "before_count":  before_count,
+        "after_count":   after_count,
+        "memo_cleared":  True,
+        "team":          name or None,
+        "team_url":      team_url,
+    })
 
 
 @app.route("/api/team_logos")
