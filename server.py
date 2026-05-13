@@ -1588,6 +1588,14 @@ def _broadcast_pick(match: dict, pick: dict, minute: int | None):
                     dead_clients.append(client_q)
             for client in dead_clients:
                 _sse_clients.discard(client)
+
+        # Fan-out to dedicated inbet Telegram bot (WC 2026 picks only, eligible
+        # members only). No-op if INBET_BOT_TOKEN is not configured — safe to
+        # ship before inbet provides the token.
+        try:
+            _broadcast_inbet_pick(match, pick, minute)
+        except Exception as sub_err:
+            log.error(f"inbet fan-out failed: {sub_err}")
     except Exception as e:
         log.error(f"_broadcast_pick error: {e}")
 
@@ -3834,6 +3842,206 @@ def _league_priority(sport_key: str | None) -> int:
         pass
     return LEAGUE_PRIORITY_BY_SPORT_KEY.get(sport_key, 99)
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  FIFA WORLD CUP 2026 — inbet.io white-label widgets
+# ════════════════════════════════════════════════════════════════════════════
+# Drives the two embeddable widgets exposed to inbet.io's premium members:
+#   1. /widget/wc2026/current — per-match state machine (LIVE → RESULTS → PREVIEW → OFF-DAY)
+#   2. /widget/wc2026/performance — tournament-scoped P&L / ROI / top greens
+# Both pull from the same JSON endpoints (/api/wc2026/*.json) so the iframe
+# can be embedded with one HTML tag and refreshed without page reload.
+
+# Tournament boundaries — used to scope DB queries and date math.
+WC2026_START_TS = 1749600000   # 2026-06-11 00:00 UTC (opener: South Africa vs Mexico)
+WC2026_END_TS   = 1753056000   # 2026-07-19 00:00 UTC (one day after final)
+WC2026_EMBLEM_URL = "https://upload.wikimedia.org/wikipedia/en/thumb/1/17/2026_FIFA_World_Cup_emblem.svg/250px-2026_FIFA_World_Cup_emblem.svg.png"
+
+# Supported widget locales. Inbet stores user locale; passes via ?lang=...
+WIDGET_LOCALES = ("en", "es", "pt-pt", "pt-br")
+WIDGET_DEFAULT_LOCALE = "en"
+
+# All UI strings used by the widgets, keyed by locale → key.
+# Keep keys identical across locales — missing keys fall back to English.
+WIDGET_COPY: dict = {
+    "en": {
+        # status pills
+        "live_now":        "LIVE",
+        "scheduled":       "SCHEDULED",
+        "finished":        "FT",
+        "half_time":       "HT",
+        # per-match widget sections
+        "algo_picks":      "Algorithm Picks",
+        "no_picks_yet":    "Awaiting value picks…",
+        "result_timeline": "Pick Timeline",
+        "next_up":         "Next up",
+        "kickoff_in":      "Kickoff in",
+        "model_preview":   "Model preview",
+        "wc_resumes_in":   "World Cup resumes in",
+        # result badges
+        "result_won":      "Won",
+        "result_lost":     "Lost",
+        "result_push":     "Push",
+        "result_pending":  "Pending",
+        # performance dashboard
+        "perf_title":      "World Cup 2026 · Live xG Model",
+        "perf_picks":      "Total picks",
+        "perf_winrate":    "Win rate",
+        "perf_pnl":        "P&L",
+        "perf_roi":        "ROI",
+        "perf_equity":     "Equity curve",
+        "perf_top_greens": "Biggest winners",
+        "perf_by_market":  "Profit by market",
+        "perf_updated":    "Updated every 5 min",
+        # entered-at / minute label
+        "min_entered":     "Entered at",
+        "minute_short":    "'",
+        # footers
+        "powered_by":      "Powered by InBetIO Live xG Model",
+        "wc_emblem_alt":   "FIFA World Cup 2026",
+        # error / empty
+        "no_data_yet":     "No data yet for this tournament.",
+        "no_live_match":   "No World Cup match live right now.",
+    },
+    "es": {
+        "live_now":        "EN VIVO",
+        "scheduled":       "PROGRAMADO",
+        "finished":        "FT",
+        "half_time":       "HT",
+        "algo_picks":      "Picks del Algoritmo",
+        "no_picks_yet":    "Esperando picks con valor…",
+        "result_timeline": "Línea de picks",
+        "next_up":         "A continuación",
+        "kickoff_in":      "Inicio en",
+        "model_preview":   "Previa del modelo",
+        "wc_resumes_in":   "El Mundial vuelve en",
+        "result_won":      "Ganada",
+        "result_lost":     "Perdida",
+        "result_push":     "Empate",
+        "result_pending":  "Pendiente",
+        "perf_title":      "Mundial 2026 · Modelo xG en Vivo",
+        "perf_picks":      "Picks totales",
+        "perf_winrate":    "Tasa de aciertos",
+        "perf_pnl":        "P&L",
+        "perf_roi":        "ROI",
+        "perf_equity":     "Curva de capital",
+        "perf_top_greens": "Mejores aciertos",
+        "perf_by_market":  "Beneficio por mercado",
+        "perf_updated":    "Actualizado cada 5 min",
+        "min_entered":     "Entrada al",
+        "minute_short":    "'",
+        "powered_by":      "Powered by InBetIO Live xG Model",
+        "wc_emblem_alt":   "FIFA Mundial 2026",
+        "no_data_yet":     "Aún no hay datos para este torneo.",
+        "no_live_match":   "No hay partido del Mundial en vivo ahora mismo.",
+    },
+    "pt-pt": {
+        "live_now":        "EM DIRETO",
+        "scheduled":       "AGENDADO",
+        "finished":        "FT",
+        "half_time":       "INT",
+        "algo_picks":      "Picks do Algoritmo",
+        "no_picks_yet":    "À espera de picks com valor…",
+        "result_timeline": "Linha do tempo das picks",
+        "next_up":         "A seguir",
+        "kickoff_in":      "Início em",
+        "model_preview":   "Antevisão do modelo",
+        "wc_resumes_in":   "Mundial regressa em",
+        "result_won":      "Ganha",
+        "result_lost":     "Perdida",
+        "result_push":     "Empate",
+        "result_pending":  "Pendente",
+        "perf_title":      "Mundial 2026 · Modelo xG ao Vivo",
+        "perf_picks":      "Picks totais",
+        "perf_winrate":    "Taxa de acerto",
+        "perf_pnl":        "P&L",
+        "perf_roi":        "ROI",
+        "perf_equity":     "Curva de capital",
+        "perf_top_greens": "Maiores vitórias",
+        "perf_by_market":  "Lucro por mercado",
+        "perf_updated":    "Atualizado a cada 5 min",
+        "min_entered":     "Entrada ao",
+        "minute_short":    "'",
+        "powered_by":      "Powered by InBetIO Live xG Model",
+        "wc_emblem_alt":   "FIFA Mundial 2026",
+        "no_data_yet":     "Ainda sem dados para este torneio.",
+        "no_live_match":   "Sem jogo do Mundial em direto neste momento.",
+    },
+    "pt-br": {
+        "live_now":        "AO VIVO",
+        "scheduled":       "AGENDADO",
+        "finished":        "FT",
+        "half_time":       "INT",
+        "algo_picks":      "Picks do Algoritmo",
+        "no_picks_yet":    "Aguardando picks com valor…",
+        "result_timeline": "Linha do tempo das picks",
+        "next_up":         "A seguir",
+        "kickoff_in":      "Início em",
+        "model_preview":   "Prévia do modelo",
+        "wc_resumes_in":   "Copa volta em",
+        "result_won":      "Ganha",
+        "result_lost":     "Perdida",
+        "result_push":     "Empate",
+        "result_pending":  "Pendente",
+        "perf_title":      "Copa 2026 · Modelo xG ao Vivo",
+        "perf_picks":      "Picks totais",
+        "perf_winrate":    "Taxa de acerto",
+        "perf_pnl":        "L&P",
+        "perf_roi":        "ROI",
+        "perf_equity":     "Curva de capital",
+        "perf_top_greens": "Maiores vitórias",
+        "perf_by_market":  "Lucro por mercado",
+        "perf_updated":    "Atualizado a cada 5 min",
+        "min_entered":     "Entrada ao",
+        "minute_short":    "'",
+        "powered_by":      "Powered by InBetIO Live xG Model",
+        "wc_emblem_alt":   "FIFA Copa do Mundo 2026",
+        "no_data_yet":     "Ainda sem dados para este torneio.",
+        "no_live_match":   "Nenhum jogo da Copa ao vivo neste momento.",
+    },
+}
+
+
+def _widget_locale(raw: str | None) -> str:
+    """Normalize and validate a locale string from a query param."""
+    if not raw:
+        return WIDGET_DEFAULT_LOCALE
+    norm = raw.strip().lower().replace("_", "-")
+    return norm if norm in WIDGET_LOCALES else WIDGET_DEFAULT_LOCALE
+
+
+def _t(locale: str, key: str) -> str:
+    """Lookup a translated string with English fallback."""
+    if locale not in WIDGET_COPY:
+        locale = WIDGET_DEFAULT_LOCALE
+    return WIDGET_COPY[locale].get(key) or WIDGET_COPY[WIDGET_DEFAULT_LOCALE].get(key, key)
+
+
+def _wc_tournament_variants() -> list[str]:
+    """All tournament-name strings in the games table that count as WC 2026."""
+    # We use the league-variants helper if the index has been built, plus a
+    # hardcoded list of known Sofascore variants. The fixed list ensures the
+    # widgets return correct data even before the slug index is warm.
+    fixed = [
+        "FIFA World Cup",
+        "FIFA World Cup 2026",
+        "World Cup",
+        "World Cup, Group Stage",
+        "World Cup, Round of 32",
+        "World Cup, Round of 16",
+        "World Cup, Quarterfinals",
+        "World Cup, Semifinals",
+        "World Cup, Final",
+        "World Cup, 3rd Place",
+    ]
+    try:
+        variants = _league_variants_for("FIFA World Cup")
+        merged = list({*fixed, *variants})
+    except Exception:
+        merged = fixed
+    return merged
+
+
 BG_INTERVAL   = 120   # seconds between cycles (2 minutes)
 ODDS_MIN_PICK = 1.40  # minimum odds to flag as value pick
 ODDS_MAX_PICK = 4.00  # maximum odds to flag as value pick
@@ -3921,6 +4129,30 @@ def _init_db():
             active_frontend INTEGER DEFAULT 1,
             updated_at      INTEGER
         );
+        CREATE TABLE IF NOT EXISTS inbet_subscribers (
+            chat_id            INTEGER PRIMARY KEY,
+            member_uuid        TEXT UNIQUE NOT NULL,
+            plan_status        TEXT,
+            locale             TEXT DEFAULT 'en',
+            status_checked_at  INTEGER,
+            linked_at          INTEGER NOT NULL,
+            active             INTEGER DEFAULT 1,
+            paused_by_user     INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_inbet_member ON inbet_subscribers(member_uuid);
+        CREATE INDEX IF NOT EXISTS idx_inbet_active ON inbet_subscribers(active);
+        CREATE TABLE IF NOT EXISTS inbet_status_audit (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_uuid  TEXT NOT NULL,
+            old_status   TEXT,
+            new_status   TEXT,
+            old_active   INTEGER,
+            new_active   INTEGER,
+            changed_at   INTEGER NOT NULL,
+            source       TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_inbet_audit_member ON inbet_status_audit(member_uuid);
+        CREATE INDEX IF NOT EXISTS idx_inbet_audit_ts ON inbet_status_audit(changed_at);
         CREATE TABLE IF NOT EXISTS match_shots (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             match_id    INTEGER NOT NULL,
@@ -6191,6 +6423,899 @@ def _seo_cache_put(key: str, html: str) -> None:
     _seo_cache[key] = {"html": html, "ts": time.time()}
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  WC 2026 widget data — state machine + tournament performance
+# ════════════════════════════════════════════════════════════════════════════
+
+def _wc2026_current_state(locale: str = "en") -> dict:
+    """
+    Decide which of the 5 widget states to render for the inbet WC 2026
+    per-match widget, given the current clock + DB state.
+
+    States:
+      live                 — a WC match is in progress
+      results_profitable   — last WC match finished, day P&L > 0; show until 1h before next
+      results_losing       — last WC match finished, day P&L ≤ 0; show for 15 min then preview
+      preview              — next WC match upcoming, show pre-match card
+      off_day              — no WC match in next 24h
+    """
+    from datetime import datetime, timezone, timedelta
+    now_ts = int(time.time())
+    variants = _wc_tournament_variants()
+    variant_norms = {_normalize_tournament(v) for v in variants}
+
+    def _is_wc(tourn: str) -> bool:
+        return _normalize_tournament(tourn or "") in variant_norms
+
+    # 1. Currently-live WC match (from in-memory _live_state)
+    live_wc_entry = None
+    try:
+        with _state_lock:
+            for entry in _live_state.values():
+                m = entry.get("match") or {}
+                if m.get("isFinished") or m.get("homeGoals") is None:
+                    continue
+                if _is_wc(m.get("tournament", "")):
+                    live_wc_entry = entry
+                    break
+    except Exception as e:
+        log.warning(f"_wc2026_current_state: live scan failed: {e}")
+
+    # 2. Next scheduled WC match (from _upcoming_cache, next 4 days)
+    next_match = None
+    next_kickoff_ts = None
+    now_utc = datetime.now(timezone.utc)
+    for offset in range(0, 4):
+        date_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
+        cached = _upcoming_cache.get(date_str)
+        if not cached:
+            continue
+        for m in cached.get("matches", []):
+            ts = m.get("startTimestamp") or 0
+            if ts <= now_ts:
+                continue
+            if not (WC2026_START_TS <= ts <= WC2026_END_TS):
+                continue
+            if not _is_wc(m.get("tournament", "")):
+                continue
+            if next_kickoff_ts is None or ts < next_kickoff_ts:
+                next_match = m
+                next_kickoff_ts = ts
+
+    # 3. Most recently finished WC match (from DB)
+    last_finished = None
+    last_finished_picks = []
+    last_finished_pnl = 0.0
+    try:
+        STAKE = get_setting("stake_per_bet", 100.0) or 100.0
+        placeholders = ",".join("?" * len(variants))
+        with _db() as conn:
+            row = conn.execute(
+                f"SELECT id, home_team, away_team, home_goals, away_goals, "
+                f"       start_ts, tournament, country, archived_at "
+                f"FROM games WHERE is_finished = 1 "
+                f"AND tournament IN ({placeholders}) "
+                f"AND start_ts >= ? AND start_ts <= ? "
+                f"ORDER BY start_ts DESC LIMIT 1",
+                (*variants, WC2026_START_TS, WC2026_END_TS)
+            ).fetchone()
+            if row:
+                last_finished = dict(row)
+                pick_rows = conn.execute(
+                    "SELECT market, label, odd_entry, odd_now, edge_entry, "
+                    "       minute_entry, result, wall_ts "
+                    "FROM tips WHERE match_id = ? "
+                    "ORDER BY wall_ts ASC",
+                    (row["id"],)
+                ).fetchall()
+                last_finished_picks = [dict(p) for p in pick_rows]
+                for p in last_finished_picks:
+                    res = (p.get("result") or "").lower()
+                    odd = p.get("odd_entry") or 0
+                    if res in ("green", "win") and odd:
+                        last_finished_pnl += (odd - 1) * STAKE
+                    elif res in ("red", "loss"):
+                        last_finished_pnl -= STAKE
+    except Exception as e:
+        log.warning(f"_wc2026_current_state: last_finished query failed: {e}")
+
+    # ───── Decide state
+    state = "off_day"
+    match_payload = None
+    picks_payload = []
+    match_pnl = None
+    countdown_s = None
+    model_preview_text = None
+
+    # LIVE branch
+    if live_wc_entry is not None:
+        state = "live"
+        m = live_wc_entry.get("match") or {}
+        match_payload = {
+            "id":          m.get("id"),
+            "home":        m.get("homeTeam"),
+            "away":        m.get("awayTeam"),
+            "home_goals":  m.get("homeGoals", 0) or 0,
+            "away_goals":  m.get("awayGoals", 0) or 0,
+            "minute":      m.get("minute"),
+            "country":     m.get("country", ""),
+            "tournament":  m.get("tournament", ""),
+            "is_finished": False,
+        }
+        live_picks = live_wc_entry.get("livePicks") or live_wc_entry.get("tips") or []
+        picks_payload = [
+            {
+                "market":  p.get("market", ""),
+                "label":   p.get("label", ""),
+                "odds":    p.get("odds") or p.get("odd_entry") or 0,
+                "edge":    p.get("edge") or p.get("edge_entry") or 0,
+                "minute":  p.get("minute_entry"),
+                "result":  p.get("result"),
+            }
+            for p in live_picks
+        ]
+        if next_kickoff_ts:
+            countdown_s = max(0, next_kickoff_ts - now_ts)
+
+    # RESULTS branch
+    elif last_finished:
+        # Use archived_at if present, else assume kickoff + 2h
+        finished_at_ts = (last_finished.get("archived_at")
+                          or (last_finished.get("start_ts") or 0) + 7200)
+        finished_age = now_ts - finished_at_ts
+        time_to_next = (next_kickoff_ts - now_ts) if next_kickoff_ts else None
+        is_profitable = last_finished_pnl > 0
+
+        show_results = False
+        if is_profitable:
+            # Keep on screen until 1h before next kickoff (or indefinitely if no next match)
+            if time_to_next is None or time_to_next > 3600:
+                show_results = True
+        else:
+            # Only for 15 min after final whistle
+            if finished_age < 900:
+                show_results = True
+
+        if show_results:
+            state = "results_profitable" if is_profitable else "results_losing"
+            match_payload = {
+                "id":          last_finished["id"],
+                "home":        last_finished["home_team"],
+                "away":        last_finished["away_team"],
+                "home_goals":  last_finished["home_goals"] or 0,
+                "away_goals":  last_finished["away_goals"] or 0,
+                "country":     last_finished.get("country", ""),
+                "tournament":  last_finished.get("tournament", ""),
+                "is_finished": True,
+            }
+            picks_payload = [
+                {
+                    "market":  p["market"],
+                    "label":   p["label"],
+                    "odds":    p["odd_entry"],
+                    "edge":    p["edge_entry"],
+                    "minute":  p["minute_entry"],
+                    "result":  p["result"],
+                }
+                for p in last_finished_picks
+            ]
+            match_pnl = round(last_finished_pnl, 0)
+            if time_to_next is not None:
+                countdown_s = max(0, time_to_next)
+
+    # PREVIEW branch — if we didn't choose live/results, see if a kickoff is near
+    if state == "off_day" and next_match and next_kickoff_ts:
+        time_to_kickoff = next_kickoff_ts - now_ts
+        if time_to_kickoff > 0:
+            state = "preview"
+            countdown_s = time_to_kickoff
+            # Cheap model preview line using avg goals from team performance
+            try:
+                home_name = next_match.get("homeTeam", "")
+                away_name = next_match.get("awayTeam", "")
+                hp = _team_performance(home_name, recent_n=5)
+                ap = _team_performance(away_name, recent_n=5)
+                avg_total = 0.0
+                count = 0
+                for perf in (hp, ap):
+                    xg = perf.get("xg_summary")
+                    if xg:
+                        avg_total += xg["avg_for"]
+                        count += 1
+                if count >= 1:
+                    proj = avg_total / count * 2  # rough 2-team projection
+                    if proj >= 2.5:
+                        model_preview_text = f"Model leans Over 2.5 — combined attacks averaging {proj:.1f} xG/match"
+                    else:
+                        model_preview_text = f"Model leans Under 2.5 — combined attacks averaging {proj:.1f} xG/match"
+            except Exception:
+                pass
+
+    # ALWAYS include the next match in payload if we have it (for countdown / preview)
+    next_match_payload = None
+    if next_match and next_kickoff_ts:
+        next_match_payload = {
+            "id":          next_match.get("id"),
+            "home":        next_match.get("homeTeam"),
+            "away":        next_match.get("awayTeam"),
+            "country":     next_match.get("country", ""),
+            "tournament":  next_match.get("tournament", ""),
+            "kickoff_ts":  next_kickoff_ts,
+        }
+
+    # OFF-DAY fallback countdown to next kickoff (could be days away)
+    if state == "off_day" and next_kickoff_ts:
+        countdown_s = next_kickoff_ts - now_ts
+
+    # Poll frequency
+    if state == "live":
+        poll_ms = 30_000
+    elif state in ("results_profitable", "results_losing"):
+        poll_ms = 60_000
+    elif state == "preview":
+        poll_ms = 60_000 if (countdown_s and countdown_s < 1800) else 120_000
+    else:  # off_day
+        poll_ms = 300_000
+
+    return {
+        "state":                       state,
+        "lang":                        locale,
+        "match":                       match_payload,
+        "picks":                       picks_payload,
+        "match_pnl":                   match_pnl,
+        "next_match":                  next_match_payload,
+        "countdown_to_next_kickoff_s": countdown_s,
+        "model_preview_text":          model_preview_text,
+        "wc_emblem":                   WC2026_EMBLEM_URL,
+        "powered_by":                  _t(locale, "powered_by"),
+        "next_poll_after_ms":          poll_ms,
+        "now_ts":                      now_ts,
+    }
+
+
+def _wc2026_performance() -> dict:
+    """
+    Tournament-scoped aggregate (June 11 → July 19, 2026 window).
+    Powers the /widget/wc2026/performance dashboard.
+    """
+    from datetime import datetime, timezone
+    out = {
+        "settled":      0,
+        "wins":         0,
+        "losses":       0,
+        "voids":        0,
+        "winrate":      0.0,
+        "pnl":          0.0,
+        "roi":          0.0,
+        "avg_odds":     0.0,
+        "equity_curve": [],
+        "top_greens":   [],
+        "by_market":    [],
+        "tournament_start": WC2026_START_TS,
+        "tournament_end":   WC2026_END_TS,
+    }
+    variants = _wc_tournament_variants()
+    if not variants:
+        return out
+    STAKE = get_setting("stake_per_bet", 100.0) or 100.0
+    placeholders = ",".join("?" * len(variants))
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                f"SELECT t.market, t.label, t.odd_entry, t.result, t.wall_ts, t.minute_entry, "
+                f"       g.home_team, g.away_team, g.start_ts, g.tournament "
+                f"FROM tips t JOIN games g ON g.id = t.match_id "
+                f"WHERE g.tournament IN ({placeholders}) "
+                f"AND g.start_ts >= ? AND g.start_ts <= ? "
+                f"AND t.result IN ('green','red','void','win','loss') "
+                f"ORDER BY t.wall_ts ASC",
+                (*variants, WC2026_START_TS, WC2026_END_TS)
+            ).fetchall()
+
+        if not rows:
+            return out
+
+        wins = losses = voids = 0
+        pnl = 0.0
+        odd_sum, odd_n = 0.0, 0
+        by_market_dict: dict = {}
+        equity_pts = []
+        cum_pnl = 0.0
+
+        for r in rows:
+            res = (r["result"] or "").lower()
+            odd = r["odd_entry"] or 0
+            if odd:
+                odd_sum += odd
+                odd_n  += 1
+            delta = 0.0
+            if res in ("green", "win"):
+                wins += 1
+                delta = (odd - 1) * STAKE if odd else 0.0
+            elif res in ("red", "loss"):
+                losses += 1
+                delta = -STAKE
+            else:
+                voids += 1
+                delta = 0.0
+            pnl     += delta
+            cum_pnl += delta
+            equity_pts.append({
+                "ts":       r["wall_ts"],
+                "date":     datetime.fromtimestamp(r["wall_ts"], tz=timezone.utc).strftime("%Y-%m-%d"),
+                "cum_pnl":  round(cum_pnl, 0),
+            })
+            mkt = r["market"] or "Other"
+            slot = by_market_dict.setdefault(mkt, {"picks": 0, "pnl": 0.0})
+            slot["picks"] += 1
+            slot["pnl"]   += delta
+
+        settled = wins + losses + voids
+        wl = wins + losses
+        out["settled"]  = settled
+        out["wins"]     = wins
+        out["losses"]   = losses
+        out["voids"]    = voids
+        out["winrate"]  = round((wins / wl * 100) if wl else 0, 1)
+        out["pnl"]      = round(pnl, 0)
+        out["roi"]      = round((pnl / (wl * STAKE) * 100) if wl else 0, 1)
+        out["avg_odds"] = round(odd_sum / odd_n, 2) if odd_n else 0.0
+        out["equity_curve"] = equity_pts
+        out["by_market"]    = [
+            {"market": k, "picks": v["picks"], "pnl": round(v["pnl"], 0)}
+            for k, v in sorted(by_market_dict.items(), key=lambda x: -x[1]["pnl"])
+        ]
+
+        greens = []
+        for r in rows:
+            res = (r["result"] or "").lower()
+            if res not in ("green", "win"):
+                continue
+            odd = r["odd_entry"] or 0
+            if not odd:
+                continue
+            profit = (odd - 1) * STAKE
+            greens.append({
+                "match":          f"{r['home_team']} vs {r['away_team']}",
+                "market":         r["market"],
+                "label":          r["label"],
+                "odds":           round(odd, 2),
+                "minute_entered": r["minute_entry"],
+                "profit":         round(profit, 0),
+            })
+        greens.sort(key=lambda x: -x["profit"])
+        out["top_greens"] = greens[:5]
+    except Exception as e:
+        log.warning(f"_wc2026_performance failed: {e}")
+    return out
+
+
+@app.route("/api/wc2026/current.json")
+def r_wc2026_current_json():
+    """JSON the per-match widget polls every 30 s (live) / 60-300 s otherwise."""
+    locale = _widget_locale(flask_request.args.get("lang"))
+    data = _wc2026_current_state(locale)
+    return jsonify(data), 200, {
+        "Cache-Control": "public, max-age=15",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+
+# ─── Per-match widget HTML ──────────────────────────────────────────────────
+# Self-contained HTML page. Inlined CSS + JS. Polls /api/wc2026/current.json
+# and renders one of 5 states (live / results_profitable / results_losing /
+# preview / off_day). Designed to be embedded as an <iframe> on inbet.io.
+_WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
+<html lang="{lang}">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow">
+<title>InBetIO Live xG Model — World Cup 2026</title>
+<style>
+  :root{{
+    --bg:#0a0e27; --card:#141a3a; --border:#2a2f4a; --text:#e8f0f7;
+    --meta:#9ca3af; --accent:{accent}; --green:#10b981; --red:#ef4444;
+    --amber:#fbbf24; --cyan:#22d3ee;
+  }}
+  body[data-theme="light"]{{
+    --bg:#f8fafc; --card:#ffffff; --border:#e5e7eb; --text:#0f172a;
+    --meta:#64748b;
+  }}
+  *{{box-sizing:border-box}}
+  body{{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5;padding:0}}
+  .header{{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}}
+  .header .left{{display:flex;align-items:center;gap:10px}}
+  .header img.emblem{{width:36px;height:auto;display:block}}
+  .header .brand{{font-size:.8rem;color:var(--meta);font-weight:600;letter-spacing:.04em;text-transform:uppercase}}
+  .pill{{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.72rem;font-weight:700;letter-spacing:.05em}}
+  .pill-live{{background:rgba(239,68,68,.15);color:#ef4444}}
+  .pill-live::before{{content:"●";margin-right:.35rem;animation:pulse 1.4s infinite}}
+  .pill-sched{{background:rgba(34,211,238,.12);color:var(--cyan)}}
+  .pill-ft{{background:rgba(156,163,175,.15);color:var(--meta)}}
+  @keyframes pulse{{0%{{opacity:1}}50%{{opacity:.35}}100%{{opacity:1}}}}
+  .container{{padding:16px}}
+  .matchcard{{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 16px;margin-bottom:14px}}
+  .matchrow{{display:flex;align-items:center;justify-content:space-between;gap:12px}}
+  .team{{display:flex;align-items:center;gap:8px;flex:1;min-width:0}}
+  .team.away{{justify-content:flex-end;text-align:right}}
+  .team-name{{font-weight:700;font-size:1.05rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+  .flag{{font-size:1.4rem;line-height:1}}
+  .score{{font-size:1.8rem;font-weight:800;letter-spacing:.05em;padding:0 14px;color:var(--text);min-width:90px;text-align:center}}
+  .meta-line{{font-size:.78rem;color:var(--meta);text-align:center;margin-top:10px}}
+  .section-title{{font-size:.72rem;color:var(--meta);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 8px}}
+  .pick-row{{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:6px;font-size:.9rem;gap:10px}}
+  .pick-left{{display:flex;align-items:center;gap:10px;min-width:0;flex:1}}
+  .pick-minute{{font-size:.72rem;color:var(--meta);min-width:34px;text-align:center;background:rgba(255,255,255,.04);border-radius:6px;padding:3px 6px}}
+  body[data-theme="light"] .pick-minute{{background:rgba(0,0,0,.04)}}
+  .pick-market{{font-size:.7rem;color:var(--meta);text-transform:uppercase;letter-spacing:.04em}}
+  .pick-label{{font-weight:600}}
+  .pick-right{{display:flex;align-items:center;gap:10px;white-space:nowrap}}
+  .pick-odds{{font-weight:700;color:var(--text)}}
+  .pick-edge{{color:var(--green);font-size:.78rem;font-weight:600}}
+  .badge{{padding:3px 9px;border-radius:6px;font-size:.7rem;font-weight:700;letter-spacing:.04em}}
+  .badge-won{{background:rgba(16,185,129,.18);color:var(--green)}}
+  .badge-lost{{background:rgba(239,68,68,.18);color:var(--red)}}
+  .badge-push{{background:rgba(156,163,175,.18);color:var(--meta)}}
+  .badge-pending{{background:rgba(251,191,36,.18);color:var(--amber)}}
+  .countdown{{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:14px}}
+  .countdown .label{{font-size:.72rem;color:var(--meta);text-transform:uppercase;letter-spacing:.08em}}
+  .countdown .value{{font-size:1.8rem;font-weight:800;margin-top:6px}}
+  .pnl-strip{{display:flex;align-items:center;justify-content:center;padding:10px;border-radius:10px;font-weight:700;font-size:1rem;margin-bottom:14px}}
+  .pnl-strip.profit{{background:rgba(16,185,129,.12);color:var(--green);border:1px solid rgba(16,185,129,.3)}}
+  .pnl-strip.loss{{background:rgba(239,68,68,.12);color:var(--red);border:1px solid rgba(239,68,68,.3)}}
+  .empty{{text-align:center;color:var(--meta);padding:20px;font-size:.85rem}}
+  .footer{{text-align:center;padding:12px 16px;border-top:1px solid var(--border);font-size:.7rem;color:var(--meta);letter-spacing:.04em}}
+  .preview-card{{text-align:center;padding:18px 16px;background:var(--card);border:1px solid var(--border);border-radius:12px}}
+  .preview-card .label{{font-size:.72rem;color:var(--meta);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}}
+  .preview-card .vs{{color:var(--meta);font-weight:400;margin:0 8px}}
+  .preview-card .model-preview{{margin-top:14px;padding:10px 12px;background:rgba(34,211,238,.06);border:1px solid rgba(34,211,238,.18);border-radius:8px;font-size:.85rem;color:var(--cyan)}}
+</style>
+</head>
+<body data-theme="{theme}">
+<div class="header">
+  <div class="left">
+    <img class="emblem" src="{emblem}" alt="{emblem_alt}">
+    <span class="brand">InBetIO Live xG Model</span>
+  </div>
+  <div id="status-pill"></div>
+</div>
+<div id="app" class="container">
+  <div class="empty">Loading…</div>
+</div>
+<div class="footer">{powered_by}</div>
+<script>
+(function(){{
+  const params  = new URLSearchParams(location.search);
+  const lang    = params.get('lang')  || 'en';
+  const apiUrl  = '/api/wc2026/current.json?lang=' + encodeURIComponent(lang);
+  const root    = document.getElementById('app');
+  const pillBox = document.getElementById('status-pill');
+  let timer;
+
+  // --- i18n (injected by server below) ---
+  const COPY = {copy_json};
+
+  function t(key){{ return (COPY && COPY[key]) || key; }}
+
+  function flagFor(country){{
+    // Country flag emoji from name; server already does this for live state,
+    // but here we recompute from country string for preview/off-day cards.
+    if (!country) return '⚽';
+    const map = {{
+      'south africa':'🇿🇦','mexico':'🇲🇽','argentina':'🇦🇷','brazil':'🇧🇷',
+      'france':'🇫🇷','england':'🏴󠁧󠁢󠁥󠁮󠁧󠁿','spain':'🇪🇸','germany':'🇩🇪','italy':'🇮🇹',
+      'portugal':'🇵🇹','netherlands':'🇳🇱','belgium':'🇧🇪','usa':'🇺🇸','canada':'🇨🇦',
+      'morocco':'🇲🇦','japan':'🇯🇵','south korea':'🇰🇷','australia':'🇦🇺','saudi arabia':'🇸🇦',
+      'iran':'🇮🇷','uruguay':'🇺🇾','colombia':'🇨🇴','chile':'🇨🇱','poland':'🇵🇱',
+      'denmark':'🇩🇰','sweden':'🇸🇪','norway':'🇳🇴','switzerland':'🇨🇭','croatia':'🇭🇷',
+      'serbia':'🇷🇸','ghana':'🇬🇭','senegal':'🇸🇳','tunisia':'🇹🇳','cameroon':'🇨🇲',
+      'ecuador':'🇪🇨','egypt':'🇪🇬','nigeria':'🇳🇬','wales':'🏴󠁧󠁢󠁷󠁬󠁳󠁿','qatar':'🇶🇦'
+    }};
+    return map[country.toLowerCase()] || '⚽';
+  }}
+
+  function fmtCountdown(s){{
+    if (s == null || s < 0) return '—';
+    const d = Math.floor(s/86400); s -= d*86400;
+    const h = Math.floor(s/3600);  s -= h*3600;
+    const m = Math.floor(s/60);
+    if (d > 0) return d + 'd ' + h + 'h';
+    if (h > 0) return h + 'h ' + (m < 10 ? '0' : '') + m + 'm';
+    return m + 'm';
+  }}
+
+  function renderPill(state, minute){{
+    let cls = 'pill pill-sched'; let text = t('scheduled');
+    if (state === 'live') {{ cls = 'pill pill-live'; text = t('live_now') + (minute != null ? ' ' + minute + "'" : ''); }}
+    else if (state === 'results_profitable' || state === 'results_losing') {{ cls = 'pill pill-ft'; text = t('finished'); }}
+    pillBox.innerHTML = '<span class="' + cls + '">' + text + '</span>';
+  }}
+
+  function badge(result){{
+    const r = (result || '').toLowerCase();
+    if (r === 'green' || r === 'win')  return '<span class="badge badge-won">✓ ' + t('result_won') + '</span>';
+    if (r === 'red'   || r === 'loss') return '<span class="badge badge-lost">✗ ' + t('result_lost') + '</span>';
+    if (r === 'void')                  return '<span class="badge badge-push">↔ ' + t('result_push') + '</span>';
+    return '<span class="badge badge-pending">' + t('result_pending') + '</span>';
+  }}
+
+  function renderPicks(picks){{
+    if (!picks || !picks.length) return '<div class="empty">' + t('no_picks_yet') + '</div>';
+    return picks.map(function(p){{
+      const minStr = p.minute != null ? (p.minute + "'") : '—';
+      const oddStr = p.odds ? '@' + Number(p.odds).toFixed(2) : '';
+      const edgeStr = p.edge ? '+' + Number(p.edge).toFixed(1) + '%' : '';
+      return ''
+        + '<div class="pick-row">'
+        +   '<div class="pick-left">'
+        +     '<div class="pick-minute">' + minStr + '</div>'
+        +     '<div><div class="pick-market">' + (p.market || '') + '</div><div class="pick-label">' + (p.label || '') + '</div></div>'
+        +   '</div>'
+        +   '<div class="pick-right">'
+        +     (edgeStr ? '<span class="pick-edge">' + edgeStr + '</span>' : '')
+        +     (oddStr  ? '<span class="pick-odds">'  + oddStr  + '</span>' : '')
+        +     badge(p.result)
+        +   '</div>'
+        + '</div>';
+    }}).join('');
+  }}
+
+  function renderMatchCard(m){{
+    if (!m) return '';
+    const score = (m.home_goals != null && m.away_goals != null && (m.is_finished || (m.home_goals + m.away_goals) > 0))
+      ? (m.home_goals + ' — ' + m.away_goals) : 'vs';
+    return ''
+      + '<div class="matchcard">'
+      +   '<div class="matchrow">'
+      +     '<div class="team"><span class="flag">' + flagFor(m.country) + '</span><span class="team-name">' + (m.home || '') + '</span></div>'
+      +     '<div class="score">' + score + '</div>'
+      +     '<div class="team away"><span class="team-name">' + (m.away || '') + '</span></div>'
+      +   '</div>'
+      +   '<div class="meta-line">' + (m.tournament || 'FIFA World Cup 2026') + '</div>'
+      + '</div>';
+  }}
+
+  function renderLive(d){{
+    return renderMatchCard(d.match)
+      + '<div class="section-title">' + t('algo_picks') + '</div>'
+      + renderPicks(d.picks);
+  }}
+
+  function renderResults(d){{
+    let strip = '';
+    if (d.match_pnl != null) {{
+      const cls = d.match_pnl > 0 ? 'profit' : 'loss';
+      const sign = d.match_pnl > 0 ? '+' : '';
+      strip = '<div class="pnl-strip ' + cls + '">' + t('perf_pnl') + ': ' + sign + d.match_pnl + '€</div>';
+    }}
+    let next = '';
+    if (d.next_match && d.countdown_to_next_kickoff_s != null) {{
+      next = '<div class="countdown"><div class="label">' + t('next_up') + ' · ' + d.next_match.home + ' ' + flagFor(d.next_match.country) + ' vs ' + d.next_match.away + '</div><div class="value">' + t('kickoff_in') + ' ' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div></div>';
+    }}
+    return renderMatchCard(d.match)
+      + strip
+      + '<div class="section-title">' + t('result_timeline') + '</div>'
+      + renderPicks(d.picks)
+      + next;
+  }}
+
+  function renderPreview(d){{
+    const nm = d.next_match;
+    if (!nm) return '<div class="empty">' + t('no_data_yet') + '</div>';
+    const teams = '<div style="font-size:1.4rem;font-weight:800;margin-top:8px">' + flagFor(nm.country) + ' ' + nm.home + ' <span class="vs">vs</span> ' + nm.away + '</div>';
+    const cd = d.countdown_to_next_kickoff_s != null
+      ? '<div class="value">' + t('kickoff_in') + ' ' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div>'
+      : '';
+    const preview = d.model_preview_text
+      ? '<div class="model-preview"><strong>' + t('model_preview') + ':</strong> ' + d.model_preview_text + '</div>'
+      : '';
+    return '<div class="preview-card"><div class="label">' + t('next_up') + ' · ' + (nm.tournament || 'FIFA World Cup 2026') + '</div>'
+      + teams + cd + preview + '</div>';
+  }}
+
+  function renderOffDay(d){{
+    const cd = d.countdown_to_next_kickoff_s != null
+      ? '<div class="countdown"><div class="label">' + t('wc_resumes_in') + '</div><div class="value">' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div></div>'
+      : '<div class="empty">' + t('no_live_match') + '</div>';
+    return cd;
+  }}
+
+  function render(d){{
+    let body = '';
+    switch (d.state) {{
+      case 'live':                body = renderLive(d); break;
+      case 'results_profitable':
+      case 'results_losing':      body = renderResults(d); break;
+      case 'preview':             body = renderPreview(d); break;
+      default:                    body = renderOffDay(d);
+    }}
+    root.innerHTML = body;
+    renderPill(d.state, d.match && d.match.minute);
+    // postMessage host for iframe auto-resize
+    try {{
+      parent.postMessage({{type:'webpronos:resize', height: document.body.scrollHeight}}, '*');
+    }} catch(e){{}}
+  }}
+
+  async function tick(){{
+    try {{
+      const r = await fetch(apiUrl, {{cache:'no-store'}});
+      if (!r.ok) throw new Error('http ' + r.status);
+      const d = await r.json();
+      render(d);
+      clearTimeout(timer);
+      timer = setTimeout(tick, d.next_poll_after_ms || 60000);
+    }} catch(e) {{
+      root.innerHTML = '<div class="empty">' + t('no_data_yet') + '</div>';
+      clearTimeout(timer);
+      timer = setTimeout(tick, 30000);
+    }}
+  }}
+  tick();
+}})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/widget/wc2026/current")
+def r_wc2026_widget_current():
+    """Per-match state-machine widget. Self-contained HTML page for <iframe> embed."""
+    locale = _widget_locale(flask_request.args.get("lang"))
+    theme  = (flask_request.args.get("theme") or "dark").strip().lower()
+    if theme not in ("dark", "light"):
+        theme = "dark"
+    accent_raw = (flask_request.args.get("accent") or "#10b981").strip()
+    import re as _re
+    accent = accent_raw if _re.match(r"^#[0-9a-fA-F]{3,8}$", accent_raw) else "#10b981"
+
+    # Inline the locale's COPY as JS so the page works without a second fetch.
+    copy_for_locale = WIDGET_COPY.get(locale, WIDGET_COPY[WIDGET_DEFAULT_LOCALE])
+    html = _WC_WIDGET_MATCH_HTML.format(
+        lang        = locale,
+        theme       = theme,
+        accent      = accent,
+        emblem      = WC2026_EMBLEM_URL,
+        emblem_alt  = _t(locale, "wc_emblem_alt"),
+        powered_by  = _t(locale, "powered_by"),
+        copy_json   = json.dumps(copy_for_locale, ensure_ascii=False),
+    )
+    return html, 200, {
+        "Content-Type":  "text/html; charset=utf-8",
+        "Cache-Control": "public, max-age=60",
+        "Access-Control-Allow-Origin": "*",
+        "X-Frame-Options": "ALLOWALL",
+        "Content-Security-Policy": "frame-ancestors *",
+    }
+
+
+@app.route("/api/wc2026/performance.json")
+def r_wc2026_performance_json():
+    """JSON for the performance dashboard widget. Cached 5 min."""
+    locale = _widget_locale(flask_request.args.get("lang"))
+    cache_key = "wc2026_performance"
+    entry = _seo_cache.get(cache_key)
+    if entry and (time.time() - entry["ts"]) < 300:
+        try:
+            data = json.loads(entry["html"])
+            data["_lang"] = locale
+            return jsonify(data), 200, {
+                "Cache-Control": "public, max-age=300",
+                "Access-Control-Allow-Origin": "*",
+            }
+        except Exception:
+            pass
+    data = _wc2026_performance()
+    _seo_cache_put(cache_key, json.dumps(data))
+    data["_lang"] = locale
+    return jsonify(data), 200, {
+        "Cache-Control": "public, max-age=300",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+
+# ─── Performance dashboard widget HTML ──────────────────────────────────────
+_WC_WIDGET_PERF_HTML = """<!DOCTYPE html>
+<html lang="{lang}">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow">
+<title>InBetIO Live xG Model — World Cup 2026 Performance</title>
+<style>
+  :root{{
+    --bg:#0a0e27; --card:#141a3a; --border:#2a2f4a; --text:#e8f0f7;
+    --meta:#9ca3af; --accent:{accent}; --green:#10b981; --red:#ef4444;
+    --amber:#fbbf24; --cyan:#22d3ee;
+  }}
+  body[data-theme="light"]{{
+    --bg:#f8fafc; --card:#ffffff; --border:#e5e7eb; --text:#0f172a;
+    --meta:#64748b;
+  }}
+  *{{box-sizing:border-box}}
+  body{{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}}
+  .header{{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--border)}}
+  .header img.emblem{{width:36px;height:auto;display:block}}
+  .header .brand{{font-weight:700;font-size:.95rem}}
+  .header .brand span{{display:block;font-size:.72rem;color:var(--meta);font-weight:500;letter-spacing:.04em}}
+  .container{{padding:16px}}
+  .stat-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:18px}}
+  .stat{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 14px}}
+  .stat .label{{font-size:.7rem;color:var(--meta);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}}
+  .stat .value{{font-size:1.5rem;font-weight:800}}
+  .stat.profit .value{{color:var(--green)}}
+  .stat.loss .value{{color:var(--red)}}
+  .section-title{{font-size:.72rem;color:var(--meta);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 10px}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px}}
+  svg.chart{{display:block;width:100%;height:auto}}
+  .greens-list .row{{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);gap:10px;font-size:.88rem}}
+  .greens-list .row:last-child{{border:none}}
+  .greens-list .match{{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+  .greens-list .label{{font-size:.7rem;color:var(--meta);margin-top:2px}}
+  .greens-list .pnl{{color:var(--green);font-weight:700;white-space:nowrap}}
+  .greens-list .odds{{color:var(--meta);font-size:.78rem;margin-right:6px}}
+  .markets-bar{{display:flex;flex-direction:column;gap:6px}}
+  .markets-bar .row{{display:flex;align-items:center;gap:10px;font-size:.82rem}}
+  .markets-bar .name{{flex:0 0 110px;color:var(--meta);font-weight:600}}
+  .markets-bar .bar{{flex:1;height:8px;background:rgba(255,255,255,.04);border-radius:4px;overflow:hidden;position:relative}}
+  body[data-theme="light"] .markets-bar .bar{{background:rgba(0,0,0,.04)}}
+  .markets-bar .fill{{height:100%;border-radius:4px}}
+  .markets-bar .fill.profit{{background:linear-gradient(90deg,var(--green) 0%,#34d399 100%)}}
+  .markets-bar .fill.loss{{background:linear-gradient(90deg,var(--red) 0%,#fb7185 100%)}}
+  .markets-bar .pnl{{flex:0 0 70px;text-align:right;font-weight:600}}
+  .markets-bar .pnl.profit{{color:var(--green)}} .markets-bar .pnl.loss{{color:var(--red)}}
+  .empty{{text-align:center;color:var(--meta);padding:20px;font-size:.85rem}}
+  .footer{{text-align:center;padding:12px 16px;border-top:1px solid var(--border);font-size:.7rem;color:var(--meta);letter-spacing:.04em}}
+</style>
+</head>
+<body data-theme="{theme}">
+<div class="header">
+  <img class="emblem" src="{emblem}" alt="{emblem_alt}">
+  <div class="brand">{title}<span>{powered_by}</span></div>
+</div>
+<div id="app" class="container"><div class="empty">Loading…</div></div>
+<div class="footer">{footer_label}</div>
+<script>
+(function(){{
+  const params = new URLSearchParams(location.search);
+  const lang   = params.get('lang')  || 'en';
+  const apiUrl = '/api/wc2026/performance.json?lang=' + encodeURIComponent(lang);
+  const root   = document.getElementById('app');
+  const COPY   = {copy_json};
+
+  function t(k){{ return (COPY && COPY[k]) || k; }}
+  function fmtPnL(v){{
+    if (v == null) return '0€';
+    const sign = v > 0 ? '+' : '';
+    return sign + Number(v).toFixed(0) + '€';
+  }}
+  function fmtPct(v){{ if (v == null) return '0%'; const s = v > 0 ? '+' : ''; return s + Number(v).toFixed(1) + '%'; }}
+
+  function renderEquity(points){{
+    if (!points || points.length < 2) return '<div class="empty">' + t('no_data_yet') + '</div>';
+    const w = 600, h = 160, pad = 24;
+    const pnls = points.map(function(p){{return p.cum_pnl;}});
+    const minY = Math.min.apply(null, pnls.concat([0]));
+    const maxY = Math.max.apply(null, pnls.concat([0]));
+    const span = Math.max(1, maxY - minY);
+    const stepX = (w - pad*2) / (points.length - 1);
+    const yFor = function(v){{ return h - pad - ((v - minY) / span) * (h - pad*2); }};
+    const path = points.map(function(p,i){{return (i===0?'M':'L') + (pad + i*stepX).toFixed(1) + ',' + yFor(p.cum_pnl).toFixed(1);}}).join(' ');
+    // zero line
+    const zeroY = yFor(0);
+    return '<svg class="chart" viewBox="0 0 ' + w + ' ' + h + '" xmlns="http://www.w3.org/2000/svg">'
+      + '<line x1="' + pad + '" y1="' + zeroY.toFixed(1) + '" x2="' + (w-pad) + '" y2="' + zeroY.toFixed(1) + '" stroke="rgba(255,255,255,0.15)" stroke-dasharray="3,4"/>'
+      + '<path d="' + path + '" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round"/>'
+      + '</svg>';
+  }}
+
+  function renderGreens(greens){{
+    if (!greens || !greens.length) return '<div class="empty">' + t('no_data_yet') + '</div>';
+    return '<div class="greens-list">' + greens.map(function(g){{
+      const min = g.minute_entered != null ? (' · ' + g.minute_entered + "'") : '';
+      return ''
+        + '<div class="row">'
+        +   '<div style="flex:1;min-width:0">'
+        +     '<div class="match">' + g.match + '</div>'
+        +     '<div class="label">' + (g.market || '') + ' · ' + (g.label || '') + min + '</div>'
+        +   '</div>'
+        +   '<span class="odds">@' + Number(g.odds).toFixed(2) + '</span>'
+        +   '<span class="pnl">+' + Number(g.profit).toFixed(0) + '€</span>'
+        + '</div>';
+    }}).join('') + '</div>';
+  }}
+
+  function renderMarkets(by){{
+    if (!by || !by.length) return '<div class="empty">' + t('no_data_yet') + '</div>';
+    const maxAbs = Math.max.apply(null, by.map(function(m){{return Math.abs(m.pnl);}}).concat([1]));
+    return '<div class="markets-bar">' + by.map(function(m){{
+      const pct = (Math.abs(m.pnl)/maxAbs) * 100;
+      const cls = m.pnl >= 0 ? 'profit' : 'loss';
+      return ''
+        + '<div class="row">'
+        +   '<div class="name">' + (m.market || '?') + '</div>'
+        +   '<div class="bar"><div class="fill ' + cls + '" style="width:' + pct.toFixed(1) + '%"></div></div>'
+        +   '<div class="pnl ' + cls + '">' + fmtPnL(m.pnl) + '</div>'
+        + '</div>';
+    }}).join('') + '</div>';
+  }}
+
+  function render(d){{
+    if (!d || d.settled === 0) {{
+      root.innerHTML = '<div class="empty">' + t('no_data_yet') + '</div>';
+      return;
+    }}
+    const pnlCls = (d.pnl || 0) >= 0 ? 'profit' : 'loss';
+    const roiCls = (d.roi || 0) >= 0 ? 'profit' : 'loss';
+    root.innerHTML = ''
+      + '<div class="stat-grid">'
+      +   '<div class="stat"><div class="label">' + t('perf_picks')   + '</div><div class="value">' + d.settled + '</div></div>'
+      +   '<div class="stat"><div class="label">' + t('perf_winrate') + '</div><div class="value">' + Number(d.winrate || 0).toFixed(1) + '%</div></div>'
+      +   '<div class="stat ' + pnlCls + '"><div class="label">' + t('perf_pnl') + '</div><div class="value">' + fmtPnL(d.pnl) + '</div></div>'
+      +   '<div class="stat ' + roiCls + '"><div class="label">' + t('perf_roi') + '</div><div class="value">' + fmtPct(d.roi) + '</div></div>'
+      + '</div>'
+      + '<div class="section-title">' + t('perf_equity') + '</div>'
+      + '<div class="card">' + renderEquity(d.equity_curve) + '</div>'
+      + '<div class="section-title">' + t('perf_top_greens') + '</div>'
+      + '<div class="card">' + renderGreens(d.top_greens) + '</div>'
+      + '<div class="section-title">' + t('perf_by_market') + '</div>'
+      + '<div class="card">' + renderMarkets(d.by_market) + '</div>';
+    try {{ parent.postMessage({{type:'webpronos:resize', height: document.body.scrollHeight}}, '*'); }} catch(e){{}}
+  }}
+
+  async function tick(){{
+    try {{
+      const r = await fetch(apiUrl, {{cache:'no-store'}});
+      if (!r.ok) throw new Error('http ' + r.status);
+      const d = await r.json();
+      render(d);
+    }} catch(e) {{
+      root.innerHTML = '<div class="empty">' + t('no_data_yet') + '</div>';
+    }}
+    setTimeout(tick, 5*60*1000);
+  }}
+  tick();
+}})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/widget/wc2026/performance")
+def r_wc2026_widget_performance():
+    """Performance dashboard widget — self-contained HTML for <iframe> embed."""
+    locale = _widget_locale(flask_request.args.get("lang"))
+    theme  = (flask_request.args.get("theme") or "dark").strip().lower()
+    if theme not in ("dark", "light"):
+        theme = "dark"
+    accent_raw = (flask_request.args.get("accent") or "#10b981").strip()
+    import re as _re
+    accent = accent_raw if _re.match(r"^#[0-9a-fA-F]{3,8}$", accent_raw) else "#10b981"
+
+    copy_for_locale = WIDGET_COPY.get(locale, WIDGET_COPY[WIDGET_DEFAULT_LOCALE])
+    html = _WC_WIDGET_PERF_HTML.format(
+        lang         = locale,
+        theme        = theme,
+        accent       = accent,
+        emblem       = WC2026_EMBLEM_URL,
+        emblem_alt   = _t(locale, "wc_emblem_alt"),
+        title        = _t(locale, "perf_title"),
+        powered_by   = _t(locale, "powered_by"),
+        footer_label = _t(locale, "perf_updated"),
+        copy_json    = json.dumps(copy_for_locale, ensure_ascii=False),
+    )
+    return html, 200, {
+        "Content-Type":  "text/html; charset=utf-8",
+        "Cache-Control": "public, max-age=300",
+        "Access-Control-Allow-Origin": "*",
+        "X-Frame-Options": "ALLOWALL",
+        "Content-Security-Policy": "frame-ancestors *",
+    }
+
+
 @app.route("/api/health/sofascore")
 def r_health_sofascore():
     """
@@ -7608,6 +8733,418 @@ def r_admin_health():
         "settings_loaded": len(_load_settings()),
         "auth_required_for_writes": True,
     })
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  inbet.io membership-status sync + Telegram fan-out
+# ════════════════════════════════════════════════════════════════════════════
+# All endpoints in this block authenticate with the shared secret
+# INBET_SYNC_SECRET (Fly.io secret). Inbet's backend uses this to push
+# member status changes to us, and we use it to query their member API.
+
+INBET_SYNC_SECRET    = os.environ.get("INBET_SYNC_SECRET", "")
+INBET_BOT_TOKEN      = os.environ.get("INBET_BOT_TOKEN", "")
+INBET_BOT_USERNAME   = os.environ.get("INBET_BOT_USERNAME", "")
+INBET_MEMBER_STATUS_URL = os.environ.get(
+    "INBET_MEMBER_STATUS_URL",
+    "https://app.inbet.io/api/internal/members/{member_uuid}/status",
+)
+
+# Plan statuses that receive Telegram pick alerts.
+INBET_ELIGIBLE_STATUSES = {"premium", "trial", "demo"}
+
+
+def _check_inbet_sync_auth() -> bool:
+    """Validate the X-InBetIO-Sync-Secret header against the shared secret."""
+    if not INBET_SYNC_SECRET:
+        return False
+    header_val = flask_request.headers.get("X-InBetIO-Sync-Secret", "").strip()
+    return header_val == INBET_SYNC_SECRET
+
+
+def _send_inbet_telegram(text: str, chat_id: int) -> bool:
+    """
+    Send a Telegram message via the DEDICATED inbet bot (NOT the WebPronos bot).
+    Uses INBET_BOT_TOKEN. Returns True on 2xx response, False otherwise.
+    """
+    if not INBET_BOT_TOKEN:
+        log.warning("_send_inbet_telegram: INBET_BOT_TOKEN not configured, skipping")
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{INBET_BOT_TOKEN}/sendMessage"
+        payload = json.dumps({
+            "chat_id":                chat_id,
+            "text":                   text,
+            "parse_mode":             "HTML",
+            "disable_web_page_preview": True,
+        }).encode()
+        import urllib.request as _u
+        req = _u.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        _u.urlopen(req, timeout=10)
+        return True
+    except Exception as e:
+        log.error(f"_send_inbet_telegram failed for chat {chat_id}: {e}")
+        return False
+
+
+def _broadcast_inbet_pick(match: dict, pick: dict, minute: int | None):
+    """
+    Fan-out a new pick to every ELIGIBLE inbet subscriber via the dedicated
+    Telegram bot. Called alongside the SSE broadcast in _broadcast_pick.
+
+    Eligibility = active=1 AND plan_status IN (premium|trial|demo).
+    Tournament restricted to WC 2026 matches only (this is a WC-scoped product).
+    Anti-spam: 1 message per match per 60 s per subscriber, 8 messages/day cap.
+    """
+    if not INBET_BOT_TOKEN:
+        return  # bot not configured — silently skip
+
+    # Only WC 2026 matches
+    tourn = match.get("tournament", "") or ""
+    variants = {_normalize_tournament(v) for v in _wc_tournament_variants()}
+    if _normalize_tournament(tourn) not in variants:
+        return
+
+    try:
+        with _db() as conn:
+            subs = conn.execute(
+                "SELECT chat_id, member_uuid, locale, plan_status "
+                "FROM inbet_subscribers "
+                "WHERE active = 1 AND plan_status IN ('premium','trial','demo')"
+            ).fetchall()
+    except Exception as e:
+        log.warning(f"_broadcast_inbet_pick: subs query failed: {e}")
+        return
+
+    if not subs:
+        return
+
+    home  = match.get("homeTeam", "")
+    away  = match.get("awayTeam", "")
+    flag_h = _country_flag(match.get("homeCountry", "") or match.get("country", ""))
+    flag_a = _country_flag(match.get("awayCountry", "") or "")
+    market = pick.get("market", "")
+    label  = pick.get("label", "")
+    odds   = pick.get("odds") or 0
+    edge   = pick.get("edge") or 0
+    minute_str = f"{minute}'" if minute is not None else ""
+
+    sent = 0
+    for s in subs:
+        locale = s["locale"] or "en"
+        msg_lines = [
+            f"🏆 <b>FIFA World Cup 2026</b>",
+            f"{flag_h} <b>{home}</b> vs <b>{away}</b> {flag_a} · {minute_str}",
+            "",
+            f"📊 <b>{market}:</b> {label}",
+            f"💰 <b>{_t(locale, 'min_entered') if False else 'Odds'}:</b> @{odds:.2f}",
+            f"📈 <b>Edge:</b> +{edge:.1f}%",
+        ]
+        msg = "\n".join(msg_lines)
+        if _send_inbet_telegram(msg, s["chat_id"]):
+            sent += 1
+    log.info(f"_broadcast_inbet_pick: sent to {sent}/{len(subs)} subscribers")
+
+
+def _fetch_inbet_member_status(member_uuid: str) -> dict | None:
+    """Call inbet's API to get current plan status. Returns {plan_status, active, locale} or None."""
+    if not INBET_SYNC_SECRET:
+        return None
+    try:
+        import urllib.request as _u
+        url = INBET_MEMBER_STATUS_URL.format(member_uuid=member_uuid)
+        req = _u.Request(url, headers={
+            "X-InBetIO-Sync-Secret": INBET_SYNC_SECRET,
+            "Accept": "application/json",
+        })
+        with _u.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        return {
+            "plan_status": (data.get("plan_status") or "").lower(),
+            "active":      bool(data.get("active", True)),
+            "locale":      _widget_locale(data.get("locale")),
+        }
+    except Exception as e:
+        log.warning(f"_fetch_inbet_member_status({member_uuid}) failed: {e}")
+        return None
+
+
+def _upsert_inbet_subscriber(chat_id: int, member_uuid: str,
+                              plan_status: str, locale: str, active: bool,
+                              source: str = "webhook") -> None:
+    """Insert / update a subscriber row and write an audit entry on status change."""
+    now_ts = int(time.time())
+    try:
+        with _db() as conn:
+            prior = conn.execute(
+                "SELECT plan_status, active FROM inbet_subscribers WHERE member_uuid = ?",
+                (member_uuid,)
+            ).fetchone()
+            conn.execute("""
+                INSERT INTO inbet_subscribers
+                  (chat_id, member_uuid, plan_status, locale, status_checked_at,
+                   linked_at, active, paused_by_user)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(member_uuid) DO UPDATE SET
+                  chat_id           = excluded.chat_id,
+                  plan_status       = excluded.plan_status,
+                  locale            = excluded.locale,
+                  status_checked_at = excluded.status_checked_at,
+                  active            = excluded.active
+            """, (chat_id, member_uuid, plan_status, locale, now_ts, now_ts, 1 if active else 0))
+            if prior is not None and (
+                prior["plan_status"] != plan_status or bool(prior["active"]) != active
+            ):
+                conn.execute("""
+                    INSERT INTO inbet_status_audit
+                      (member_uuid, old_status, new_status, old_active, new_active,
+                       changed_at, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (member_uuid, prior["plan_status"], plan_status,
+                      int(bool(prior["active"])), int(active), now_ts, source))
+    except Exception as e:
+        log.error(f"_upsert_inbet_subscriber failed: {e}")
+
+
+@app.route("/api/inbet/member-status", methods=["POST"])
+def r_inbet_member_status():
+    """
+    Webhook called by inbet's backend whenever a member's plan status changes.
+    Body: {member_uuid, plan_status, active, locale?}
+
+    Auth: shared secret in X-InBetIO-Sync-Secret header.
+    """
+    if not _check_inbet_sync_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        payload = flask_request.get_json(force=True) or {}
+        member_uuid = (payload.get("member_uuid") or "").strip()
+        if not member_uuid:
+            return jsonify({"error": "member_uuid required"}), 400
+        plan_status = (payload.get("plan_status") or "").lower().strip()
+        active      = bool(payload.get("active", True))
+        locale      = _widget_locale(payload.get("locale"))
+
+        with _db() as conn:
+            prior = conn.execute(
+                "SELECT chat_id, plan_status, active FROM inbet_subscribers "
+                "WHERE member_uuid = ?",
+                (member_uuid,)
+            ).fetchone()
+            if prior is None:
+                # Member hasn't bound to the bot yet — nothing to do, just ack
+                return jsonify({"ok": True, "linked": False, "member_uuid": member_uuid})
+
+            _upsert_inbet_subscriber(
+                chat_id     = prior["chat_id"],
+                member_uuid = member_uuid,
+                plan_status = plan_status,
+                locale      = locale,
+                active      = active,
+                source      = "webhook",
+            )
+        return jsonify({
+            "ok":          True,
+            "linked":      True,
+            "member_uuid": member_uuid,
+            "eligible":    active and plan_status in INBET_ELIGIBLE_STATUSES,
+        })
+    except Exception as e:
+        log.error(f"r_inbet_member_status error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/inbet/unlink", methods=["POST"])
+def r_inbet_unlink():
+    """
+    Mark an inbet member as inactive (stop receiving Telegram alerts).
+    Body: {member_uuid}
+    Auth: X-InBetIO-Sync-Secret header.
+    """
+    if not _check_inbet_sync_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        payload = flask_request.get_json(force=True) or {}
+        member_uuid = (payload.get("member_uuid") or "").strip()
+        if not member_uuid:
+            return jsonify({"error": "member_uuid required"}), 400
+        now_ts = int(time.time())
+        with _db() as conn:
+            prior = conn.execute(
+                "SELECT plan_status, active FROM inbet_subscribers WHERE member_uuid = ?",
+                (member_uuid,)
+            ).fetchone()
+            if prior is None:
+                return jsonify({"ok": True, "found": False})
+            conn.execute(
+                "UPDATE inbet_subscribers SET active = 0, status_checked_at = ? "
+                "WHERE member_uuid = ?",
+                (now_ts, member_uuid)
+            )
+            conn.execute("""
+                INSERT INTO inbet_status_audit
+                  (member_uuid, old_status, new_status, old_active, new_active,
+                   changed_at, source)
+                VALUES (?, ?, ?, ?, 0, ?, 'unlink')
+            """, (member_uuid, prior["plan_status"], prior["plan_status"],
+                  int(bool(prior["active"])), now_ts))
+        return jsonify({"ok": True, "found": True, "member_uuid": member_uuid})
+    except Exception as e:
+        log.error(f"r_inbet_unlink error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/inbet/status", methods=["GET"])
+def r_inbet_status():
+    """
+    Read endpoint (admin auth) — current state for a given member_uuid or
+    aggregate counters. Useful for support / debugging.
+    """
+    if not _check_admin_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    member_uuid = (flask_request.args.get("member_uuid") or "").strip()
+    try:
+        with _db() as conn:
+            if member_uuid:
+                row = conn.execute(
+                    "SELECT chat_id, member_uuid, plan_status, locale, active, "
+                    "       paused_by_user, linked_at, status_checked_at "
+                    "FROM inbet_subscribers WHERE member_uuid = ?",
+                    (member_uuid,)
+                ).fetchone()
+                if not row:
+                    return jsonify({"found": False, "member_uuid": member_uuid})
+                return jsonify({"found": True, **dict(row)})
+            # Aggregate
+            counts = conn.execute("""
+                SELECT
+                  COUNT(*) AS total,
+                  SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active,
+                  SUM(CASE WHEN plan_status = 'premium' THEN 1 ELSE 0 END) AS premium,
+                  SUM(CASE WHEN plan_status = 'trial'   THEN 1 ELSE 0 END) AS trial,
+                  SUM(CASE WHEN plan_status = 'demo'    THEN 1 ELSE 0 END) AS demo
+                FROM inbet_subscribers
+            """).fetchone()
+        return jsonify(dict(counts))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─── Dedicated inbet Telegram bot — webhook handler ─────────────────────────
+@app.route("/telegram/inbet/webhook", methods=["POST"])
+def r_inbet_telegram_webhook():
+    """
+    Webhook for the DEDICATED inbet Telegram bot (separate from the WebPronos
+    one). Set this URL with Telegram via setWebhook using INBET_BOT_TOKEN.
+
+    We only handle:
+      - /start <member_uuid> → bind chat_id ↔ member_uuid (calls inbet API for status)
+      - /stop                → pause sends (paused_by_user=1, active=0)
+      - /resume              → un-pause if previously paused
+    """
+    try:
+        update = flask_request.get_json(force=True) or {}
+        msg = update.get("message") or update.get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        text = (msg.get("text") or "").strip()
+        if not chat_id or not text:
+            return jsonify({"ok": True})
+
+        # /start [<payload>]
+        if text.startswith("/start"):
+            parts = text.split(maxsplit=1)
+            payload = parts[1].strip() if len(parts) > 1 else ""
+            if not payload:
+                _send_inbet_telegram(
+                    "⚠️ Use the 'Get Alerts' button inside your inbet account to link this Telegram chat.",
+                    chat_id,
+                )
+                return jsonify({"ok": True})
+
+            # payload is the member_uuid
+            member_uuid = payload
+            status = _fetch_inbet_member_status(member_uuid)
+            if status is None:
+                # inbet API unreachable / member not found — store with unknown status
+                status = {"plan_status": "unknown", "active": False, "locale": "en"}
+                _send_inbet_telegram(
+                    "⚠️ Couldn't reach inbet to confirm your membership right now. "
+                    "We've recorded your Telegram and will start alerts once "
+                    "the status is confirmed.",
+                    chat_id,
+                )
+            _upsert_inbet_subscriber(
+                chat_id     = int(chat_id),
+                member_uuid = member_uuid,
+                plan_status = status["plan_status"],
+                locale      = status["locale"],
+                active      = status["active"],
+                source      = "telegram_start",
+            )
+            if status["active"] and status["plan_status"] in INBET_ELIGIBLE_STATUSES:
+                locale = status["locale"]
+                replies = {
+                    "en":    "✅ Linked! You'll get live picks during the World Cup.",
+                    "es":    "✅ ¡Vinculado! Recibirás picks en directo durante el Mundial.",
+                    "pt-pt": "✅ Ligado! Vais receber picks ao vivo durante o Mundial.",
+                    "pt-br": "✅ Vinculado! Você vai receber picks ao vivo durante a Copa.",
+                }
+                _send_inbet_telegram(replies.get(locale, replies["en"]), chat_id)
+            return jsonify({"ok": True})
+
+        if text.startswith("/stop"):
+            now_ts = int(time.time())
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE inbet_subscribers "
+                    "SET active = 0, paused_by_user = 1, status_checked_at = ? "
+                    "WHERE chat_id = ?",
+                    (now_ts, chat_id)
+                )
+            _send_inbet_telegram(
+                "🔕 Alerts paused. Send /resume to start receiving picks again.",
+                chat_id,
+            )
+            return jsonify({"ok": True})
+
+        if text.startswith("/resume"):
+            now_ts = int(time.time())
+            with _db() as conn:
+                # Only resume if previously paused-by-user AND still eligible per inbet
+                row = conn.execute(
+                    "SELECT member_uuid, paused_by_user FROM inbet_subscribers WHERE chat_id = ?",
+                    (chat_id,)
+                ).fetchone()
+                if row and row["paused_by_user"]:
+                    status = _fetch_inbet_member_status(row["member_uuid"]) or {
+                        "plan_status": "unknown", "active": False, "locale": "en"
+                    }
+                    eligible = status["active"] and status["plan_status"] in INBET_ELIGIBLE_STATUSES
+                    conn.execute(
+                        "UPDATE inbet_subscribers "
+                        "SET active = ?, paused_by_user = 0, plan_status = ?, "
+                        "    locale = ?, status_checked_at = ? "
+                        "WHERE chat_id = ?",
+                        (1 if eligible else 0, status["plan_status"],
+                         status["locale"], now_ts, chat_id)
+                    )
+                    if eligible:
+                        _send_inbet_telegram("🔔 Alerts resumed. You're back on the list.", chat_id)
+                    else:
+                        _send_inbet_telegram(
+                            "ℹ️ Your inbet membership isn't active right now — "
+                            "no alerts will be sent until it is.",
+                            chat_id,
+                        )
+            return jsonify({"ok": True})
+
+        # Unknown command — ignore silently
+        return jsonify({"ok": True})
+
+    except Exception as e:
+        log.error(f"r_inbet_telegram_webhook error: {e}", exc_info=True)
+        return jsonify({"ok": True})  # always 200 to Telegram
 
 
 @app.route("/api/admin/send-daily-preview", methods=["POST"])
