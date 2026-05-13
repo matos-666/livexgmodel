@@ -6920,7 +6920,7 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
             "picks": [
                 {"market": "Over/Under 2.5", "label": "Over 2.5",   "odds": 1.85, "edge": 8.2, "minute": 34, "result": None},
                 {"market": "1X2",            "label": xl("Brazil"), "odds": 2.40, "edge": 5.1, "minute": 52, "result": None},
-                {"market": "BTTS",           "label": "Yes",        "odds": 1.55, "edge": 4.3, "minute": 11, "result": None},
+                {"market": "Asian Handicap", "label": xl("Brazil") + " -0.5", "odds": 2.05, "edge": 4.3, "minute": 11, "result": None},
             ],
             # Cumulative xG over match minutes — realistic-looking curve for an
             # entertaining open game where both attacks created chances.
@@ -6955,9 +6955,9 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
                 "is_finished": True,
             },
             "picks": [
-                {"market": "1X2",            "label": xl("Argentina"), "odds": 2.10, "edge": 6.4, "minute": 18, "result": "won"},
-                {"market": "Over/Under 2.5", "label": "Over 2.5",      "odds": 1.95, "edge": 5.2, "minute": 41, "result": "won"},
-                {"market": "BTTS",           "label": "Yes",           "odds": 1.65, "edge": 3.8, "minute": 12, "result": "won"},
+                {"market": "1X2",            "label": xl("Argentina"),       "odds": 2.10, "edge": 6.4, "minute": 18, "result": "won"},
+                {"market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 1.95, "edge": 5.2, "minute": 41, "result": "won"},
+                {"market": "Asian Handicap", "label": xl("Argentina") + " -0.5", "odds": 1.85, "edge": 3.8, "minute": 12, "result": "won"},
             ],
             "match_pnl": 187,
             "next_match": {
@@ -7112,34 +7112,58 @@ def _wc2026_current_state_for_match(match_id: int, locale: str = "en") -> dict:
 
 
 def _wc2026_mock_performance(locale: str = "en") -> dict:
-    """Synthetic dashboard payload — fixed numbers for pre-launch QA."""
+    """Synthetic dashboard payload — fixed numbers for pre-launch QA.
+
+    Field shapes match the real _wc2026_performance() output:
+      equity_curve: [{ts, date, cum_pnl}]    (JS reads p.cum_pnl)
+      top_greens:   [{match, market, label, odds, minute_entered, profit}]
+      by_market:    [{market, picks, pnl}]
+    No BTTS (the model doesn't trade that market).
+    """
+    from datetime import datetime, timezone
     now_ts = int(time.time())
     xl = lambda n: _xlate(n, locale)
-    # 14-day rising equity curve (€)
+
+    # 19-day rising equity curve in EUR (cumulative P&L)
     curve = [0, 35, 88, 64, 142, 198, 264, 312, 388, 421, 510, 612, 698, 783, 904, 1058, 1142, 1208, 1283]
+    equity_pts = []
+    for i, v in enumerate(curve):
+        ts = now_ts - (len(curve) - 1 - i) * 86400
+        equity_pts.append({
+            "ts":      ts,
+            "date":    datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d"),
+            "cum_pnl": v,
+        })
+
+    # Top 5 winning picks — markets used: 1X2, Over/Under 2.5, Asian Handicap,
+    # Draw No Bet. Deliberately no BTTS.
+    top_greens = [
+        {"match": f"{xl('Argentina')} vs Iran",          "market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 2.10, "minute_entered": 31, "profit": 110},
+        {"match": f"{xl('Brazil')} vs Serbia",           "market": "1X2",            "label": xl("Brazil"),          "odds": 1.95, "minute_entered": 22, "profit":  95},
+        {"match": f"{xl('Netherlands')} vs {xl('Argentina')}", "market": "Asian Handicap", "label": f"{xl('Argentina')} +0.5", "odds": 1.85, "minute_entered": 14, "profit":  85},
+        {"match": f"{xl('Portugal')} vs Ghana",          "market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 1.75, "minute_entered": 38, "profit":  75},
+        {"match": f"{xl('Spain')} vs Morocco",           "market": "Draw No Bet",    "label": xl("Spain"),           "odds": 1.70, "minute_entered": 19, "profit":  70},
+    ]
+
+    by_market = [
+        {"market": "Over/Under 2.5", "picks": 21, "pnl":  712.0},
+        {"market": "1X2",            "picks": 14, "pnl":  386.0},
+        {"market": "Asian Handicap", "picks":  8, "pnl":  135.0},
+        {"market": "Draw No Bet",    "picks":  4, "pnl":   50.0},
+    ]
+
     return {
-        "settled":     47,
-        "wins":        30,
-        "losses":      14,
-        "voids":       3,
-        "winrate":     63.8,
-        "pnl":         1283.0,
-        "roi":         18.2,
-        "avg_odds":    1.92,
-        "equity_curve": [{"ts": now_ts - (len(curve) - i) * 86400, "pnl": v} for i, v in enumerate(curve)],
-        "top_greens": [
-            {"home": xl("Argentina"), "away": "Iran",         "market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 2.10, "minute": 31, "profit": 110},
-            {"home": xl("Brazil"),    "away": "Serbia",       "market": "1X2",            "label": xl("Brazil"),          "odds": 1.95, "minute": 22, "profit":  95},
-            {"home": xl("France"),    "away": "Tunisia",      "market": "BTTS",           "label": "Yes",                 "odds": 1.80, "minute": 14, "profit":  80},
-            {"home": xl("Portugal"),  "away": "Ghana",        "market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 1.75, "minute": 38, "profit":  75},
-            {"home": xl("Spain"),     "away": "Morocco",      "market": "Asian Handicap", "label": xl("Spain") + " -1",   "odds": 2.05, "minute": 19, "profit":  70},
-        ],
-        "by_market": [
-            {"market": "Over/Under 2.5", "picks": 18, "pnl":  642.0},
-            {"market": "1X2",            "picks": 14, "pnl":  391.0},
-            {"market": "BTTS",           "picks":  9, "pnl":  175.0},
-            {"market": "Asian Handicap", "picks":  6, "pnl":   75.0},
-        ],
+        "settled":      47,
+        "wins":         30,
+        "losses":       14,
+        "voids":        3,
+        "winrate":      63.8,
+        "pnl":          1283.0,
+        "roi":          18.2,
+        "avg_odds":     1.92,
+        "equity_curve": equity_pts,
+        "top_greens":   top_greens,
+        "by_market":    by_market,
         "tournament_start": WC2026_START_TS,
         "tournament_end":   WC2026_END_TS,
         "_mock":            True,
