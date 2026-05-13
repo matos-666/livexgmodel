@@ -8885,7 +8885,14 @@ def _match_url(match_id, home: str = "", away: str = "") -> str:
 
 @app.route("/robots.txt")
 def r_robots():
-    """robots.txt — points crawlers to the sitemap index, blocks API/admin paths."""
+    """robots.txt — points crawlers to the sitemap index, blocks API/admin paths.
+
+    Both the master index and the legacy flat sitemap are declared. Crawlers
+    that recognise sitemap indexes (Google, Bing) will follow /sitemap_index.xml
+    and discover each sub-sitemap with per-category lastmod, saving crawl
+    budget. The legacy /sitemap.xml stays declared so older crawlers and
+    cached Search Console state don't break.
+    """
     body = (
         "User-agent: *\n"
         "Disallow: /api/\n"
@@ -8895,6 +8902,7 @@ def r_robots():
         "Disallow: /proxy/\n"
         "Allow: /\n"
         "\n"
+        f"Sitemap: {SITE_URL}/sitemap_index.xml\n"
         f"Sitemap: {SITE_URL}/sitemap.xml\n"
     )
     return Response(body, mimetype="text/plain", headers={"Cache-Control": "public, max-age=86400"})
@@ -9100,14 +9108,99 @@ def _sm_envelope(urls: list[str]) -> str:
     )
 
 
+# ─── Per-category lastmod helpers ────────────────────────────────────────────
+# These power the sitemap-index <sitemap><lastmod> element so Google can tell
+# at a glance which sub-sitemaps changed since its last crawl and skip the
+# rest. Each helper runs ONE cheap query (or returns today's date for static
+# pages). Results are not cached because they're already O(1)–O(log N).
+def _sm_lastmod_today() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _sm_lastmod_max_tip_ts() -> str:
+    """Freshest tip timestamp — used as lastmod for teams & leagues (both
+    surface the same underlying tip stream)."""
+    from datetime import datetime, timezone
+    try:
+        with _db() as conn:
+            row = conn.execute("SELECT MAX(wall_ts) AS m FROM tips").fetchone()
+        m = row["m"] if row and row["m"] else None
+        if m:
+            return datetime.fromtimestamp(m, tz=timezone.utc).strftime("%Y-%m-%d")
+    except Exception as e:
+        log.warning(f"_sm_lastmod_max_tip_ts: {e}")
+    return _sm_lastmod_today()
+
+
+def _sm_lastmod_matches() -> str:
+    """Freshest of: max game start_ts (newly scheduled) OR max tip wall_ts."""
+    from datetime import datetime, timezone
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT MAX(ts) AS m FROM ("
+                "  SELECT MAX(start_ts) AS ts FROM games "
+                "  UNION ALL "
+                "  SELECT MAX(wall_ts) AS ts FROM tips"
+                ")").fetchone()
+        m = row["m"] if row and row["m"] else None
+        if m:
+            return datetime.fromtimestamp(m, tz=timezone.utc).strftime("%Y-%m-%d")
+    except Exception as e:
+        log.warning(f"_sm_lastmod_matches: {e}")
+    return _sm_lastmod_today()
+
+
+def _sm_lastmod_blog() -> str:
+    """Freshest published_at across blog posts (Supabase). Falls back to today
+    if Supabase is unreachable — better to over-report than block the index."""
+    try:
+        import urllib.request as _ur
+        url = (
+            f"{SUPABASE_URL}/rest/v1/blog_posts"
+            f"?select=published_at&order=published_at.desc&limit=1"
+        )
+        req = _ur.Request(url, headers={
+            "apikey":        SUPABASE_ANON,
+            "Authorization": f"Bearer {SUPABASE_ANON}",
+        })
+        with _ur.urlopen(req, timeout=3) as r:
+            arr = json.loads(r.read())
+        if arr:
+            return (arr[0].get("published_at") or "")[:10] or _sm_lastmod_today()
+    except Exception as e:
+        log.debug(f"_sm_lastmod_blog: {e}")
+    return _sm_lastmod_today()
+
+
+def _sm_index_entry(loc: str, lastmod: str) -> str:
+    return (
+        f"  <sitemap>\n"
+        f"    <loc>{loc}</loc>\n"
+        f"    <lastmod>{lastmod}</lastmod>\n"
+        f"  </sitemap>"
+    )
+
+
+def _sm_index_envelope(entries: list[str]) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        + "\n".join(entries) + "\n"
+        '</sitemapindex>'
+    )
+
+
 @app.route("/sitemap.xml")
 def r_sitemap():
     """
-    Single flat sitemap with ALL URLs (~1000) — pages, leagues, teams,
-    matches, blog. Sitemap protocol allows up to 50k URLs / 50MB per file,
-    we are well below the limit. Flat instead of an index because the CDN
-    in front of webpronos.com only routes /sitemap.xml itself to Flask, so
-    sub-sitemap URLs would 404. This keeps everything reachable in one shot.
+    Legacy flat sitemap with ALL URLs (~1000) — pages, leagues, teams,
+    matches, blog. Kept for backwards compatibility because Google has it
+    cached and Search Console references it. New crawlers should follow
+    /sitemap_index.xml (apwin-style hierarchy with per-category lastmod).
+    The Cloudflare worker (cloudflare-worker.js) routes /^\\/sitemap.*\\.xml$/
+    directly to Flask so the sub-sitemap URLs resolve correctly.
     """
     urls = (
         _sm_urls_pages()
@@ -9117,6 +9210,41 @@ def r_sitemap():
         + _sm_urls_blog()
     )
     return _xml_response(_sm_envelope(urls), len(urls))
+
+
+@app.route("/sitemap_index.xml")
+def r_sitemap_index():
+    """
+    Master sitemap index — preferred entry point for crawlers.
+
+    Each sub-sitemap has its own <lastmod> derived from the freshest URL
+    inside it, so Google can re-crawl only the parts that changed since the
+    previous visit instead of pulling one monolithic ~1000-URL file.
+
+    Categories:
+      pages    — static + market hub pages           (~15)
+      leagues  — one URL per monitored league        (~100)
+      teams    — one URL per team that ever had a tip(~500)
+      matches  — live + 30-day window of scheduled & recently finished
+      blog     — Supabase-backed blog posts
+    """
+    pages_lastmod    = _sm_lastmod_today()
+    tips_lastmod     = _sm_lastmod_max_tip_ts()
+    matches_lastmod  = _sm_lastmod_matches()
+    blog_lastmod     = _sm_lastmod_blog()
+
+    entries = [
+        _sm_index_entry(f"{SITE_URL}/sitemap-pages.xml",    pages_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-leagues.xml",  tips_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-teams.xml",    tips_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-matches.xml",  matches_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-blog.xml",     blog_lastmod),
+    ]
+    body = _sm_index_envelope(entries)
+    return Response(body, mimetype="application/xml", headers={
+        "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+        "X-Sitemap-Index": str(len(entries)),
+    })
 
 
 # Sub-sitemap routes kept as direct Flask endpoints in case crawlers fetch
