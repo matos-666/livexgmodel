@@ -14,16 +14,19 @@
 #   - name           → the existing worker's name (see Workers & Pages list)
 #   - routes pattern → already correct below (webpronos.com/*)
 
-name        = "webpronos-seo-router"          # ← CHANGE if existing worker has a different name
+name        = "webpronos-seo-proxy"            # matches the existing worker (confirmed via dashboard 2026-05-13)
 main        = "cloudflare-worker.js"
 compatibility_date = "2025-01-01"
-account_id  = "REPLACE_WITH_ACCOUNT_ID"        # ← boss sends this once
+account_id  = "619a36f905889629b34f6db8d70dcd2e"
 
-# Bind to webpronos.com so all traffic flows through the worker.
-# `zone_name` is the apex domain Cloudflare manages.
+# Routes that fire this worker. Mirrors the two routes already registered
+# in the dashboard so wrangler deploys keep them in sync:
+#   - apex domain (webpronos.com/*)
+#   - any subdomain wildcard (covers embed.webpronos.com used by the
+#     inbet integration, plus future subdomains without extra plumbing)
 routes = [
-  { pattern = "webpronos.com/*", zone_name = "webpronos.com" },
-  { pattern = "www.webpronos.com/*", zone_name = "webpronos.com" },
+  { pattern = "webpronos.com/*",    zone_name = "webpronos.com" },
+  { pattern = "*.webpronos.com/*",  zone_name = "webpronos.com" },
 ]
 
 # No KV / D1 / R2 bindings — the worker is a pure router (sitemaps + bot
