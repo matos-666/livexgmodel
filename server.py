@@ -7122,7 +7122,7 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
   .team{{display:flex;align-items:center;gap:8px;flex:1;min-width:0}}
   .team.away{{justify-content:flex-end;text-align:right}}
   .team-name{{font-weight:700;font-size:1.05rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-  .flag{{font-size:1.4rem;line-height:1}}
+  .flag{{font-size:1.7rem;line-height:1;filter:drop-shadow(0 2px 4px rgba(0,0,0,.25))}}
   .score{{font-size:1.8rem;font-weight:800;letter-spacing:.05em;padding:0 14px;color:var(--text);min-width:90px;text-align:center}}
   .meta-line{{font-size:.78rem;color:var(--meta);text-align:center;margin-top:10px}}
   .section-title{{font-size:.72rem;color:var(--meta);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 8px}}
@@ -7187,21 +7187,41 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
 
   function t(key){{ return (COPY && COPY[key]) || key; }}
 
-  function flagFor(country){{
-    // Country flag emoji from name; server already does this for live state,
-    // but here we recompute from country string for preview/off-day cards.
-    if (!country) return '⚽';
-    const map = {{
-      'south africa':'🇿🇦','mexico':'🇲🇽','argentina':'🇦🇷','brazil':'🇧🇷',
-      'france':'🇫🇷','england':'🏴󠁧󠁢󠁥󠁮󠁧󠁿','spain':'🇪🇸','germany':'🇩🇪','italy':'🇮🇹',
-      'portugal':'🇵🇹','netherlands':'🇳🇱','belgium':'🇧🇪','usa':'🇺🇸','canada':'🇨🇦',
-      'morocco':'🇲🇦','japan':'🇯🇵','south korea':'🇰🇷','australia':'🇦🇺','saudi arabia':'🇸🇦',
-      'iran':'🇮🇷','uruguay':'🇺🇾','colombia':'🇨🇴','chile':'🇨🇱','poland':'🇵🇱',
-      'denmark':'🇩🇰','sweden':'🇸🇪','norway':'🇳🇴','switzerland':'🇨🇭','croatia':'🇭🇷',
-      'serbia':'🇷🇸','ghana':'🇬🇭','senegal':'🇸🇳','tunisia':'🇹🇳','cameroon':'🇨🇲',
-      'ecuador':'🇪🇨','egypt':'🇪🇬','nigeria':'🇳🇬','wales':'🏴󠁧󠁢󠁷󠁬󠁳󠁿','qatar':'🇶🇦'
-    }};
-    return map[country.toLowerCase()] || '⚽';
+  // For a national-team competition the team name IS the country, so this
+  // same map works for both flagFor(country) and flagFor(teamName). The map
+  // includes every nation that could plausibly qualify for the 2026 WC plus
+  // common alt spellings ("usa" / "united states", "south korea" / "korea
+  // republic", etc.) returned by different data sources.
+  const FLAG_MAP = {{
+    'south africa':'🇿🇦','mexico':'🇲🇽','argentina':'🇦🇷','brazil':'🇧🇷',
+    'france':'🇫🇷','england':'🏴󠁧󠁢󠁥󠁮󠁧󠁿','spain':'🇪🇸','germany':'🇩🇪','italy':'🇮🇹',
+    'portugal':'🇵🇹','netherlands':'🇳🇱','belgium':'🇧🇪','usa':'🇺🇸','united states':'🇺🇸',
+    'canada':'🇨🇦','morocco':'🇲🇦','japan':'🇯🇵','south korea':'🇰🇷','korea republic':'🇰🇷',
+    'australia':'🇦🇺','saudi arabia':'🇸🇦','iran':'🇮🇷','ir iran':'🇮🇷','uruguay':'🇺🇾',
+    'colombia':'🇨🇴','chile':'🇨🇱','poland':'🇵🇱','denmark':'🇩🇰','sweden':'🇸🇪',
+    'norway':'🇳🇴','switzerland':'🇨🇭','croatia':'🇭🇷','serbia':'🇷🇸','ghana':'🇬🇭',
+    'senegal':'🇸🇳','tunisia':'🇹🇳','cameroon':'🇨🇲','ecuador':'🇪🇨','egypt':'🇪🇬',
+    'nigeria':'🇳🇬','wales':'🏴󠁧󠁢󠁷󠁬󠁳󠁿','qatar':'🇶🇦','peru':'🇵🇪','bolivia':'🇧🇴',
+    'paraguay':'🇵🇾','venezuela':'🇻🇪','panama':'🇵🇦','costa rica':'🇨🇷','jamaica':'🇯🇲',
+    'honduras':'🇭🇳','el salvador':'🇸🇻','guatemala':'🇬🇹','curacao':'🇨🇼','haiti':'🇭🇹',
+    'algeria':'🇩🇿','ivory coast':'🇨🇮','cote d\\'ivoire':'🇨🇮','mali':'🇲🇱','burkina faso':'🇧🇫',
+    'cape verde':'🇨🇻','dr congo':'🇨🇩','gabon':'🇬🇦','zambia':'🇿🇲','kenya':'🇰🇪',
+    'iraq':'🇮🇶','jordan':'🇯🇴','uae':'🇦🇪','united arab emirates':'🇦🇪','oman':'🇴🇲',
+    'uzbekistan':'🇺🇿','china':'🇨🇳','china pr':'🇨🇳','thailand':'🇹🇭','vietnam':'🇻🇳',
+    'new zealand':'🇳🇿','fiji':'🇫🇯','turkey':'🇹🇷','türkiye':'🇹🇷','austria':'🇦🇹',
+    'czech republic':'🇨🇿','czechia':'🇨🇿','slovakia':'🇸🇰','hungary':'🇭🇺','romania':'🇷🇴',
+    'bulgaria':'🇧🇬','ukraine':'🇺🇦','russia':'🇷🇺','greece':'🇬🇷','iceland':'🇮🇸',
+    'ireland':'🇮🇪','scotland':'🏴󠁧󠁢󠁳󠁣󠁴󠁿','northern ireland':'🇬🇧','finland':'🇫🇮','albania':'🇦🇱',
+    'bosnia':'🇧🇦','bosnia and herzegovina':'🇧🇦','north macedonia':'🇲🇰','slovenia':'🇸🇮',
+    'georgia':'🇬🇪','azerbaijan':'🇦🇿','armenia':'🇦🇲'
+  }};
+
+  function flagFor(name){{
+    // Accepts either a country or a national-team name (same map).
+    if (!name) return '⚽';
+    // Strip "(Mock)" suffix or other parenthesised hints
+    const clean = name.replace(/\\s*\\(.*?\\)\\s*$/, '').trim().toLowerCase();
+    return FLAG_MAP[clean] || '⚽';
   }}
 
   function fmtCountdown(s){{
@@ -7254,12 +7274,16 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
     if (!m) return '';
     const score = (m.home_goals != null && m.away_goals != null && (m.is_finished || (m.home_goals + m.away_goals) > 0))
       ? (m.home_goals + ' — ' + m.away_goals) : 'vs';
+    // For a national-team competition each team has its own flag (team name
+    // == nation). renderMatchCard is also used for non-WC fallbacks where
+    // m.home/m.away may be club names — flagFor returns the generic ⚽ fallback
+    // in that case, which is acceptable.
     return ''
       + '<div class="matchcard">'
       +   '<div class="matchrow">'
-      +     '<div class="team"><span class="flag">' + flagFor(m.country) + '</span><span class="team-name">' + (m.home || '') + '</span></div>'
+      +     '<div class="team"><span class="flag">' + flagFor(m.home) + '</span><span class="team-name">' + (m.home || '') + '</span></div>'
       +     '<div class="score">' + score + '</div>'
-      +     '<div class="team away"><span class="team-name">' + (m.away || '') + '</span></div>'
+      +     '<div class="team away"><span class="team-name">' + (m.away || '') + '</span><span class="flag">' + flagFor(m.away) + '</span></div>'
       +   '</div>'
       +   '<div class="meta-line">' + (m.tournament || 'FIFA World Cup 2026') + '</div>'
       + '</div>';
@@ -7280,7 +7304,7 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
     }}
     let next = '';
     if (d.next_match && d.countdown_to_next_kickoff_s != null) {{
-      next = '<div class="countdown"><div class="label">' + t('next_up') + ' · ' + d.next_match.home + ' ' + flagFor(d.next_match.country) + ' vs ' + d.next_match.away + '</div><div class="value">' + t('kickoff_in') + ' ' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div></div>';
+      next = '<div class="countdown"><div class="label">' + t('next_up') + ' · ' + flagFor(d.next_match.home) + ' ' + d.next_match.home + ' vs ' + d.next_match.away + ' ' + flagFor(d.next_match.away) + '</div><div class="value">' + t('kickoff_in') + ' ' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div></div>';
     }}
     return renderMatchCard(d.match)
       + strip
@@ -7292,7 +7316,7 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
   function renderPreview(d){{
     const nm = d.next_match;
     if (!nm) return '<div class="empty">' + t('no_data_yet') + '</div>';
-    const teams = '<div style="font-size:1.4rem;font-weight:800;margin-top:8px">' + flagFor(nm.country) + ' ' + nm.home + ' <span class="vs">vs</span> ' + nm.away + '</div>';
+    const teams = '<div style="font-size:1.4rem;font-weight:800;margin-top:8px">' + flagFor(nm.home) + ' ' + nm.home + ' <span class="vs">vs</span> ' + nm.away + ' ' + flagFor(nm.away) + '</div>';
     const cd = d.countdown_to_next_kickoff_s != null
       ? '<div class="value">' + t('kickoff_in') + ' ' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div>'
       : '';
