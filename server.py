@@ -6790,13 +6790,295 @@ def _wc2026_performance() -> dict:
     return out
 
 
+# ─── MOCK + LIVE-MATCH OVERRIDE (for pre-tournament testing) ─────────────────
+# Two test affordances accessible via query params on the widget endpoints:
+#   ?mock=<state>      → return synthetic payload for one of the 5 states
+#                        (live | results_win | results_loss | preview | off_day)
+#   ?match_id=<id>     → bypass the WC tournament filter and treat any currently
+#                        monitored live match as the "current" match. Lets us
+#                        rehearse the widget on a Premier League / Liga fixture
+#                        before the World Cup kicks off.
+# Both are opt-in via explicit query param — production traffic is untouched.
+
+def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
+    """Return a synthetic, realistic-looking payload for one of the 5 states.
+
+    Used by inbet devs and us for visual QA / screenshots before the WC begins.
+    Numbers, teams and minutes are hardcoded. Touches no DB, no live state.
+    """
+    now_ts = int(time.time())
+    base = {
+        "lang":              locale,
+        "wc_emblem":         WC2026_EMBLEM_URL,
+        "powered_by":        _t(locale, "powered_by"),
+        "now_ts":            now_ts,
+        "match":             None,
+        "picks":             [],
+        "match_pnl":         None,
+        "next_match":        None,
+        "countdown_to_next_kickoff_s": None,
+        "model_preview_text": None,
+        "next_poll_after_ms": 30_000,
+        "_mock":             True,
+    }
+
+    if state == "live":
+        base.update({
+            "state": "live",
+            "match": {
+                "id": 99000001,
+                "home": "England", "away": "Brazil",
+                "home_goals": 1, "away_goals": 1, "minute": 67,
+                "country": "QAT (Mock)",
+                "tournament": "FIFA World Cup 2026 — Group Stage",
+                "is_finished": False,
+            },
+            "picks": [
+                {"market": "Over/Under 2.5", "label": "Over 2.5",   "odds": 1.85, "edge": 8.2, "minute": 34, "result": None},
+                {"market": "1X2",            "label": "Brazil",     "odds": 2.40, "edge": 5.1, "minute": 52, "result": None},
+                {"market": "BTTS",           "label": "Yes",        "odds": 1.55, "edge": 4.3, "minute": 11, "result": None},
+            ],
+            "countdown_to_next_kickoff_s": 4 * 3600,
+            "next_poll_after_ms": 30_000,
+        })
+
+    elif state in ("results_win", "results_profitable"):
+        base.update({
+            "state": "results_profitable",
+            "match": {
+                "id": 99000002,
+                "home": "Argentina", "away": "Spain",
+                "home_goals": 2, "away_goals": 1, "minute": None,
+                "country": "USA (Mock)",
+                "tournament": "FIFA World Cup 2026 — Group Stage",
+                "is_finished": True,
+            },
+            "picks": [
+                {"market": "1X2",            "label": "Argentina", "odds": 2.10, "edge": 6.4, "minute": 18, "result": "won"},
+                {"market": "Over/Under 2.5", "label": "Over 2.5",  "odds": 1.95, "edge": 5.2, "minute": 41, "result": "won"},
+                {"market": "BTTS",           "label": "Yes",       "odds": 1.65, "edge": 3.8, "minute": 12, "result": "won"},
+            ],
+            "match_pnl": 187,
+            "next_match": {
+                "id": 99000099, "home": "France", "away": "Netherlands",
+                "country": "USA (Mock)",
+                "tournament": "FIFA World Cup 2026 — Group Stage",
+                "kickoff_ts": now_ts + 3 * 3600 + 14 * 60,
+            },
+            "countdown_to_next_kickoff_s": 3 * 3600 + 14 * 60,
+            "next_poll_after_ms": 60_000,
+        })
+
+    elif state in ("results_loss", "results_losing"):
+        base.update({
+            "state": "results_losing",
+            "match": {
+                "id": 99000003,
+                "home": "Germany", "away": "Mexico",
+                "home_goals": 0, "away_goals": 2, "minute": None,
+                "country": "CAN (Mock)",
+                "tournament": "FIFA World Cup 2026 — Group Stage",
+                "is_finished": True,
+            },
+            "picks": [
+                {"market": "1X2",            "label": "Germany",   "odds": 1.80, "edge": 5.0, "minute": 22, "result": "lost"},
+                {"market": "Over/Under 2.5", "label": "Over 2.5",  "odds": 1.95, "edge": 4.1, "minute": 38, "result": "lost"},
+            ],
+            "match_pnl": -200,
+            "next_match": {
+                "id": 99000099, "home": "Portugal", "away": "Uruguay",
+                "country": "MEX (Mock)",
+                "tournament": "FIFA World Cup 2026 — Group Stage",
+                "kickoff_ts": now_ts + 2 * 3600 + 45 * 60,
+            },
+            "countdown_to_next_kickoff_s": 2 * 3600 + 45 * 60,
+            "next_poll_after_ms": 60_000,
+        })
+
+    elif state == "preview":
+        base.update({
+            "state": "preview",
+            "match": None,
+            "next_match": {
+                "id": 99000004, "home": "Portugal", "away": "Croatia",
+                "country": "USA (Mock)",
+                "tournament": "FIFA World Cup 2026 — Group Stage",
+                "kickoff_ts": now_ts + 2 * 3600 + 14 * 60,
+            },
+            "countdown_to_next_kickoff_s": 2 * 3600 + 14 * 60,
+            "model_preview_text": "Model leans Over 2.5 — combined attacks averaging 1.6 xG/match",
+            "next_poll_after_ms": 60_000,
+        })
+
+    elif state == "off_day":
+        base.update({
+            "state": "off_day",
+            "next_match": {
+                "id": 99000005, "home": "South Africa", "away": "Mexico",
+                "country": "MEX (Mock)",
+                "tournament": "FIFA World Cup 2026 — Opening Match",
+                "kickoff_ts": now_ts + 2 * 86400 + 4 * 3600,
+            },
+            "countdown_to_next_kickoff_s": 2 * 86400 + 4 * 3600,
+            "next_poll_after_ms": 300_000,
+        })
+
+    else:
+        base.update({"state": "off_day", "next_poll_after_ms": 60_000})
+
+    return base
+
+
+def _wc2026_current_state_for_match(match_id: int, locale: str = "en") -> dict:
+    """Build a 'live' state payload for any monitored match (non-WC OK).
+
+    Used by ?match_id=<id> to rehearse the widget against a real, currently-live
+    fixture before the World Cup starts. Builds the same payload shape the
+    live branch of _wc2026_current_state produces, just bypassing the WC
+    tournament filter.
+    """
+    now_ts = int(time.time())
+    entry = None
+    try:
+        with _state_lock:
+            entry = _live_state.get(int(match_id))
+            if entry:
+                entry = dict(entry)  # shallow copy for safety
+    except Exception as e:
+        log.warning(f"_wc2026_current_state_for_match({match_id}) failed: {e}")
+
+    if not entry:
+        # Match not in live state → fall through to off_day with a hint
+        return {
+            "state":               "off_day",
+            "lang":                locale,
+            "match":               None,
+            "picks":               [],
+            "match_pnl":           None,
+            "next_match":          None,
+            "countdown_to_next_kickoff_s": None,
+            "model_preview_text":  f"Match id={match_id} not found in live state. Visit /api/state/tips to list live IDs.",
+            "wc_emblem":           WC2026_EMBLEM_URL,
+            "powered_by":          _t(locale, "powered_by"),
+            "next_poll_after_ms":  60_000,
+            "now_ts":              now_ts,
+            "_override_match_id":  match_id,
+        }
+
+    m = entry.get("match") or {}
+    is_finished = bool(m.get("isFinished"))
+    state = "results_profitable" if is_finished else "live"
+    match_payload = {
+        "id":          m.get("id"),
+        "home":        m.get("homeTeam"),
+        "away":        m.get("awayTeam"),
+        "home_goals":  m.get("homeGoals", 0) or 0,
+        "away_goals":  m.get("awayGoals", 0) or 0,
+        "minute":      m.get("minute"),
+        "country":     m.get("country", ""),
+        "tournament":  m.get("tournament", ""),
+        "is_finished": is_finished,
+    }
+    live_picks = entry.get("livePicks") or entry.get("tips") or []
+    picks_payload = [
+        {
+            "market":  p.get("market", ""),
+            "label":   p.get("label", ""),
+            "odds":    p.get("odds") or p.get("odd_entry") or 0,
+            "edge":    p.get("edge")  or p.get("edge_entry") or 0,
+            "minute":  p.get("minute_entry"),
+            "result":  p.get("result"),
+        }
+        for p in live_picks
+    ]
+
+    return {
+        "state":                       state,
+        "lang":                        locale,
+        "match":                       match_payload,
+        "picks":                       picks_payload,
+        "match_pnl":                   None,
+        "next_match":                  None,
+        "countdown_to_next_kickoff_s": None,
+        "model_preview_text":          None,
+        "wc_emblem":                   WC2026_EMBLEM_URL,
+        "powered_by":                  _t(locale, "powered_by"),
+        "next_poll_after_ms":          30_000 if not is_finished else 60_000,
+        "now_ts":                      now_ts,
+        "_override_match_id":          int(match_id),
+    }
+
+
+def _wc2026_mock_performance(locale: str = "en") -> dict:
+    """Synthetic dashboard payload — fixed numbers for pre-launch QA."""
+    now_ts = int(time.time())
+    # 14-day rising equity curve (€)
+    curve = [0, 35, 88, 64, 142, 198, 264, 312, 388, 421, 510, 612, 698, 783, 904, 1058, 1142, 1208, 1283]
+    return {
+        "settled":     47,
+        "wins":        30,
+        "losses":      14,
+        "voids":       3,
+        "winrate":     63.8,
+        "pnl":         1283.0,
+        "roi":         18.2,
+        "avg_odds":    1.92,
+        "equity_curve": [{"ts": now_ts - (len(curve) - i) * 86400, "pnl": v} for i, v in enumerate(curve)],
+        "top_greens": [
+            {"home": "Argentina", "away": "Iran",      "market": "Over/Under 2.5", "label": "Over 2.5", "odds": 2.10, "minute": 31, "profit": 110},
+            {"home": "Brazil",    "away": "Serbia",    "market": "1X2",            "label": "Brazil",   "odds": 1.95, "minute": 22, "profit":  95},
+            {"home": "France",    "away": "Tunisia",   "market": "BTTS",           "label": "Yes",      "odds": 1.80, "minute": 14, "profit":  80},
+            {"home": "Portugal",  "away": "Ghana",     "market": "Over/Under 2.5", "label": "Over 2.5", "odds": 1.75, "minute": 38, "profit":  75},
+            {"home": "Spain",     "away": "Morocco",   "market": "Asian Handicap", "label": "Spain -1", "odds": 2.05, "minute": 19, "profit":  70},
+        ],
+        "by_market": [
+            {"market": "Over/Under 2.5", "picks": 18, "pnl":  642.0},
+            {"market": "1X2",            "picks": 14, "pnl":  391.0},
+            {"market": "BTTS",           "picks":  9, "pnl":  175.0},
+            {"market": "Asian Handicap", "picks":  6, "pnl":   75.0},
+        ],
+        "tournament_start": WC2026_START_TS,
+        "tournament_end":   WC2026_END_TS,
+        "_mock":            True,
+        "_lang":            locale,
+    }
+
+
+_MOCK_STATE_ALIASES = {
+    "live":               "live",
+    "results_win":        "results_profitable",
+    "results_profitable": "results_profitable",
+    "results_loss":       "results_losing",
+    "results_losing":     "results_losing",
+    "preview":            "preview",
+    "off_day":            "off_day",
+    "offday":             "off_day",
+}
+
+
 @app.route("/api/wc2026/current.json")
 def r_wc2026_current_json():
-    """JSON the per-match widget polls every 30 s (live) / 60-300 s otherwise."""
+    """JSON the per-match widget polls every 30 s (live) / 60-300 s otherwise.
+
+    Query params:
+        lang      — en | es | pt-pt | pt-br
+        mock      — force one of the 5 states with synthetic data (test only)
+        match_id  — override WC filter, use any monitored live match (test only)
+    """
     locale = _widget_locale(flask_request.args.get("lang"))
-    data = _wc2026_current_state(locale)
+    mock     = (flask_request.args.get("mock") or "").strip().lower()
+    match_id = (flask_request.args.get("match_id") or "").strip()
+
+    if mock:
+        canonical = _MOCK_STATE_ALIASES.get(mock, "off_day")
+        data = _wc2026_mock_payload(canonical, locale)
+    elif match_id.isdigit():
+        data = _wc2026_current_state_for_match(int(match_id), locale)
+    else:
+        data = _wc2026_current_state(locale)
+
     return jsonify(data), 200, {
-        "Cache-Control": "public, max-age=15",
+        "Cache-Control": "no-store" if (mock or match_id) else "public, max-age=15",
         "Access-Control-Allow-Origin": "*",
     }
 
@@ -6888,7 +7170,14 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
 (function(){{
   const params  = new URLSearchParams(location.search);
   const lang    = params.get('lang')  || 'en';
-  const apiUrl  = '/api/wc2026/current.json?lang=' + encodeURIComponent(lang);
+  // Test affordances: ?mock=<state> forces a hardcoded state, ?match_id=<id>
+  // pulls any monitored live match (lets us rehearse on non-WC fixtures before
+  // 11 June 2026). Both query params are forwarded to the JSON endpoint.
+  const mock     = params.get('mock');
+  const matchId  = params.get('match_id');
+  let apiUrl  = '/api/wc2026/current.json?lang=' + encodeURIComponent(lang);
+  if (mock)    apiUrl += '&mock='     + encodeURIComponent(mock);
+  if (matchId) apiUrl += '&match_id=' + encodeURIComponent(matchId);
   const root    = document.getElementById('app');
   const pillBox = document.getElementById('status-pill');
   let timer;
@@ -7093,8 +7382,24 @@ def r_wc2026_widget_current():
 
 @app.route("/api/wc2026/performance.json")
 def r_wc2026_performance_json():
-    """JSON for the performance dashboard widget. Cached 5 min."""
+    """JSON for the performance dashboard widget. Cached 5 min.
+
+    Query params:
+        lang  — en | es | pt-pt | pt-br
+        mock  — if truthy (1, true, yes), return synthetic dashboard data
+                with realistic-looking numbers. Useful before the WC starts
+                when the tips table has no settled WC picks yet.
+    """
     locale = _widget_locale(flask_request.args.get("lang"))
+    mock = (flask_request.args.get("mock") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    if mock:
+        data = _wc2026_mock_performance(locale)
+        return jsonify(data), 200, {
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+        }
+
     cache_key = "wc2026_performance"
     entry = _seo_cache.get(cache_key)
     if entry and (time.time() - entry["ts"]) < 300:
@@ -7181,7 +7486,11 @@ _WC_WIDGET_PERF_HTML = """<!DOCTYPE html>
 (function(){{
   const params = new URLSearchParams(location.search);
   const lang   = params.get('lang')  || 'en';
-  const apiUrl = '/api/wc2026/performance.json?lang=' + encodeURIComponent(lang);
+  // ?mock=1 → server returns synthetic dashboard data. Used for pre-launch
+  // QA and for screenshots when no settled WC picks exist yet.
+  const mock   = params.get('mock');
+  let apiUrl = '/api/wc2026/performance.json?lang=' + encodeURIComponent(lang);
+  if (mock) apiUrl += '&mock=' + encodeURIComponent(mock);
   const root   = document.getElementById('app');
   const COPY   = {copy_json};
 
