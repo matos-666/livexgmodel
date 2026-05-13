@@ -7353,10 +7353,17 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
   .container{{padding:16px}}
   .matchcard{{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 16px;margin-bottom:14px}}
   .matchrow{{display:flex;align-items:center;justify-content:space-between;gap:12px}}
-  .team{{display:flex;align-items:center;gap:8px;flex:1;min-width:0}}
-  .team.away{{justify-content:flex-end;text-align:right}}
-  .team-name{{font-weight:700;font-size:1.05rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-  .flag{{font-size:1.7rem;line-height:1;filter:drop-shadow(0 2px 4px rgba(0,0,0,.25))}}
+  /* Stacked team card: flag on top, name below — used in renderMatchCard,
+     renderPreview and renderResults. */
+  .team{{display:flex;flex-direction:column;align-items:center;gap:8px;flex:1;min-width:0}}
+  .team.away{{text-align:center}}
+  .team-name{{font-weight:700;font-size:1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;text-align:center}}
+  .flag-img{{display:block;height:56px;width:auto;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.25);object-fit:cover}}
+  /* Smaller flag for inline next-match countdown rows where stacking would
+     be visually overkill (single-line "Next up: PT vs HR" copy). */
+  .flag-inline{{height:18px;width:auto;border-radius:2px;vertical-align:middle;margin:0 4px;box-shadow:0 1px 3px rgba(0,0,0,.2)}}
+  .flag{{font-size:1.4rem;line-height:1}}
+  .flag-fallback{{font-size:1.4rem}}
   .score{{font-size:1.8rem;font-weight:800;letter-spacing:.05em;padding:0 14px;color:var(--text);min-width:90px;text-align:center}}
   .meta-line{{font-size:.78rem;color:var(--meta);text-align:center;margin-top:10px}}
   .section-title{{font-size:.72rem;color:var(--meta);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 8px}}
@@ -7428,12 +7435,44 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
 
   function t(key){{ return (COPY && COPY[key]) || key; }}
 
-  // For a national-team competition the team name IS the country, so this
-  // same map works for both flagFor(country) and flagFor(teamName). The map
-  // also includes localized variants (Inglaterra / Alemanha / Francia / …)
-  // so that mock payloads served with lang=pt-pt|es|pt-br still render the
-  // right flag even though our backend translates the team names for those
-  // locales.
+  // For a national-team competition the team name IS the country. Map every
+  // English name AND its localized variants to an ISO 3166-1 alpha-2 code
+  // (lowercase). UK home nations use the `gb-eng`/`gb-wls`/`gb-sct` flagcdn
+  // subdivision IDs. Real flag images are served from https://flagcdn.com/
+  // so we drop the emoji approach entirely.
+  const FLAG_CODE_MAP = {{
+    // Confederations Cup / typical WC qualifiers — English
+    'south africa':'za','mexico':'mx','argentina':'ar','brazil':'br',
+    'france':'fr','england':'gb-eng','spain':'es','germany':'de','italy':'it',
+    'portugal':'pt','netherlands':'nl','belgium':'be','usa':'us','united states':'us',
+    'canada':'ca','morocco':'ma','japan':'jp','south korea':'kr','korea republic':'kr',
+    'australia':'au','saudi arabia':'sa','iran':'ir','ir iran':'ir','uruguay':'uy',
+    'colombia':'co','chile':'cl','poland':'pl','denmark':'dk','sweden':'se',
+    'norway':'no','switzerland':'ch','croatia':'hr','serbia':'rs','ghana':'gh',
+    'senegal':'sn','tunisia':'tn','cameroon':'cm','ecuador':'ec','egypt':'eg',
+    'nigeria':'ng','wales':'gb-wls','qatar':'qa','peru':'pe','bolivia':'bo',
+    'paraguay':'py','venezuela':'ve','panama':'pa','costa rica':'cr','jamaica':'jm',
+    'honduras':'hn','el salvador':'sv','guatemala':'gt','curacao':'cw','haiti':'ht',
+    'algeria':'dz','ivory coast':'ci','cote d\\'ivoire':'ci','mali':'ml','burkina faso':'bf',
+    'cape verde':'cv','dr congo':'cd','gabon':'ga','zambia':'zm','kenya':'ke',
+    'iraq':'iq','jordan':'jo','uae':'ae','united arab emirates':'ae','oman':'om',
+    'uzbekistan':'uz','china':'cn','china pr':'cn','thailand':'th','vietnam':'vn',
+    'new zealand':'nz','fiji':'fj','turkey':'tr','türkiye':'tr','austria':'at',
+    'czech republic':'cz','czechia':'cz','slovakia':'sk','hungary':'hu','romania':'ro',
+    'bulgaria':'bg','ukraine':'ua','russia':'ru','greece':'gr','iceland':'is',
+    'ireland':'ie','scotland':'gb-sct','northern ireland':'gb-nir','finland':'fi','albania':'al',
+    'bosnia':'ba','bosnia and herzegovina':'ba','north macedonia':'mk','slovenia':'si',
+    'georgia':'ge','azerbaijan':'az','armenia':'am',
+    // Localized variants — pt-pt / pt-br / es
+    'inglaterra':'gb-eng','brasil':'br','espanha':'es','españa':'es',
+    'alemanha':'de','alemania':'de','méxico':'mx','frança':'fr','francia':'fr',
+    'croácia':'hr','croacia':'hr','áfrica do sul':'za','sudáfrica':'za',
+    'países baixos':'nl','países bajos':'nl','holanda':'nl',
+    'uruguai':'uy','turquia':'tr'
+  }};
+
+  // Legacy emoji map — kept for fallback only (used by very old code paths).
+  // Prefer flagImg() everywhere.
   const FLAG_MAP = {{
     'south africa':'🇿🇦','mexico':'🇲🇽','argentina':'🇦🇷','brazil':'🇧🇷',
     'france':'🇫🇷','england':'🏴󠁧󠁢󠁥󠁮󠁧󠁿','spain':'🇪🇸','germany':'🇩🇪','italy':'🇮🇹',
@@ -7464,12 +7503,25 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
     'uruguai':'🇺🇾','turquia':'🇹🇷'
   }};
 
+  function _cleanName(name){{
+    return (name || '').replace(/\\s*\\(.*?\\)\\s*$/, '').trim().toLowerCase();
+  }}
   function flagFor(name){{
-    // Accepts either a country or a national-team name (same map).
+    // Legacy emoji helper — used only by inline rendering paths where an
+    // <img> would break the surrounding text (e.g. countdown one-liners).
     if (!name) return '⚽';
-    // Strip "(Mock)" suffix or other parenthesised hints
-    const clean = name.replace(/\\s*\\(.*?\\)\\s*$/, '').trim().toLowerCase();
-    return FLAG_MAP[clean] || '⚽';
+    return FLAG_MAP[_cleanName(name)] || '⚽';
+  }}
+  // flagImg: returns an <img> tag pointing at the flagcdn.com CDN.
+  //   sizePx — display height in CSS pixels (the source request asks for 2×
+  //   for retina sharpness, e.g. sizePx=64 → request h128).
+  function flagImg(name, sizePx){{
+    if (!name) return '';
+    const code = FLAG_CODE_MAP[_cleanName(name)];
+    if (!code) return '<span class="flag flag-fallback">⚽</span>';
+    const src2x = 'https://flagcdn.com/h' + (sizePx * 2) + '/' + code + '.png';
+    return '<img class="flag-img" src="' + src2x + '" alt="' + name +
+           '" height="' + sizePx + '" loading="lazy" decoding="async" />';
   }}
 
   function fmtCountdown(s){{
@@ -7522,16 +7574,16 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
     if (!m) return '';
     const score = (m.home_goals != null && m.away_goals != null && (m.is_finished || (m.home_goals + m.away_goals) > 0))
       ? (m.home_goals + ' — ' + m.away_goals) : 'vs';
-    // For a national-team competition each team has its own flag (team name
-    // == nation). renderMatchCard is also used for non-WC fallbacks where
-    // m.home/m.away may be club names — flagFor returns the generic ⚽ fallback
-    // in that case, which is acceptable.
+    // Stacked layout per team: real flag image on top, country/team name
+    // below, both centered. flagImg returns <span class="flag-fallback">⚽
+    // when the name is not in FLAG_CODE_MAP (e.g. club fixtures used as
+    // ?match_id= rehearsal).
     return ''
       + '<div class="matchcard">'
       +   '<div class="matchrow">'
-      +     '<div class="team"><span class="flag">' + flagFor(m.home) + '</span><span class="team-name">' + (m.home || '') + '</span></div>'
+      +     '<div class="team">' + flagImg(m.home, 56) + '<div class="team-name">' + (m.home || '') + '</div></div>'
       +     '<div class="score">' + score + '</div>'
-      +     '<div class="team away"><span class="team-name">' + (m.away || '') + '</span><span class="flag">' + flagFor(m.away) + '</span></div>'
+      +     '<div class="team away">' + flagImg(m.away, 56) + '<div class="team-name">' + (m.away || '') + '</div></div>'
       +   '</div>'
       +   '<div class="meta-line">' + (m.tournament || 'FIFA World Cup 2026') + '</div>'
       + '</div>';
@@ -7615,7 +7667,13 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
     }}
     let next = '';
     if (d.next_match && d.countdown_to_next_kickoff_s != null) {{
-      next = '<div class="countdown"><div class="label">' + t('next_up') + ' · ' + flagFor(d.next_match.home) + ' ' + d.next_match.home + ' vs ' + d.next_match.away + ' ' + flagFor(d.next_match.away) + '</div><div class="value">' + t('kickoff_in') + ' ' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div></div>';
+      // Inline mini-flag — only emitted when we have a code (no broken-image
+      // placeholder if a country isn't in FLAG_CODE_MAP).
+      const inlineFlag = (n) => {{
+        const c = FLAG_CODE_MAP[_cleanName(n)];
+        return c ? '<img class="flag-inline" src="https://flagcdn.com/h36/' + c + '.png" alt="" />' : '';
+      }};
+      next = '<div class="countdown"><div class="label">' + t('next_up') + ' · ' + inlineFlag(d.next_match.home) + d.next_match.home + ' vs ' + d.next_match.away + inlineFlag(d.next_match.away) + '</div><div class="value">' + t('kickoff_in') + ' ' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div></div>';
     }}
     return renderMatchCard(d.match)
       + strip
@@ -7627,7 +7685,12 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
   function renderPreview(d){{
     const nm = d.next_match;
     if (!nm) return '<div class="empty">' + t('no_data_yet') + '</div>';
-    const teams = '<div style="font-size:1.4rem;font-weight:800;margin-top:8px">' + flagFor(nm.home) + ' ' + nm.home + ' <span class="vs">vs</span> ' + nm.away + ' ' + flagFor(nm.away) + '</div>';
+    const teams = ''
+      + '<div class="matchrow" style="margin-top:10px">'
+      +   '<div class="team">' + flagImg(nm.home, 56) + '<div class="team-name">' + nm.home + '</div></div>'
+      +   '<div class="score" style="font-size:1.2rem">vs</div>'
+      +   '<div class="team away">' + flagImg(nm.away, 56) + '<div class="team-name">' + nm.away + '</div></div>'
+      + '</div>';
     const cd = d.countdown_to_next_kickoff_s != null
       ? '<div class="value">' + t('kickoff_in') + ' ' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div>'
       : '';
