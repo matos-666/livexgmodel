@@ -44,6 +44,28 @@ LOG_PREFIX="[failover $(date -u '+%Y-%m-%dT%H:%M:%SZ')]"
 log()  { echo "$LOG_PREFIX $*"; }
 fail() { log "ERROR: $*"; exit "${2:-1}"; }
 
+# fly_json: wrap `flyctl <args> --json` with retry. The Fly API occasionally
+# returns an empty body for a 1-2 second window, which previously aborted the
+# whole script via `set -e`. We retry up to 3 times with a 5s gap; if all
+# three return empty/invalid JSON, the helper exits non-zero and the caller
+# decides whether to fail() or fall back. Output goes only to stdout; logs
+# go to stderr so they don't contaminate the parsed JSON.
+fly_json() {
+    local out=""
+    local attempt
+    for attempt in 1 2 3; do
+        out="$(flyctl "$@" --json 2>/dev/null || true)"
+        if [[ -n "$out" ]] && printf '%s' "$out" | python3 -c "import sys,json; json.load(sys.stdin)" >/dev/null 2>&1; then
+            printf '%s' "$out"
+            return 0
+        fi
+        log "WARN: 'flyctl $* --json' returned empty/invalid (attempt $attempt/3) — retrying in 5s" 1>&2
+        sleep 5
+    done
+    log "ERROR: 'flyctl $* --json' failed all 3 retries" 1>&2
+    return 1
+}
+
 command -v flyctl >/dev/null || fail "flyctl not installed" 2
 [[ -f "$FLY_TOML" ]] || fail "fly.toml not found at $FLY_TOML" 2
 [[ -n "${FLY_API_TOKEN:-}" ]] || fail "FLY_API_TOKEN env var is required" 2
@@ -53,8 +75,9 @@ command -v flyctl >/dev/null || fail "flyctl not installed" 2
 # fly.toml. fly.toml can lag during back-to-back migrations (checkout may
 # happen before the previous run's git push lands). The live machine state
 # is always correct.
-PROD_MACHINE_REGION="$(flyctl machines list -a "$APP_NAME" --json 2>/dev/null \
-  | python3 -c "import sys,json; m=[x for x in json.load(sys.stdin) if x.get('state')=='started']; print(m[0]['region'] if m else '')" )"
+PROD_MACHINE_REGION="$(fly_json machines list -a "$APP_NAME" \
+  | python3 -c "import sys,json; m=[x for x in json.load(sys.stdin) if x.get('state')=='started']; print(m[0]['region'] if m else '')" )" \
+  || fail "could not list machines (3 retries failed)"
 TOML_REGION="$(grep -E '^\s*primary_region' "$FLY_TOML" | sed -E 's/.*"([^"]+)".*/\1/')"
 CURRENT_REGION="${PROD_MACHINE_REGION:-$TOML_REGION}"
 [[ -n "$CURRENT_REGION" ]] || fail "could not determine current region (no started machine + fly.toml unparseable)"
@@ -64,12 +87,14 @@ fi
 log "current primary_region: $CURRENT_REGION"
 
 # ─── 2. Get current production machine + volume IDs ──────────────────────────
-PROD_MACHINE_ID="$(flyctl machines list -a "$APP_NAME" --json 2>/dev/null \
-  | python3 -c "import sys,json; m=[x for x in json.load(sys.stdin) if x.get('region')=='$CURRENT_REGION' and x.get('state')=='started']; print(m[0]['id'] if m else '')")"
+PROD_MACHINE_ID="$(fly_json machines list -a "$APP_NAME" \
+  | python3 -c "import sys,json; m=[x for x in json.load(sys.stdin) if x.get('region')=='$CURRENT_REGION' and x.get('state')=='started']; print(m[0]['id'] if m else '')")" \
+  || fail "could not list machines for region $CURRENT_REGION (3 retries failed)"
 [[ -n "$PROD_MACHINE_ID" ]] || fail "no started machine in region $CURRENT_REGION"
 
-PROD_VOLUME_ID="$(flyctl volumes list -a "$APP_NAME" --json 2>/dev/null \
-  | python3 -c "import sys,json; v=[x for x in json.load(sys.stdin) if x.get('region')=='$CURRENT_REGION' and x.get('attached_machine_id')=='$PROD_MACHINE_ID']; print(v[0]['id'] if v else '')")"
+PROD_VOLUME_ID="$(fly_json volumes list -a "$APP_NAME" \
+  | python3 -c "import sys,json; v=[x for x in json.load(sys.stdin) if x.get('region')=='$CURRENT_REGION' and x.get('attached_machine_id')=='$PROD_MACHINE_ID']; print(v[0]['id'] if v else '')")" \
+  || fail "could not list volumes (3 retries failed)"
 [[ -n "$PROD_VOLUME_ID" ]] || fail "no volume attached to machine $PROD_MACHINE_ID"
 
 log "production machine: $PROD_MACHINE_ID  volume: $PROD_VOLUME_ID"
@@ -95,8 +120,10 @@ done
 sleep 5
 for region in "${!TEST_MACHINES[@]}"; do
     mid="${TEST_MACHINES[$region]}"
-    vid="$(flyctl volumes list -a "$APP_NAME" --json 2>/dev/null \
-        | python3 -c "import sys,json; v=[x for x in json.load(sys.stdin) if x.get('attached_machine_id')=='$mid']; print(v[0]['id'] if v else '')")"
+    # Non-fatal: if listing fails we just skip tracking this test volume.
+    # The orphaned volume would be cleaned up by the next failover run anyway.
+    vid="$(fly_json volumes list -a "$APP_NAME" 2>/dev/null \
+        | python3 -c "import sys,json; v=[x for x in json.load(sys.stdin) if x.get('attached_machine_id')=='$mid']; print(v[0]['id'] if v else '')" || echo '')"
     [[ -n "$vid" ]] && TEST_VOLUMES[$region]=$vid
 done
 
