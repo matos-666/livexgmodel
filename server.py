@@ -6882,6 +6882,108 @@ def _xlate(name: str, locale: str) -> str:
     return _COUNTRY_I18N.get(locale, {}).get(name, name)
 
 
+# ── Market & label localisation ──────────────────────────────────────────────
+# Markets we trade: Totals (Over/Under any line) · 1X2 · Asian Handicap.
+# Explicitly excluded: BTTS, Draw No Bet — the model does not produce these.
+# Each locale maps an internal canonical name → its display string.
+_MARKET_DISPLAY = {
+    "en":    {"totals": "Totals",  "1x2": "1X2", "ah": "Asian Handicap"},
+    "es":    {"totals": "Totales", "1x2": "1X2", "ah": "Hándicap Asiático"},
+    "pt-pt": {"totals": "Totais",  "1x2": "1X2", "ah": "Handicap Asiático"},
+    "pt-br": {"totals": "Totais",  "1x2": "1X2", "ah": "Handicap Asiático"},
+}
+
+_LABEL_PREFIX = {
+    "en":    {"Over": "Over",    "Under": "Under",    "Yes": "Yes", "No": "No",  "Draw": "Draw"},
+    "es":    {"Over": "Más de",  "Under": "Menos de", "Yes": "Sí",  "No": "No",  "Draw": "Empate"},
+    "pt-pt": {"Over": "Mais de", "Under": "Menos de", "Yes": "Sim", "No": "Não", "Draw": "Empate"},
+    "pt-br": {"Over": "Mais de", "Under": "Menos de", "Yes": "Sim", "No": "Não", "Draw": "Empate"},
+}
+
+import re as _re_i18n
+_HANDICAP_LINE_RX = _re_i18n.compile(r'^(.+?)\s+([+\-]\d+(?:\.\d+)?)$')
+
+
+def _xlate_market(name: str, locale: str) -> str:
+    """Translate / normalize a market display name. Folds every Over/Under line
+    variant (Over/Under 2.5, O/U 3.5, Totals…) into the single 'Totais' bucket
+    because the project owner trades multiple lines under the same family.
+    """
+    if not name:
+        return name
+    low = name.lower()
+    table = _MARKET_DISPLAY.get(locale, _MARKET_DISPLAY["en"])
+    if "over/under" in low or "over / under" in low or low.startswith("o/u") or low == "totals":
+        return table["totals"]
+    if "1x2" in low or low in ("home/draw/away", "match result"):
+        return table["1x2"]
+    if "handicap" in low or low == "ah":
+        return table["ah"]
+    return name  # unknown — leave as-is
+
+
+def _xlate_pick_label(label: str, locale: str) -> str:
+    """Translate a pick label: 'Over 2.5' → 'Mais de 2.5', 'Yes' → 'Sim',
+    'Brazil -0.5' → 'Brasil -0.5', etc. Team names route through _xlate().
+    """
+    if not label:
+        return label
+    tbl = _LABEL_PREFIX.get(locale, _LABEL_PREFIX["en"])
+    if label.startswith("Over "):
+        return f"{tbl['Over']} {label[5:]}"
+    if label.startswith("Under "):
+        return f"{tbl['Under']} {label[6:]}"
+    if label in tbl:
+        return tbl[label]
+    m = _HANDICAP_LINE_RX.match(label)
+    if m:
+        return f"{_xlate(m.group(1), locale)} {m.group(2)}"
+    return _xlate(label, locale)
+
+
+def _localize_current_payload(data: dict, locale: str) -> dict:
+    """Translate market + label strings in the per-match current.json output."""
+    if not data:
+        return data
+    picks = data.get("picks") or []
+    if picks:
+        data["picks"] = [{
+            **p,
+            "market": _xlate_market(p.get("market", ""), locale),
+            "label":  _xlate_pick_label(p.get("label", ""), locale),
+        } for p in picks]
+    return data
+
+
+def _localize_performance_payload(data: dict, locale: str) -> dict:
+    """Translate market + label strings in the performance dashboard output."""
+    if not data:
+        return data
+    bm = data.get("by_market") or []
+    if bm:
+        # After translation multiple internal markets can collapse onto the
+        # same display name ("Over/Under 2.5" + "Over/Under 3.5" → "Totais").
+        # Merge them so the dashboard shows one row per family.
+        merged: dict = {}
+        for m in bm:
+            disp = _xlate_market(m.get("market", ""), locale)
+            slot = merged.setdefault(disp, {"market": disp, "picks": 0, "pnl": 0.0})
+            slot["picks"] += int(m.get("picks", 0) or 0)
+            slot["pnl"]   += float(m.get("pnl", 0) or 0)
+        data["by_market"] = sorted(
+            ({"market": v["market"], "picks": v["picks"], "pnl": round(v["pnl"], 0)}
+             for v in merged.values()),
+            key=lambda x: -x["pnl"])
+    tg = data.get("top_greens") or []
+    if tg:
+        data["top_greens"] = [{
+            **g,
+            "market": _xlate_market(g.get("market", ""), locale),
+            "label":  _xlate_pick_label(g.get("label", ""), locale),
+        } for g in tg]
+    return data
+
+
 def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
     """Return a synthetic, realistic-looking payload for one of the 5 states.
 
@@ -6918,9 +7020,9 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
                 "is_finished": False,
             },
             "picks": [
-                {"market": "Over/Under 2.5", "label": "Over 2.5",   "odds": 1.85, "edge": 8.2, "minute": 34, "result": None},
-                {"market": "1X2",            "label": xl("Brazil"), "odds": 2.40, "edge": 5.1, "minute": 52, "result": None},
-                {"market": "Asian Handicap", "label": xl("Brazil") + " -0.5", "odds": 2.05, "edge": 4.3, "minute": 11, "result": None},
+                {"market": "Totals",         "label": "Over 2.5",                  "odds": 1.85, "edge": 8.2, "minute": 34, "result": None},
+                {"market": "1X2",            "label": xl("Brazil"),                "odds": 2.40, "edge": 5.1, "minute": 52, "result": None},
+                {"market": "Asian Handicap", "label": f"{xl('Brazil')} -0.5",      "odds": 2.05, "edge": 4.3, "minute": 11, "result": None},
             ],
             # Cumulative xG over match minutes — realistic-looking curve for an
             # entertaining open game where both attacks created chances.
@@ -6955,9 +7057,9 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
                 "is_finished": True,
             },
             "picks": [
-                {"market": "1X2",            "label": xl("Argentina"),       "odds": 2.10, "edge": 6.4, "minute": 18, "result": "won"},
-                {"market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 1.95, "edge": 5.2, "minute": 41, "result": "won"},
-                {"market": "Asian Handicap", "label": xl("Argentina") + " -0.5", "odds": 1.85, "edge": 3.8, "minute": 12, "result": "won"},
+                {"market": "1X2",            "label": xl("Argentina"),              "odds": 2.10, "edge": 6.4, "minute": 18, "result": "won"},
+                {"market": "Totals",         "label": "Over 2.5",                   "odds": 1.95, "edge": 5.2, "minute": 41, "result": "won"},
+                {"market": "Asian Handicap", "label": f"{xl('Argentina')} -0.5",    "odds": 1.85, "edge": 3.8, "minute": 12, "result": "won"},
             ],
             "match_pnl": 187,
             "next_match": {
@@ -6982,8 +7084,8 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
                 "is_finished": True,
             },
             "picks": [
-                {"market": "1X2",            "label": xl("Germany"), "odds": 1.80, "edge": 5.0, "minute": 22, "result": "lost"},
-                {"market": "Over/Under 2.5", "label": "Over 2.5",    "odds": 1.95, "edge": 4.1, "minute": 38, "result": "lost"},
+                {"market": "1X2",     "label": xl("Germany"),  "odds": 1.80, "edge": 5.0, "minute": 22, "result": "lost"},
+                {"market": "Totals",  "label": "Over 2.5",     "odds": 1.95, "edge": 4.1, "minute": 38, "result": "lost"},
             ],
             "match_pnl": -200,
             "next_match": {
@@ -7135,21 +7237,21 @@ def _wc2026_mock_performance(locale: str = "en") -> dict:
             "cum_pnl": v,
         })
 
-    # Top 5 winning picks — markets used: 1X2, Over/Under 2.5, Asian Handicap,
-    # Draw No Bet. Deliberately no BTTS.
+    # Top 5 winning picks — only the 3 markets we actually trade.
+    # Note we deliberately mix Over 2.5 / Over 3.5 / Under 3.5 to demonstrate
+    # that we trade multiple lines (all collapse under "Totais" / "Totals").
     top_greens = [
-        {"match": f"{xl('Argentina')} vs Iran",          "market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 2.10, "minute_entered": 31, "profit": 110},
-        {"match": f"{xl('Brazil')} vs Serbia",           "market": "1X2",            "label": xl("Brazil"),          "odds": 1.95, "minute_entered": 22, "profit":  95},
+        {"match": f"{xl('Argentina')} vs Iran",                "market": "Totals",         "label": "Over 2.5",                "odds": 2.10, "minute_entered": 31, "profit": 110},
+        {"match": f"{xl('Brazil')} vs Serbia",                 "market": "1X2",            "label": xl("Brazil"),              "odds": 1.95, "minute_entered": 22, "profit":  95},
         {"match": f"{xl('Netherlands')} vs {xl('Argentina')}", "market": "Asian Handicap", "label": f"{xl('Argentina')} +0.5", "odds": 1.85, "minute_entered": 14, "profit":  85},
-        {"match": f"{xl('Portugal')} vs Ghana",          "market": "Over/Under 2.5", "label": "Over 2.5",            "odds": 1.75, "minute_entered": 38, "profit":  75},
-        {"match": f"{xl('Spain')} vs Morocco",           "market": "Draw No Bet",    "label": xl("Spain"),           "odds": 1.70, "minute_entered": 19, "profit":  70},
+        {"match": f"{xl('Portugal')} vs Ghana",                "market": "Totals",         "label": "Over 3.5",                "odds": 2.30, "minute_entered": 38, "profit":  75},
+        {"match": f"{xl('Spain')} vs Morocco",                 "market": "Totals",         "label": "Under 3.5",               "odds": 1.70, "minute_entered": 19, "profit":  70},
     ]
 
     by_market = [
-        {"market": "Over/Under 2.5", "picks": 21, "pnl":  712.0},
+        {"market": "Totals",         "picks": 25, "pnl":  762.0},
         {"market": "1X2",            "picks": 14, "pnl":  386.0},
         {"market": "Asian Handicap", "picks":  8, "pnl":  135.0},
-        {"market": "Draw No Bet",    "picks":  4, "pnl":   50.0},
     ]
 
     return {
@@ -7203,6 +7305,11 @@ def r_wc2026_current_json():
         data = _wc2026_current_state_for_match(int(match_id), locale)
     else:
         data = _wc2026_current_state(locale)
+
+    # Final localisation pass — translates market names and pick labels.
+    # Mock data ships canonical English names; real data comes straight from
+    # Sofascore. Both pass through the same translator for consistency.
+    data = _localize_current_payload(data, locale)
 
     return jsonify(data), 200, {
         "Cache-Control": "no-store" if (mock or match_id) else "public, max-age=15",
@@ -7623,26 +7730,29 @@ def r_wc2026_performance_json():
 
     if mock:
         data = _wc2026_mock_performance(locale)
+        data = _localize_performance_payload(data, locale)
         return jsonify(data), 200, {
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
         }
 
+    # Real data path. We cache the raw (English-canonical) payload for 5 min,
+    # then localise on the way out per request so different locales hit the
+    # same underlying cache.
     cache_key = "wc2026_performance"
     entry = _seo_cache.get(cache_key)
     if entry and (time.time() - entry["ts"]) < 300:
         try:
             data = json.loads(entry["html"])
-            data["_lang"] = locale
-            return jsonify(data), 200, {
-                "Cache-Control": "public, max-age=300",
-                "Access-Control-Allow-Origin": "*",
-            }
         except Exception:
-            pass
-    data = _wc2026_performance()
-    _seo_cache_put(cache_key, json.dumps(data))
+            data = _wc2026_performance()
+            _seo_cache_put(cache_key, json.dumps(data))
+    else:
+        data = _wc2026_performance()
+        _seo_cache_put(cache_key, json.dumps(data))
+
     data["_lang"] = locale
+    data = _localize_performance_payload(data, locale)
     return jsonify(data), 200, {
         "Cache-Control": "public, max-age=300",
         "Access-Control-Allow-Origin": "*",
