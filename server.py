@@ -9144,6 +9144,136 @@ def _betradar_match_caption(match_id: int) -> str:
     )
 
 
+def _betradar_daily_caption(target_start_ts: int, target_end_ts: int,
+                             date_label: str, day_label: str = "Hoje") -> str:
+    """Mirror of the existing _send_daily_summary text, returned as caption
+    HTML so we can attach it to the animated daily-recap MP4."""
+    STAKE = get_setting("stake_per_bet", 100.0) or 100.0
+    with _db() as conn:
+        tips = conn.execute(
+            "SELECT t.result, t.odd_entry, t.label, t.market, "
+            "       g.home_team, g.away_team "
+            "FROM tips t LEFT JOIN games g ON g.id = t.match_id "
+            "WHERE t.wall_ts >= ? AND t.wall_ts < ? AND t.result IS NOT NULL "
+            "ORDER BY t.odd_entry DESC",
+            (target_start_ts, target_end_ts)
+        ).fetchall()
+    if not tips:
+        return ""
+    lucro, odds_sum, wins, losses = 0.0, 0.0, 0, 0
+    for t in tips:
+        o = float(t["odd_entry"] or 0)
+        if (t["result"] or "").lower() in ("green", "win"):
+            lucro += (o - 1) * STAKE; wins += 1; odds_sum += o
+        elif (t["result"] or "").lower() in ("red", "loss"):
+            lucro -= STAKE; losses += 1; odds_sum += o
+    settled = wins + losses
+    avg_odds = odds_sum / settled if settled else 0.0
+    roi = (lucro / (settled * STAKE) * 100) if settled else 0.0
+
+    winning = [t for t in tips if (t["result"] or "").lower() in ("green","win")]
+    biggest = max(winning, key=lambda t: t["odd_entry"] or 0) if winning else None
+    big_block = ""
+    if biggest:
+        bw_odd    = biggest["odd_entry"] or 0
+        bw_label  = biggest["label"] or "?"
+        bw_market = biggest["market"] or "?"
+        bw_match  = f"{biggest['home_team']} vs {biggest['away_team']}" \
+                    if biggest["home_team"] and biggest["away_team"] else "—"
+        bw_profit = (bw_odd - 1) * STAKE
+        big_block = (
+            f"\n🎯 <b>Maior Odd do Dia:</b> {bw_odd:.2f}\n"
+            f"   <i>{bw_label} ({bw_market})</i>\n"
+            f"   <i>{bw_match}</i>\n"
+            f"   💰 Lucro gerado: <b>+€{bw_profit:.2f}</b>"
+        )
+
+    return (
+        f"<b>Resumo Diário — {day_label} ({date_label})</b>\n"
+        f"\n"
+        f"💶 <b>Lucro:</b> €{lucro:,.2f}\n"
+        f"📊 <b>Odds Médias:</b> {avg_odds:.2f}\n"
+        f"📈 <b>ROI:</b> {roi:.1f}%"
+        f"{big_block}\n"
+        f"\n"
+        f"<i>Mantém a vigilância nas entradas de amanhã — o edge está lá! 🚀</i>"
+    )
+
+
+@app.route("/api/admin/betradar/daily-recap", methods=["POST", "GET"])
+def r_betradar_daily_recap():
+    """Generate the day's cumulative-P&L animation + send to a chat_id.
+
+    Query params:
+      date     — YYYY-MM-DD (Lisbon timezone), defaults to today
+      chat_id  — target Telegram chat (defaults to first admin)
+    """
+    from datetime import datetime, timedelta
+    import pytz
+
+    date_str = (flask_request.args.get("date") or "").strip()
+    lisbon   = pytz.timezone("Europe/Lisbon")
+    if date_str:
+        try:
+            y, m, d = map(int, date_str.split("-"))
+        except Exception:
+            return jsonify({"ok": False, "error": "date must be YYYY-MM-DD"}), 400
+    else:
+        now = datetime.now(lisbon)
+        y, m, d = now.year, now.month, now.day
+
+    start = lisbon.localize(datetime(y, m, d))
+    end   = start + timedelta(days=1)
+    target_start_ts = int(start.timestamp())
+    target_end_ts   = int(end.timestamp())
+    date_label = start.strftime("%d/%m/%Y")
+
+    chat_id_raw = (flask_request.args.get("chat_id") or "").strip()
+    if chat_id_raw.lstrip("-").isdigit():
+        chat_id = int(chat_id_raw)
+    elif TELEGRAM_ADMIN_CHAT_IDS:
+        chat_id = next(iter(TELEGRAM_ADMIN_CHAT_IDS))
+    else:
+        return jsonify({"ok": False, "error": "no chat_id and no admin chat configured"}), 400
+
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        from tools.build_daily_recap import build_daily_recap  # type: ignore
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"recap import failed: {e}"}), 500
+
+    requested_path = f"/tmp/daily_recap_{date_str or 'today'}.mp4"
+    actual_path = requested_path
+    try:
+        result = build_daily_recap(
+            target_start_ts=target_start_ts,
+            target_end_ts=target_end_ts,
+            date_label=date_label,
+            out_path=requested_path,
+            db_path=str(DB_PATH),
+        )
+        actual_path = result.split(" (", 1)[0] if isinstance(result, str) else requested_path
+        anim_bytes = open(actual_path, "rb").read()
+    except Exception as e:
+        log.error(f"betradar daily recap build failed for {date_str}: {e}")
+        return jsonify({"ok": False, "error": f"build failed: {e}"}), 500
+
+    caption  = _betradar_daily_caption(target_start_ts, target_end_ts, date_label)
+    filename = os.path.basename(actual_path)
+    _send_telegram_animation(chat_id, anim_bytes, caption=caption,
+                              buttons=_betradar_share_buttons(),
+                              filename=filename)
+
+    return jsonify({
+        "ok":       True,
+        "date":     date_label,
+        "format":   filename.rsplit(".", 1)[-1],
+        "size":     len(anim_bytes),
+        "chat_id":  chat_id,
+        "caption_chars": len(caption),
+    })
+
+
 def _betradar_share_buttons() -> list:
     """Inline keyboard: single 'Partilhar Resultados' button that opens
     Telegram's native chat-picker pre-populated with the share message via
