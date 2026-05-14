@@ -7479,6 +7479,32 @@ def _wc2026_current_state_for_match(match_id: int, locale: str = "en") -> dict:
     except Exception as e:
         log.warning(f"_wc2026_current_state_for_match({match_id}) DB lookup failed: {e}")
 
+    # ── 2.5. Not in DB? Try _upcoming_cache — scheduled fixture that the
+    # background scraper has already discovered but hasn't yet promoted to
+    # the games table (which only happens once it starts being tracked).
+    if not g_row:
+        try:
+            for date_key, cached in _upcoming_cache.items():
+                for m_up in (cached or {}).get("matches", []):
+                    if int(m_up.get("id") or 0) == int(match_id):
+                        g_row = {
+                            "id":           m_up.get("id"),
+                            "home_team":    m_up.get("homeTeam"),
+                            "away_team":    m_up.get("awayTeam"),
+                            "home_goals":   0,
+                            "away_goals":   0,
+                            "start_ts":     m_up.get("startTimestamp"),
+                            "tournament":   m_up.get("tournament", ""),
+                            "country":      m_up.get("country", ""),
+                            "is_finished":  0,
+                            "archived_at":  None,
+                        }
+                        break
+                if g_row:
+                    break
+        except Exception as e:
+            log.warning(f"_wc2026_current_state_for_match({match_id}) upcoming cache lookup failed: {e}")
+
     if g_row:
         g = dict(g_row)
         if g.get("is_finished"):
