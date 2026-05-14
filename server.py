@@ -3881,6 +3881,9 @@ WIDGET_COPY: dict = {
         "model_preview":   "Model preview",
         "wc_resumes_in":   "World Cup resumes in",
         "upcoming_matches": "Upcoming matches",
+        "model_lean_over":  "Model leans Over 2.5 — combined attacks averaging {xg} xG/match",
+        "model_lean_under": "Model leans Under 2.5 — combined attacks averaging {xg} xG/match",
+        "get_alerts":       "Get Pick Alerts",
         # result badges
         "result_won":      "Won",
         "result_lost":     "Lost",
@@ -3920,6 +3923,9 @@ WIDGET_COPY: dict = {
         "model_preview":   "Previa del modelo",
         "wc_resumes_in":   "El Mundial vuelve en",
         "upcoming_matches": "Próximos partidos",
+        "model_lean_over":  "El modelo se inclina por Más de 2.5 — ataques combinados promedian {xg} xG/partido",
+        "model_lean_under": "El modelo se inclina por Menos de 2.5 — ataques combinados promedian {xg} xG/partido",
+        "get_alerts":       "Recibir Picks",
         "result_won":      "Ganada",
         "result_lost":     "Perdida",
         "result_push":     "Empate",
@@ -3954,6 +3960,9 @@ WIDGET_COPY: dict = {
         "model_preview":   "Antevisão do modelo",
         "wc_resumes_in":   "Mundial regressa em",
         "upcoming_matches": "Próximos jogos",
+        "model_lean_over":  "Modelo inclina-se para Mais de 2.5 — ataques combinados em média {xg} xG/jogo",
+        "model_lean_under": "Modelo inclina-se para Menos de 2.5 — ataques combinados em média {xg} xG/jogo",
+        "get_alerts":       "Receber Picks",
         "result_won":      "Ganha",
         "result_lost":     "Perdida",
         "result_push":     "Empate",
@@ -3988,6 +3997,9 @@ WIDGET_COPY: dict = {
         "model_preview":   "Prévia do modelo",
         "wc_resumes_in":   "Copa volta em",
         "upcoming_matches": "Próximos jogos",
+        "model_lean_over":  "Modelo inclina-se para Mais de 2.5 — ataques combinados na média de {xg} xG/jogo",
+        "model_lean_under": "Modelo inclina-se para Menos de 2.5 — ataques combinados na média de {xg} xG/jogo",
+        "get_alerts":       "Receber Picks",
         "result_won":      "Ganha",
         "result_lost":     "Perdida",
         "result_push":     "Empate",
@@ -6698,10 +6710,8 @@ def _wc2026_current_state(locale: str = "en", demo: bool = False) -> dict:
                         count += 1
                 if count >= 1:
                     proj = avg_total / count * 2  # rough 2-team projection
-                    if proj >= 2.5:
-                        model_preview_text = f"Model leans Over 2.5 — combined attacks averaging {proj:.1f} xG/match"
-                    else:
-                        model_preview_text = f"Model leans Under 2.5 — combined attacks averaging {proj:.1f} xG/match"
+                    key = "model_lean_over" if proj >= 2.5 else "model_lean_under"
+                    model_preview_text = _t(locale, key).replace("{xg}", f"{proj:.1f}")
             except Exception:
                 pass
 
@@ -7158,7 +7168,7 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
                 "kickoff_ts": now_ts + 2 * 3600 + 14 * 60,
             },
             "countdown_to_next_kickoff_s": 2 * 3600 + 14 * 60,
-            "model_preview_text": "Model leans Over 2.5 — combined attacks averaging 1.6 xG/match",
+            "model_preview_text": _t(locale, "model_lean_over").replace("{xg}", "1.6"),
             "next_poll_after_ms": 60_000,
         })
 
@@ -7440,6 +7450,21 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
   .flag-inline{{height:18px;width:auto;border-radius:2px;vertical-align:middle;margin:0 4px;box-shadow:0 1px 3px rgba(0,0,0,.2)}}
   .flag{{font-size:1.4rem;line-height:1}}
   .flag-fallback{{font-size:1.4rem}}
+  /* "Get Pick Alerts" CTA — InBet orange, present in every state above the
+     Powered-by footer. Pill-shaped, prominent. */
+  .alerts-cta-wrap{{display:flex;justify-content:center;margin:20px 0 12px}}
+  .alerts-cta{{
+    display:inline-flex;align-items:center;gap:8px;
+    background:var(--accent);color:#1a1a2e;
+    font-weight:800;font-size:.95rem;letter-spacing:.02em;
+    padding:11px 22px;border-radius:999px;text-decoration:none;
+    box-shadow:0 4px 12px rgba(255,138,30,.30);
+    transition:transform .12s ease, box-shadow .12s ease, filter .12s ease;
+  }}
+  .alerts-cta:hover{{transform:translateY(-1px);filter:brightness(1.05);
+    box-shadow:0 6px 16px rgba(255,138,30,.40)}}
+  .alerts-cta:active{{transform:translateY(0)}}
+  .alerts-cta .tg{{font-size:1.1rem;line-height:1}}
   /* Upcoming-matches list (off_day state) — symmetric layout matching the
      InBet members-area look: team name + logo left, time stacked centred,
      logo + team name right. */
@@ -7866,6 +7891,18 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
     return cd + listHtml;
   }}
 
+  // "Get Pick Alerts" CTA — same DOM in every state, deep-links to the
+  // dedicated InBet Telegram bot. Localised label per data.lang.
+  const ALERTS_CTA_HTML = ''
+    + '<div class="alerts-cta-wrap">'
+    +   '<a class="alerts-cta" href="https://t.me/InBetWC2026_Bot" '
+    +      'target="_blank" rel="noopener" '
+    +      'aria-label="' + t('get_alerts') + '">'
+    +     '<span class="tg" aria-hidden="true">📲</span>'
+    +     '<span>' + t('get_alerts') + '</span>'
+    +   '</a>'
+    + '</div>';
+
   function render(d){{
     let body = '';
     switch (d.state) {{
@@ -7875,7 +7912,9 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
       case 'preview':             body = renderPreview(d); break;
       default:                    body = renderOffDay(d);
     }}
-    root.innerHTML = body;
+    // Always-visible CTA below the state body so members can link their
+    // Telegram from any screen.
+    root.innerHTML = body + ALERTS_CTA_HTML;
     renderPill(d.state, d.match && d.match.minute);
     // postMessage host for iframe auto-resize
     try {{
@@ -8010,6 +8049,18 @@ _WC_WIDGET_PERF_HTML = """<!DOCTYPE html>
   .header .brand{{font-weight:700;font-size:.95rem}}
   .header .brand span{{display:block;font-size:.72rem;color:var(--meta);font-weight:500;letter-spacing:.04em}}
   .container{{padding:16px}}
+  /* "Get Pick Alerts" CTA — same look as the per-match widget */
+  .alerts-cta-wrap{{display:flex;justify-content:center;margin:20px 0 12px}}
+  .alerts-cta{{display:inline-flex;align-items:center;gap:8px;
+    background:var(--accent);color:#1a1a2e;
+    font-weight:800;font-size:.95rem;letter-spacing:.02em;
+    padding:11px 22px;border-radius:999px;text-decoration:none;
+    box-shadow:0 4px 12px rgba(255,138,30,.30);
+    transition:transform .12s ease, box-shadow .12s ease, filter .12s ease;}}
+  .alerts-cta:hover{{transform:translateY(-1px);filter:brightness(1.05);
+    box-shadow:0 6px 16px rgba(255,138,30,.40)}}
+  .alerts-cta:active{{transform:translateY(0)}}
+  .alerts-cta .tg{{font-size:1.1rem;line-height:1}}
   .stat-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:18px}}
   .stat{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 14px}}
   .stat .label{{font-size:.7rem;color:var(--meta);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}}
@@ -8115,9 +8166,22 @@ _WC_WIDGET_PERF_HTML = """<!DOCTYPE html>
     }}).join('') + '</div>';
   }}
 
+  // Same orange CTA as the per-match widget — keeps the two iframes
+  // visually consistent on the InBet members area.
+  const ALERTS_CTA_HTML = ''
+    + '<div class="alerts-cta-wrap">'
+    +   '<a class="alerts-cta" href="https://t.me/InBetWC2026_Bot" '
+    +      'target="_blank" rel="noopener" '
+    +      'aria-label="' + t('get_alerts') + '">'
+    +     '<span class="tg" aria-hidden="true">📲</span>'
+    +     '<span>' + t('get_alerts') + '</span>'
+    +   '</a>'
+    + '</div>';
+
   function render(d){{
     if (!d || d.settled === 0) {{
-      root.innerHTML = '<div class="empty">' + t('no_data_yet') + '</div>';
+      root.innerHTML = '<div class="empty">' + t('no_data_yet') + '</div>'
+                     + ALERTS_CTA_HTML;
       return;
     }}
     const pnlCls = (d.pnl || 0) >= 0 ? 'profit' : 'loss';
@@ -8134,7 +8198,8 @@ _WC_WIDGET_PERF_HTML = """<!DOCTYPE html>
       + '<div class="section-title">' + t('perf_top_greens') + '</div>'
       + '<div class="card">' + renderGreens(d.top_greens) + '</div>'
       + '<div class="section-title">' + t('perf_by_market') + '</div>'
-      + '<div class="card">' + renderMarkets(d.by_market) + '</div>';
+      + '<div class="card">' + renderMarkets(d.by_market) + '</div>'
+      + ALERTS_CTA_HTML;
     try {{ parent.postMessage({{type:'webpronos:resize', height: document.body.scrollHeight}}, '*'); }} catch(e){{}}
   }}
 
