@@ -6618,21 +6618,40 @@ def _build_xg_timeline_from_entry(entry: dict) -> list:
     """Construct a cumulative xG timeline [{minute, home, away}, …] from a live
     state entry. Returns [] if no usable shots data. Penalties are excluded
     from the cumulative total to match how we compute team xG elsewhere.
+
+    The live_state stores shots as the dict returned by get_shotmap():
+        {"homeShots":[…], "awayShots":[…], "homeXg":N, "awayXg":N, …}
+    We also accept a flat list-of-shots shape for forward-compat. Each shot
+    has `minute`, `xg`, `isPenalty`, and (for the flat shape) `isHome`.
     """
     if not entry:
         return []
-    shots = entry.get("shots") or []
-    if not isinstance(shots, list) or not shots:
+    shots = entry.get("shots")
+    if not shots:
         return []
+
+    # Normalise to a flat [(shot_dict, is_home), …] list regardless of shape.
+    flat = []
+    if isinstance(shots, dict):
+        for s in (shots.get("homeShots") or []):
+            flat.append((s, True))
+        for s in (shots.get("awayShots") or []):
+            flat.append((s, False))
+    elif isinstance(shots, list):
+        for s in shots:
+            flat.append((s, bool(s.get("isHome"))))
+    else:
+        return []
+
     rows = []
-    for s in shots:
+    for s, is_home in flat:
         m = s.get("minute")
         if m is None:
             continue
         if s.get("isPenalty"):
             continue
         rows.append((int(m) + (int(s.get("addedTime") or 0) or 0) / 60.0,
-                     bool(s.get("isHome")),
+                     is_home,
                      float(s.get("xg") or 0)))
     rows.sort(key=lambda r: r[0])
     timeline = [{"minute": 0, "home": 0.0, "away": 0.0}]
@@ -6801,7 +6820,7 @@ def _wc2026_current_state(locale: str = "en", demo: bool = False) -> dict:
                 "label":   p.get("label", ""),
                 "odds":    p.get("odds") or p.get("odd_entry") or 0,
                 "edge":    p.get("edge") or p.get("edge_entry") or 0,
-                "minute":  p.get("minute_entry"),
+                "minute":  p.get("minute_entry") if p.get("minute_entry") is not None else p.get("minute"),
                 "result":  p.get("result"),
             }
             for p in live_picks
@@ -7433,7 +7452,7 @@ def _wc2026_current_state_for_match(match_id: int, locale: str = "en") -> dict:
             "label":   p.get("label", ""),
             "odds":    p.get("odds") or p.get("odd_entry") or 0,
             "edge":    p.get("edge")  or p.get("edge_entry") or 0,
-            "minute":  p.get("minute_entry"),
+            "minute":  p.get("minute_entry") if p.get("minute_entry") is not None else p.get("minute"),
             "result":  p.get("result"),
         }
         for p in live_picks
