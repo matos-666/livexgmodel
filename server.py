@@ -9145,15 +9145,16 @@ def _betradar_match_caption(match_id: int) -> str:
 
 
 def _betradar_share_buttons() -> list:
-    """Inline keyboard for the recap message: opens the bot OR shares it to
-    another Telegram chat via the native switch_inline_query selector."""
+    """Inline keyboard: single 'Partilhar Resultados' button that opens
+    Telegram's native chat-picker pre-populated with the share message via
+    switch_inline_query. Lets the user forward this recap to any contact
+    or group in two taps."""
     return [
         [
-            {"text": "📲 Abrir bot", "url": BETRADAR_BOT_LINK},
-            {"text": "🔗 Partilhar com amigos",
+            {"text": "🔗 Partilhar Resultados",
              "switch_inline_query": (
-                 "Live xG picks de futebol gratuitas — "
-                 f"junta-te a @{BETRADAR_BOT_USERNAME}"
+                 "🟢 Picks ao vivo de futebol no @"
+                 f"{BETRADAR_BOT_USERNAME} — junta-te grátis"
              )},
         ],
     ]
@@ -9185,13 +9186,44 @@ def r_betradar_recap(match_id: int):
     except Exception as e:
         return jsonify({"ok": False, "error": f"recap import failed: {e}"}), 500
 
+    # Fetch the two team crests using OUR curl_cffi session (TLS-impersonated
+    # — gets past Sofascore CDN's anti-bot which plain urllib doesn't). This
+    # is the same path that scrapes match data, so if scraping works, logos
+    # work. Falls back gracefully (coloured circle) when something fails.
+    def _fetch_logo_img(team_id):
+        if not team_id or not _session:
+            return None
+        try:
+            url = f"https://api.sofascore.app/api/v1/team/{team_id}/image"
+            resp = _session.get(url, timeout=6)
+            if resp.status_code != 200 or not resp.content:
+                return None
+            from PIL import Image as _PIL
+            import io as _io
+            img = _PIL.open(_io.BytesIO(resp.content)).convert("RGBA")
+            img.thumbnail((192, 192), _PIL.LANCZOS)
+            return img
+        except Exception as e:
+            log.warning(f"recap logo fetch failed team_id={team_id}: {e}")
+            return None
+
+    with _db() as conn:
+        team_ids = conn.execute(
+            "SELECT home_team_id, away_team_id FROM games WHERE id = ?",
+            (match_id,)
+        ).fetchone()
+    logo_home_img = _fetch_logo_img(team_ids["home_team_id"]) if team_ids else None
+    logo_away_img = _fetch_logo_img(team_ids["away_team_id"]) if team_ids else None
+
     # Generate the recap. Prefer MP4 (H.264 via ffmpeg) — falls back to GIF
     # only if ffmpeg isn't installed. build_recap may rewrite the extension
     # in that fallback case, so we read whatever it actually produced.
     requested_path = f"/tmp/betradar_recap_{match_id}.mp4"
     actual_path = requested_path
     try:
-        result = build_recap(match_id, requested_path, db_path=str(DB_PATH))
+        result = build_recap(match_id, requested_path, db_path=str(DB_PATH),
+                              home_logo_img=logo_home_img,
+                              away_logo_img=logo_away_img)
         # build_recap returns "path (size · frames · duration)" — extract path
         actual_path = result.split(" (", 1)[0] if isinstance(result, str) else requested_path
         anim_bytes = open(actual_path, "rb").read()

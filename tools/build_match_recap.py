@@ -194,7 +194,16 @@ def result_chip(r: str) -> tuple[str, str, str]:
 
 # ── Animation ──────────────────────────────────────────────────────────────
 def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
-                db_path: str = DB_DEFAULT, fps: int = 10) -> str:
+                db_path: str = DB_DEFAULT, fps: int = 10,
+                home_logo_img: Image.Image | None = None,
+                away_logo_img: Image.Image | None = None) -> str:
+    """Build the recap animation.
+
+    home_logo_img/away_logo_img can be passed by the caller (e.g. server.py
+    using its TLS-impersonated curl_cffi session that gets past anti-bot
+    CDNs); when not provided the function falls back to a plain urllib
+    fetch which works in dev but is often blocked in production.
+    """
     data   = load_match(match_id, db_path)
     g      = data["match"]
     tips   = data["tips"]
@@ -208,9 +217,9 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
     home_name, away_name = g["home_team"], g["away_team"]
     score = f"{g['home_goals']} — {g['away_goals']}"
 
-    # Fetch logos (best-effort, may be None)
-    logo_home = fetch_team_logo(g.get("home_team_id"))
-    logo_away = fetch_team_logo(g.get("away_team_id"))
+    # Use caller-provided logos when present, else best-effort urllib fetch.
+    logo_home = home_logo_img or fetch_team_logo(g.get("home_team_id"))
+    logo_away = away_logo_img or fetch_team_logo(g.get("away_team_id"))
 
     # ── Figure layout: header / chart / picks list ────────────────────────
     # DPI 160 + MP4 output via H.264 gives noticeably sharper playback than
