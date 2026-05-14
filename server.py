@@ -854,7 +854,47 @@ def _send_daily_summary(days_back: int = 0, force_send: bool = False):
         msg = "\n".join(msg_lines)
 
         log.info(f"_send_daily_summary: sending message for {day_label} ({date_str}), lucro €{lucro:.2f}")
-        _send_telegram(msg)
+
+        # Try to attach the animated P&L recap. Falls back to plain text if
+        # the MP4 build fails for any reason (ffmpeg missing, no settled
+        # tips for the day in the recap loader, etc.) — delivery must
+        # never be blocked by the visual.
+        anim_bytes = None
+        try:
+            sys.path.insert(0, os.path.dirname(__file__))
+            from tools.build_daily_recap import build_daily_recap  # type: ignore
+            out_path = f"/tmp/daily_recap_{target_date.strftime('%Y-%m-%d')}.mp4"
+            result = build_daily_recap(
+                target_start_ts=target_start_ts,
+                target_end_ts=target_end_ts,
+                date_label=date_str,
+                out_path=out_path,
+                db_path=str(DB_PATH),
+            )
+            actual_path = result.split(" (", 1)[0] if isinstance(result, str) else out_path
+            with open(actual_path, "rb") as fh:
+                anim_bytes = fh.read()
+            filename = os.path.basename(actual_path)
+        except Exception as e:
+            log.warning(f"_send_daily_summary: animation build failed ({e}); falling back to text-only")
+            anim_bytes = None
+
+        subscribers = _tg_subscribers() or []
+        if anim_bytes:
+            chat_ids = [int(c) for c in subscribers if str(c).lstrip("-").isdigit()]
+            stats = _broadcast_telegram_animation(
+                chat_ids, anim_bytes, caption=msg,
+                buttons=_betradar_share_buttons(),
+                filename=filename,
+            )
+            log.info(
+                f"_send_daily_summary: animation broadcast — "
+                f"upload {stats['sent_with_upload']}, "
+                f"by_id {stats['sent_with_id']}, "
+                f"failed {stats['failed']} (file_id={stats['file_id']})"
+            )
+        else:
+            _send_telegram(msg)
 
     except Exception as e:
         log.error(f"_send_daily_summary error: {e}", exc_info=True)
@@ -1023,12 +1063,17 @@ def _generate_monthly_chart() -> bytes | None:
 
 def _send_telegram_animation(chat_id: int, animation_bytes: bytes,
                               caption: str = "", buttons: list | None = None,
-                              filename: str = "recap.mp4"):
+                              filename: str = "recap.mp4") -> str | None:
     """Envia animação via Telegram sendAnimation. Aceita GIF ou MP4 (H.264).
     Content-Type derivado da extensão do filename — MP4 dá melhor qualidade
-    pelo mesmo file size."""
+    pelo mesmo file size.
+
+    Returns the Telegram-assigned file_id on success (str) or None on
+    failure. The file_id can be reused with _send_telegram_animation_by_id
+    to fan out the same animation to many chats without re-uploading.
+    """
     if not TELEGRAM_BOT_TOKEN:
-        return
+        return None
     import urllib.request as _urllib
     content_type = "video/mp4" if filename.lower().endswith(".mp4") else "image/gif"
     try:
@@ -1057,9 +1102,80 @@ def _send_telegram_animation(chat_id: int, animation_bytes: bytes,
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAnimation"
         req = _urllib.Request(url, data=body,
                               headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-        _urllib.urlopen(req, timeout=60)
+        with _urllib.urlopen(req, timeout=60) as resp:
+            payload = json.loads(resp.read())
+        return ((payload.get("result") or {}).get("animation") or {}).get("file_id")
     except Exception as e:
         log.error(f"Telegram send_animation failed to {chat_id}: {e}")
+        return None
+
+
+def _send_telegram_animation_by_id(chat_id: int, file_id: str,
+                                    caption: str = "",
+                                    buttons: list | None = None) -> bool:
+    """Forward a previously-uploaded animation by its Telegram file_id.
+
+    Much cheaper than _send_telegram_animation: no file upload, just a
+    small JSON POST. Use this for fan-out after the first chat has been
+    served via the full multipart upload."""
+    if not TELEGRAM_BOT_TOKEN or not file_id:
+        return False
+    import urllib.request as _urllib
+    try:
+        payload = {
+            "chat_id":    str(chat_id),
+            "animation":  file_id,
+            "parse_mode": "HTML",
+        }
+        if caption:
+            payload["caption"] = caption
+        if buttons:
+            payload["reply_markup"] = {"inline_keyboard": buttons}
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAnimation"
+        req = _urllib.Request(url, data=json.dumps(payload).encode(),
+                              headers={"Content-Type": "application/json"})
+        _urllib.urlopen(req, timeout=10)
+        return True
+    except Exception as e:
+        log.error(f"Telegram send_animation_by_id failed to {chat_id}: {e}")
+        return False
+
+
+def _broadcast_telegram_animation(chat_ids: list, animation_bytes: bytes,
+                                   caption: str = "",
+                                   buttons: list | None = None,
+                                   filename: str = "recap.mp4") -> dict:
+    """Fan out one animation to many chats. Uploads the file ONCE to the
+    first chat, then forwards the rest via Telegram's file_id reuse —
+    O(1) bandwidth instead of O(N).
+    Returns {sent_with_upload, sent_with_id, failed, file_id}."""
+    if not chat_ids:
+        return {"sent_with_upload": 0, "sent_with_id": 0, "failed": 0, "file_id": None}
+    first, rest = chat_ids[0], chat_ids[1:]
+    file_id = _send_telegram_animation(first, animation_bytes, caption=caption,
+                                        buttons=buttons, filename=filename)
+    sent_with_upload = 1 if file_id is not None else 0
+    sent_with_id = 0
+    failed = 0
+    for cid in rest:
+        if file_id and _send_telegram_animation_by_id(cid, file_id,
+                                                       caption=caption,
+                                                       buttons=buttons):
+            sent_with_id += 1
+        else:
+            # First-send failed OR file_id wasn't returned → fall back to
+            # full upload per chat. Rare path; just keep delivery working.
+            if _send_telegram_animation(cid, animation_bytes, caption=caption,
+                                         buttons=buttons, filename=filename):
+                sent_with_upload += 1
+            else:
+                failed += 1
+    return {
+        "sent_with_upload": sent_with_upload,
+        "sent_with_id":     sent_with_id,
+        "failed":           failed,
+        "file_id":          file_id,
+    }
 
 
 def _send_telegram_photo(chat_id: int, photo_bytes: bytes,
