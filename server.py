@@ -831,7 +831,7 @@ def _send_daily_summary(days_back: int = 0, force_send: bool = False):
             biggest_win_block = [
                 "",
                 f"🎯 <b>Maior Odd do Dia:</b> {bw_odd:.2f}",
-                f"   <i>{bw_label} ({bw_market})</i>",
+                f"   <i>{_localize_pick_label(bw_label)} ({bw_market})</i>",
                 f"   <i>{bw_match}</i>",
                 f"   💰 Lucro gerado: <b>+€{bw_profit:.2f}</b>",
             ]
@@ -9097,6 +9097,34 @@ BETRADAR_BOT_USERNAME = "BetRadarAI_bot"
 BETRADAR_BOT_LINK     = f"https://t.me/{BETRADAR_BOT_USERNAME}"
 
 
+# Map of common English pick labels to pt-pt, applied to every user-facing
+# message (daily summary, match recap caption, daily recap caption, etc.).
+# Team-name labels (e.g. "Brazil -1.0") are pass-through — team names are
+# already what we want to show.
+_PICK_LABEL_PT = {
+    "Draw":           "Empate",
+    "Yes":            "Sim",
+    "No":             "Não",
+    "Both teams":     "Ambas Marcam",
+    "Both Teams":     "Ambas Marcam",
+    "Home":           "Casa",
+    "Away":           "Fora",
+}
+
+
+def _localize_pick_label(label: str) -> str:
+    """Translate a tip label to pt-pt for display. Falls through for labels
+    that are team names or already localised (e.g. 'Mais de 2.5')."""
+    if not label:
+        return label
+    s = label.strip()
+    if s in _PICK_LABEL_PT:
+        return _PICK_LABEL_PT[s]
+    if s.startswith("Over "):   return "Mais de "  + s[5:]
+    if s.startswith("Under "):  return "Menos de " + s[6:]
+    return label
+
+
 def _betradar_match_caption(match_id: int) -> str:
     """Build a Portuguese-language summary caption shown above the GIF in
     the BetRadarAI bot. Includes country flag emoji of the competition,
@@ -9176,7 +9204,7 @@ def _betradar_daily_caption(target_start_ts: int, target_end_ts: int,
     big_block = ""
     if biggest:
         bw_odd    = biggest["odd_entry"] or 0
-        bw_label  = biggest["label"] or "?"
+        bw_label  = _localize_pick_label(biggest["label"] or "?")
         bw_market = biggest["market"] or "?"
         bw_match  = f"{biggest['home_team']} vs {biggest['away_team']}" \
                     if biggest["home_team"] and biggest["away_team"] else "—"

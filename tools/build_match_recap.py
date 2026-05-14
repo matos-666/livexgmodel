@@ -83,6 +83,26 @@ DB_DEFAULT = "/tmp/tips_prod.db"
 _LOGO_CACHE: dict[int, Image.Image] = {}
 
 
+# Lightweight duplicate of server.py's _localize_pick_label so this module
+# stays standalone (CLI invocation does not import server.py). Keep the two
+# tables in sync if either is extended.
+_PICK_LABEL_PT = {
+    "Draw":       "Empate", "Yes": "Sim", "No": "Não",
+    "Both teams": "Ambas Marcam", "Both Teams": "Ambas Marcam",
+    "Home": "Casa", "Away": "Fora",
+}
+
+def localize_pick_label(label: str) -> str:
+    if not label:
+        return label
+    s = label.strip()
+    if s in _PICK_LABEL_PT:
+        return _PICK_LABEL_PT[s]
+    if s.startswith("Over "):  return "Mais de "  + s[5:]
+    if s.startswith("Under "): return "Menos de " + s[6:]
+    return label
+
+
 # ── Data loaders ───────────────────────────────────────────────────────────
 def load_match(match_id: int, db_path: str = DB_DEFAULT) -> dict:
     con = sqlite3.connect(db_path)
@@ -410,7 +430,8 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
                                 color=fg_clr, fontsize=7, fontweight="bold",
                                 ha="center", va="center", alpha=0)
         # Label
-        a_label = ax_list.text(pill_x + pill_w + 0.02, y, str(t["label"] or ""),
+        a_label = ax_list.text(pill_x + pill_w + 0.02, y,
+                                localize_pick_label(str(t["label"] or "")),
                                 transform=ax_list.transAxes,
                                 color=INK, fontsize=10, fontweight="600",
                                 ha="left", va="center", alpha=0)

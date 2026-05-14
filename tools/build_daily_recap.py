@@ -25,6 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 from matplotlib.patches import FancyBboxPatch
+from matplotlib.collections import PolyCollection
 
 # ── Palette (matches the BetRadar match-recap to stay consistent) ──────────
 BG          = "#ffffff"
@@ -34,10 +35,10 @@ INK         = "#1a2540"
 MUTED       = "#6b7280"
 SUBTLE      = "#d1d5db"
 GRID        = "#e5e7eb"
-GREEN       = "#16a34a"     # cumulative line (profit)
-GREEN_FILL  = "#bbf7d0"     # soft fill under the line
-RED         = "#dc2626"     # loss markers
-LIME_FILL   = "#dcfce7"
+GREEN       = "#16a34a"     # cumulative line when profitable
+GREEN_FILL  = "#bbf7d0"     # soft fill above zero
+RED         = "#dc2626"     # cumulative line when in red
+RED_FILL    = "#fecaca"     # soft fill below zero
 
 DB_DEFAULT  = "/tmp/tips_prod.db"
 
@@ -207,27 +208,46 @@ def build_daily_recap(target_start_ts: int, target_end_ts: int,
         # Build the partial curve up to the revealed index, with an
         # interpolated trailing point for smooth growth between picks.
         if revealed == 0 and fract == 0:
-            xs, ys = [0], [0]
+            xs, ys = [0], [0.0]
         else:
             xs = list(range(revealed + 1))     # 0..revealed inclusive
             ys = list(cum[: revealed + 1])
             if revealed < n and fract > 0:
-                # Add an interpolated trailing point
                 next_y = cum[revealed] + (cum[revealed + 1] - cum[revealed]) * fract
                 xs.append(revealed + fract)
                 ys.append(next_y)
-        line.set_data(xs, ys)
 
-        # Show markers for revealed picks
+        # Bi-color filled area: green above 0, red below 0. Re-drawn each
+        # frame on the partial xs/ys. Previous PolyCollection fills are
+        # removed before the new ones are added; scatter markers
+        # (PathCollection) and the line are untouched.
+        for c in list(ax_chart.collections):
+            if isinstance(c, PolyCollection):
+                c.remove()
+        if len(xs) >= 2:
+            ax_chart.fill_between(xs, 0, ys, step="post",
+                                   where=[y >= 0 for y in ys],
+                                   interpolate=False,
+                                   color=GREEN_FILL, alpha=0.55, zorder=2)
+            ax_chart.fill_between(xs, 0, ys, step="post",
+                                   where=[y < 0 for y in ys],
+                                   interpolate=False,
+                                   color=RED_FILL, alpha=0.55, zorder=2)
+
+        # Line: change colour according to CURRENT cumulative sign.
+        current_p = ys[-1] if ys else 0.0
+        line_color = GREEN if current_p >= 0 else RED
+        line.set_data(xs, ys)
+        line.set_color(line_color)
+
+        # Show markers for revealed picks (kept above the fill)
         for i, m in enumerate(marker_artists, start=1):
             m.set_alpha(1.0 if i <= revealed else 0.0)
 
-        # Update the big profit number to the running cumulative
-        current_p = ys[-1] if ys else 0.0
+        # Header big number — colour-coded too
         s = "+" if current_p >= 0 else "−"
-        clr = GREEN if current_p >= 0 else RED
         profit_text.set_text(f"{s}€{abs(current_p):,.2f}")
-        profit_text.set_color(clr)
+        profit_text.set_color(line_color)
         return []
 
     anim = FuncAnimation(fig, update, frames=total_frames, interval=1000 / fps, blit=False)
