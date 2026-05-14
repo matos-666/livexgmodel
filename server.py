@@ -6472,7 +6472,7 @@ def _build_xg_timeline_from_entry(entry: dict) -> list:
     return timeline
 
 
-def _wc2026_current_state(locale: str = "en") -> dict:
+def _wc2026_current_state(locale: str = "en", demo: bool = False) -> dict:
     """
     Decide which of the 5 widget states to render for the inbet WC 2026
     per-match widget, given the current clock + DB state.
@@ -6483,6 +6483,13 @@ def _wc2026_current_state(locale: str = "en") -> dict:
       results_losing       — last WC match finished, day P&L ≤ 0; show for 15 min then preview
       preview              — next WC match upcoming, show pre-match card
       off_day              — no WC match in next 24h
+
+    Args:
+      demo — when True, drops the WC tournament filter AND the WC date window
+             so the same state machine can run against ANY currently
+             monitored fixture. Used by the staging widget URL so dev
+             teams can rehearse end-to-end against live non-WC games
+             before the tournament starts.
     """
     from datetime import datetime, timezone, timedelta
     now_ts = int(time.time())
@@ -6490,9 +6497,13 @@ def _wc2026_current_state(locale: str = "en") -> dict:
     variant_norms = {_normalize_tournament(v) for v in variants}
 
     def _is_wc(tourn: str) -> bool:
+        # Demo mode: accept everything (any tournament passes the filter).
+        if demo:
+            return True
         return _normalize_tournament(tourn or "") in variant_norms
 
-    # 1. Currently-live WC match (from in-memory _live_state)
+    # 1. Currently-live match (WC by default; any monitored match in demo mode).
+    # Pick the FIRST one we find — for demo this means the top of _live_state.
     live_wc_entry = None
     try:
         with _state_lock:
@@ -6521,7 +6532,9 @@ def _wc2026_current_state(locale: str = "en") -> dict:
             ts = m.get("startTimestamp") or 0
             if ts <= now_ts:
                 continue
-            if not (WC2026_START_TS <= ts <= WC2026_END_TS):
+            # WC date-window filter only applies in real WC mode; demo mode
+            # accepts any monitored upcoming fixture.
+            if not demo and not (WC2026_START_TS <= ts <= WC2026_END_TS):
                 continue
             if not _is_wc(m.get("tournament", "")):
                 continue
@@ -6538,15 +6551,28 @@ def _wc2026_current_state(locale: str = "en") -> dict:
         STAKE = get_setting("stake_per_bet", 100.0) or 100.0
         placeholders = ",".join("?" * len(variants))
         with _db() as conn:
-            row = conn.execute(
-                f"SELECT id, home_team, away_team, home_goals, away_goals, "
-                f"       start_ts, tournament, country, archived_at "
-                f"FROM games WHERE is_finished = 1 "
-                f"AND tournament IN ({placeholders}) "
-                f"AND start_ts >= ? AND start_ts <= ? "
-                f"ORDER BY start_ts DESC LIMIT 1",
-                (*variants, WC2026_START_TS, WC2026_END_TS)
-            ).fetchone()
+            if demo:
+                # Demo: most recent finished game in the last 24h, ANY tournament.
+                # Bounded to the last day so we don't pull a 6-month-old game
+                # if there's nothing fresh.
+                row = conn.execute(
+                    "SELECT id, home_team, away_team, home_goals, away_goals, "
+                    "       start_ts, tournament, country, archived_at "
+                    "FROM games WHERE is_finished = 1 "
+                    "AND start_ts >= ? "
+                    "ORDER BY start_ts DESC LIMIT 1",
+                    (now_ts - 86400,)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    f"SELECT id, home_team, away_team, home_goals, away_goals, "
+                    f"       start_ts, tournament, country, archived_at "
+                    f"FROM games WHERE is_finished = 1 "
+                    f"AND tournament IN ({placeholders}) "
+                    f"AND start_ts >= ? AND start_ts <= ? "
+                    f"ORDER BY start_ts DESC LIMIT 1",
+                    (*variants, WC2026_START_TS, WC2026_END_TS)
+                ).fetchone()
             if row:
                 last_finished = dict(row)
                 pick_rows = conn.execute(
@@ -7335,10 +7361,15 @@ def r_wc2026_current_json():
         lang      — en | es | pt-pt | pt-br
         mock      — force one of the 5 states with synthetic data (test only)
         match_id  — override WC filter, use any monitored live match (test only)
+        demo      — full state machine without WC filter; picks the first
+                    monitored live match (any tournament), shows results when
+                    it ends, then transitions to the next monitored fixture.
+                    Used by the staging widget URL for end-to-end dev testing.
     """
     locale = _widget_locale(flask_request.args.get("lang"))
     mock     = (flask_request.args.get("mock") or "").strip().lower()
     match_id = (flask_request.args.get("match_id") or "").strip()
+    demo     = (flask_request.args.get("demo") or "").strip().lower() in ("1", "true", "yes", "on")
 
     if mock:
         canonical = _MOCK_STATE_ALIASES.get(mock, "off_day")
@@ -7346,7 +7377,7 @@ def r_wc2026_current_json():
     elif match_id.isdigit():
         data = _wc2026_current_state_for_match(int(match_id), locale)
     else:
-        data = _wc2026_current_state(locale)
+        data = _wc2026_current_state(locale, demo=demo)
 
     # Final localisation pass — translates market names and pick labels.
     # Mock data ships canonical English names; real data comes straight from
@@ -7354,7 +7385,7 @@ def r_wc2026_current_json():
     data = _localize_current_payload(data, locale)
 
     return jsonify(data), 200, {
-        "Cache-Control": "no-store" if (mock or match_id) else "public, max-age=15",
+        "Cache-Control": "no-store" if (mock or match_id or demo) else "public, max-age=15",
         "Access-Control-Allow-Origin": "*",
     }
 
@@ -7495,14 +7526,18 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
 (function(){{
   const params  = new URLSearchParams(location.search);
   const lang    = params.get('lang')  || 'en';
-  // Test affordances: ?mock=<state> forces a hardcoded state, ?match_id=<id>
-  // pulls any monitored live match (lets us rehearse on non-WC fixtures before
-  // 11 June 2026). Both query params are forwarded to the JSON endpoint.
+  // Test affordances forwarded to the JSON endpoint:
+  //   ?mock=<state>   — hardcoded payload for one of the 5 states
+  //   ?match_id=<id>  — track ONE specific live match by id
+  //   ?demo=1         — full state machine using ANY monitored fixture (no
+  //                     WC tournament filter); ideal for dev/staging tests
   const mock     = params.get('mock');
   const matchId  = params.get('match_id');
+  const demo     = params.get('demo');
   let apiUrl  = '/api/wc2026/current.json?lang=' + encodeURIComponent(lang);
   if (mock)    apiUrl += '&mock='     + encodeURIComponent(mock);
   if (matchId) apiUrl += '&match_id=' + encodeURIComponent(matchId);
+  if (demo)    apiUrl += '&demo='     + encodeURIComponent(demo);
   const root    = document.getElementById('app');
   const pillBox = document.getElementById('status-pill');
   let timer;
