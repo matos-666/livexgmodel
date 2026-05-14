@@ -58,6 +58,8 @@ _session = None
 # top-down: each key is used until its remaining requests drop below
 # ODDS_API_KEY_THRESHOLD, at which point the next key takes over.
 _DEFAULT_ODDS_KEYS = [
+    "a1b39abfff67accdfaf3c2adb167e685",  # fresh — added 2026-05-14
+    "e85703a4e55ec785b5d1af5491e58025",  # fresh — added 2026-05-14
     "5094ec093e7ba2417b13f97b28c8c31e",  # fresh — added 2026-05-13
     "47584ba207a1c72c88c1c8ab031c1679",  # fresh — added 2026-05-13
     "482e6787f85ae37796b502840e057623",  # fresh — added 2026-05-13
@@ -5645,8 +5647,15 @@ def r_today_monitored():
             # Extract tournament name (could be dict or string)
             tourn = m.get("tournament", {})
             tourn_name = tourn.get("name", "") if isinstance(tourn, dict) else str(tourn or "")
-            country = m.get("country", {})
-            country_name = country.get("name", "") if isinstance(country, dict) else str(country or "")
+            # Sofascore exposes country as `tournament.category.name`, NOT as a
+            # top-level `event.country` field. Reading the wrong path silently
+            # returned "" → _is_monitored_league_strict rejected every league
+            # that requires a country match (LaLiga/Premier/Bundesliga/etc.)
+            # so the "agendados hoje" tab dropped most of the day's fixtures.
+            if isinstance(tourn, dict):
+                country_name = (tourn.get("category") or {}).get("name", "")
+            else:
+                country_name = ""
 
             if _is_monitored_league_strict(tourn_name, country_name):
                 sk = _resolve_sport_key(tourn_name, country_name)
