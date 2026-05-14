@@ -7409,17 +7409,38 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
   .flag-inline{{height:18px;width:auto;border-radius:2px;vertical-align:middle;margin:0 4px;box-shadow:0 1px 3px rgba(0,0,0,.2)}}
   .flag{{font-size:1.4rem;line-height:1}}
   .flag-fallback{{font-size:1.4rem}}
-  /* Upcoming-matches list (off_day state) */
-  .upcoming-list{{display:flex;flex-direction:column;gap:8px;margin-top:6px}}
-  .upcoming-row{{display:flex;align-items:center;justify-content:space-between;
-    padding:12px 14px;background:var(--card);border:1px solid var(--border);
-    border-radius:10px;gap:12px;font-size:.92rem}}
-  .upcoming-teams{{display:flex;align-items:center;gap:10px;min-width:0;flex:1}}
-  .upcoming-vs{{color:var(--meta);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}}
-  .upcoming-team{{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-  .upcoming-when{{display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex-shrink:0}}
-  .upcoming-when .day{{font-size:.72rem;color:var(--meta);text-transform:uppercase;letter-spacing:.05em}}
-  .upcoming-when .time{{font-weight:700;font-size:1rem;color:var(--accent)}}
+  /* Upcoming-matches list (off_day state) — symmetric layout matching the
+     InBet members-area look: team name + logo left, time stacked centred,
+     logo + team name right. */
+  .upcoming-list{{display:flex;flex-direction:column;gap:10px;margin-top:6px}}
+  .upcoming-row{{
+    display:grid;
+    grid-template-columns:1fr auto 1fr;
+    align-items:center;
+    padding:14px 16px;
+    background:var(--card);border:1px solid var(--border);
+    border-radius:12px;gap:14px;
+  }}
+  .upcoming-side{{display:flex;align-items:center;gap:12px;min-width:0}}
+  .upcoming-side.home{{justify-content:flex-end}}
+  .upcoming-side.away{{justify-content:flex-start}}
+  .upcoming-team{{font-weight:700;font-size:1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+  .upcoming-mid{{display:flex;flex-direction:column;align-items:center;gap:1px;padding:0 10px;line-height:1.15}}
+  .upcoming-mid .day{{font-size:.68rem;color:var(--meta);text-transform:uppercase;letter-spacing:.06em}}
+  .upcoming-mid .time{{font-weight:800;font-size:1.15rem;color:var(--accent)}}
+  .upcoming-mid .vs{{font-size:.7rem;color:var(--meta);margin-top:2px;text-transform:uppercase;letter-spacing:.08em}}
+  /* Override the global .flag-img 56px height — upcoming list uses smaller flags */
+  .upcoming-row .flag-img{{height:32px}}
+  /* Mobile / narrow iframes: shrink everything proportionally */
+  @media (max-width: 520px){{
+    .upcoming-row{{padding:10px 10px;gap:8px;grid-template-columns:1fr auto 1fr}}
+    .upcoming-side{{gap:7px}}
+    .upcoming-team{{font-size:.85rem}}
+    .upcoming-mid{{padding:0 4px}}
+    .upcoming-mid .time{{font-size:.95rem}}
+    .upcoming-mid .day,.upcoming-mid .vs{{font-size:.62rem}}
+    .upcoming-row .flag-img{{height:22px}}
+  }}
   .score{{font-size:1.8rem;font-weight:800;letter-spacing:.05em;padding:0 14px;color:var(--text);min-width:90px;text-align:center}}
   .meta-line{{font-size:.78rem;color:var(--meta);text-align:center;margin-top:10px}}
   .section-title{{font-size:.72rem;color:var(--meta);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 8px}}
@@ -7774,8 +7795,9 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
       ? '<div class="countdown"><div class="label">' + t('wc_resumes_in') + '</div><div class="value">' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div></div>'
       : '';
 
-    // List of next 3 upcoming WC fixtures. Each row: home flag + name · vs ·
-    // away name + flag · day-of-week + kickoff time (local browser TZ).
+    // List of next 3 upcoming WC fixtures, InBet-style layout:
+    //   [team-home  flag]   [DAY/TIME/VS]   [flag  team-away]
+    // CSS centres the middle column and shrinks flags + fonts on mobile.
     const list = Array.isArray(d.upcoming_matches) ? d.upcoming_matches : [];
     let listHtml = '';
     if (list.length > 0) {{
@@ -7787,16 +7809,18 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
             const time = dt.toLocaleTimeString(undefined, {{hour:'2-digit', minute:'2-digit'}});
             return ''
               + '<div class="upcoming-row">'
-              +   '<div class="upcoming-teams">'
-              +     flagImg(m.home, 22)
+              +   '<div class="upcoming-side home">'
               +     '<span class="upcoming-team">' + (m.home || '') + '</span>'
-              +     '<span class="upcoming-vs">vs</span>'
-              +     '<span class="upcoming-team">' + (m.away || '') + '</span>'
-              +     flagImg(m.away, 22)
+              +     flagImg(m.home, 32)
               +   '</div>'
-              +   '<div class="upcoming-when">'
+              +   '<div class="upcoming-mid">'
               +     '<span class="day">' + day + '</span>'
               +     '<span class="time">' + time + '</span>'
+              +     '<span class="vs">vs</span>'
+              +   '</div>'
+              +   '<div class="upcoming-side away">'
+              +     flagImg(m.away, 32)
+              +     '<span class="upcoming-team">' + (m.away || '') + '</span>'
               +   '</div>'
               + '</div>';
           }}).join('')
