@@ -48,10 +48,10 @@ AWAY_CLR    = "#f97316"   # orange
 GOAL_CLR    = "#fbbf24"   # gold star
 HT_CLR      = "#94a3b8"
 
-# Result badges
-WIN_BG, WIN_FG     = "#dcfce7", "#15803d"
-LOSS_BG, LOSS_FG   = "#fee2e2", "#b91c1c"
-VOID_BG, VOID_FG   = "#e5e7eb", "#6b7280"
+# Result badges — labels in pt-pt to match the bot's primary audience.
+WIN_LABEL, WIN_BG, WIN_FG     = "✓ GANHA",   "#dcfce7", "#15803d"
+LOSS_LABEL, LOSS_BG, LOSS_FG  = "✗ PERDIDA", "#fee2e2", "#b91c1c"
+VOID_LABEL, VOID_BG, VOID_FG  = "↔ ANULADA", "#e5e7eb", "#6b7280"
 
 # Market pill colours
 MARKET_PILLS = {
@@ -187,9 +187,9 @@ def tip_profit(t: dict) -> float:
 
 def result_chip(r: str) -> tuple[str, str, str]:
     r = (r or "").lower()
-    if r in ("green", "win"):  return ("✓ WON",  WIN_BG,  WIN_FG)
-    if r in ("red", "loss"):   return ("✗ LOST", LOSS_BG, LOSS_FG)
-    return ("↔ VOID", VOID_BG, VOID_FG)
+    if r in ("green", "win"):  return (WIN_LABEL,  WIN_BG,  WIN_FG)
+    if r in ("red", "loss"):   return (LOSS_LABEL, LOSS_BG, LOSS_FG)
+    return (VOID_LABEL, VOID_BG, VOID_FG)
 
 
 # ── Animation ──────────────────────────────────────────────────────────────
@@ -212,39 +212,48 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
     logo_home = fetch_team_logo(g.get("home_team_id"))
     logo_away = fetch_team_logo(g.get("away_team_id"))
 
-    # ── Figure layout: header strip / chart / picks list ──────────────────
-    fig = plt.figure(figsize=(6.8, 7.2), dpi=100, facecolor=BG)
+    # ── Figure layout: header / chart / picks list ────────────────────────
+    # DPI bumped from 90 → 130 for retina-sharp playback on mobile Telegram.
+    # Header height ratio increased so logos + score + names don't overlap.
+    fig = plt.figure(figsize=(6.8, 7.5), dpi=130, facecolor=BG)
     gs  = fig.add_gridspec(
         nrows=3, ncols=1,
-        height_ratios=[0.22, 0.50, 0.28],
-        hspace=0.18, left=0.06, right=0.96, top=0.96, bottom=0.04,
+        height_ratios=[0.26, 0.48, 0.26],
+        hspace=0.20, left=0.06, right=0.96, top=0.97, bottom=0.04,
     )
     ax_head  = fig.add_subplot(gs[0]); ax_head.axis("off"); ax_head.set_facecolor(BG)
     ax_chart = fig.add_subplot(gs[1]); ax_chart.set_facecolor(SOFT)
     ax_list  = fig.add_subplot(gs[2]); ax_list.axis("off"); ax_list.set_facecolor(BG)
 
     # ── HEADER ────────────────────────────────────────────────────────────
+    # Top strip: tournament/country (left) · FINISHED chip (right)
     tournament_line = f"{g['tournament']}"
     if g.get("country"):
         tournament_line += f" · {g['country']}"
-    ax_head.text(0.02, 0.86, tournament_line, transform=ax_head.transAxes,
+    ax_head.text(0.02, 0.92, tournament_line, transform=ax_head.transAxes,
                  color=MUTED, fontsize=9, fontweight="bold", va="top")
-    # FINISHED chip top-right
-    chip = FancyBboxPatch((0.86, 0.78), 0.13, 0.13,
+    chip = FancyBboxPatch((0.85, 0.84), 0.14, 0.12,
                           boxstyle="round,pad=0.01,rounding_size=0.04",
                           transform=ax_head.transAxes,
                           facecolor=SOFT, edgecolor=SUBTLE, linewidth=1)
     ax_head.add_patch(chip)
-    ax_head.text(0.925, 0.845, "FINISHED", transform=ax_head.transAxes,
+    ax_head.text(0.92, 0.90, "TERMINADO", transform=ax_head.transAxes,
                  color=MUTED, fontsize=7, fontweight="bold",
                  ha="center", va="center")
 
-    # Team names + score row. Position logos with OffsetImage when available.
-    # Layout columns (in axes coords): home logo 0.16 · home name 0.32 ·
-    #                                  score 0.50 · away name 0.68 · away logo 0.84
+    # Layout in 5 columns to prevent the long team names from colliding
+    # with the centred score (the v1 overlap bug). Logos sit at the edges;
+    # team names sit immediately next to their logo (justified inward);
+    # the score lives alone in the middle column.
+    LOGO_HOME_X, LOGO_AWAY_X = 0.07, 0.93
+    NAME_HOME_X, NAME_AWAY_X = 0.18, 0.82
+    DOT_HOME_X,  DOT_AWAY_X  = 0.155, 0.845
+    SCORE_X = 0.50
+    Y_ROW = 0.40  # vertical centre of the row
+
     def _draw_logo(img: Image.Image | None, x: float, y: float, fallback_color: str):
         if img is not None:
-            oi = OffsetImage(img, zoom=0.32)
+            oi = OffsetImage(img, zoom=0.42)
             ab = AnnotationBbox(oi, (x, y), xycoords=ax_head.transAxes,
                                 frameon=False, box_alignment=(0.5, 0.5))
             ax_head.add_artist(ab)
@@ -252,22 +261,28 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
             ax_head.scatter([x], [y], s=900, transform=ax_head.transAxes,
                             facecolor=fallback_color, edgecolor=SUBTLE, linewidths=1.5)
 
-    _draw_logo(logo_home, 0.18, 0.36, HOME_CLR)
-    _draw_logo(logo_away, 0.82, 0.36, AWAY_CLR)
+    _draw_logo(logo_home, LOGO_HOME_X, Y_ROW, HOME_CLR)
+    _draw_logo(logo_away, LOGO_AWAY_X, Y_ROW, AWAY_CLR)
 
-    # Home / away dot + name
-    ax_head.text(0.32, 0.36, home_name, transform=ax_head.transAxes,
-                 color=INK, fontsize=13, fontweight="bold", ha="left", va="center")
-    ax_head.text(0.30, 0.36, "●", transform=ax_head.transAxes,
-                 color=HOME_CLR, fontsize=10, ha="right", va="center")
-    ax_head.text(0.68, 0.36, away_name, transform=ax_head.transAxes,
-                 color=INK, fontsize=13, fontweight="bold", ha="right", va="center")
-    ax_head.text(0.70, 0.36, "●", transform=ax_head.transAxes,
-                 color=AWAY_CLR, fontsize=10, ha="left", va="center")
+    # Home name: left-aligned starting after the home logo. Coloured dot to
+    # the left. Bounded so very long names truncate via clip rather than
+    # spilling into the score column.
+    ax_head.text(DOT_HOME_X, Y_ROW, "●", transform=ax_head.transAxes,
+                 color=HOME_CLR, fontsize=11, ha="left", va="center")
+    ax_head.text(NAME_HOME_X, Y_ROW, home_name, transform=ax_head.transAxes,
+                 color=INK, fontsize=12, fontweight="bold",
+                 ha="left", va="center", clip_on=True)
+    # Away name: right-aligned ending before the away logo.
+    ax_head.text(DOT_AWAY_X, Y_ROW, "●", transform=ax_head.transAxes,
+                 color=AWAY_CLR, fontsize=11, ha="right", va="center")
+    ax_head.text(NAME_AWAY_X, Y_ROW, away_name, transform=ax_head.transAxes,
+                 color=INK, fontsize=12, fontweight="bold",
+                 ha="right", va="center", clip_on=True)
 
-    # Score big
-    ax_head.text(0.50, 0.36, score, transform=ax_head.transAxes,
-                 color=INK, fontsize=22, fontweight="800",
+    # Score sits BELOW the names so a long team name can never collide with
+    # it. Larger font for visual weight.
+    ax_head.text(SCORE_X, 0.08, score, transform=ax_head.transAxes,
+                 color=INK, fontsize=26, fontweight="800",
                  ha="center", va="center")
 
     # ── CHART AXES ────────────────────────────────────────────────────────
@@ -289,15 +304,15 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
     ax_chart.spines["right"].set_visible(False)
     ax_chart.grid(color=GRID, alpha=0.7, linestyle="--", linewidth=0.6, axis="y")
     ax_chart.set_axisbelow(True)
-    ax_chart.set_title("XG TIMELINE REPLAY", loc="left", color=INK, fontsize=10,
+    ax_chart.set_title("REPLAY DA TIMELINE xG", loc="left", color=INK, fontsize=10,
                         fontweight="bold", pad=14, x=0.0, y=1.04)
-    ax_chart.text(0.0, 1.02, "How the algorithm tracked momentum",
+    ax_chart.text(0.0, 1.02, "Como o algoritmo seguiu o jogo",
                   transform=ax_chart.transAxes, color=MUTED, fontsize=8,
                   ha="left", va="bottom", style="italic")
 
-    # HT line (45')
+    # Intervalo line (45')
     ax_chart.axvline(45, color=HT_CLR, linewidth=1, linestyle=":", alpha=0.6, zorder=1)
-    ax_chart.text(45, max_xg * 0.97, "HT", color=MUTED, fontsize=7,
+    ax_chart.text(45, max_xg * 0.97, "INT", color=MUTED, fontsize=7,
                   ha="center", va="top", alpha=0.7, fontweight="bold")
 
     # Static placeholders (filled per frame)
@@ -336,12 +351,15 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
     # Play cursor (moving vertical line as time advances)
     play_cursor = ax_chart.axvline(0, color=INK, linewidth=1, alpha=0.25, zorder=2)
 
-    # Legend manually drawn at top-right of chart
-    ax_chart.text(0.99, 1.04, f"●", transform=ax_chart.transAxes,
-                  color=HOME_CLR, fontsize=11, ha="right", va="bottom")
-    ax_chart.text(0.99, 1.04, f"           {home_name}   ",
-                  transform=ax_chart.transAxes, color=INK, fontsize=8,
-                  ha="right", va="bottom")
+    # Legend inside chart, bottom-right. Two dot-name chips, neutral spacing.
+    ax_chart.text(0.99, 0.97, f"●  {home_name}",
+                  transform=ax_chart.transAxes,
+                  color=HOME_CLR, fontsize=8, fontweight="bold",
+                  ha="right", va="top")
+    ax_chart.text(0.99, 0.91, f"●  {away_name}",
+                  transform=ax_chart.transAxes,
+                  color=AWAY_CLR, fontsize=8, fontweight="bold",
+                  ha="right", va="top")
 
     # ── PICKS LIST ────────────────────────────────────────────────────────
     # Render row layout once, set alpha 0; reveal per frame as match clock
@@ -449,7 +467,7 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
 
     anim = FuncAnimation(fig, update, frames=total_frames, interval=1000 / fps, blit=False)
     writer = PillowWriter(fps=fps)
-    anim.save(out_path, writer=writer, dpi=90, savefig_kwargs={"facecolor": BG})
+    anim.save(out_path, writer=writer, dpi=130, savefig_kwargs={"facecolor": BG})
     plt.close(fig)
 
     size_kb = Path(out_path).stat().st_size // 1024

@@ -9091,13 +9091,17 @@ def r_refresh_logos():
 
 
 # ─── BetRadarAI match recap (animated GIF + caption) ────────────────────────
+BETRADAR_BOT_USERNAME = "BetRadarAI_bot"
+BETRADAR_BOT_LINK     = f"https://t.me/{BETRADAR_BOT_USERNAME}"
+
+
 def _betradar_match_caption(match_id: int) -> str:
     """Build a Portuguese-language summary caption shown above the GIF in
-    the BetRadarAI bot. Numbers are derived from the DB so the text matches
-    the visual frames."""
+    the BetRadarAI bot. Includes country flag emoji of the competition,
+    win/loss counts with green accents, and a share CTA at the bottom."""
     with _db() as conn:
         g = conn.execute(
-            "SELECT home_team, away_team, home_goals, away_goals, tournament "
+            "SELECT home_team, away_team, home_goals, away_goals, tournament, country "
             "FROM games WHERE id = ?", (match_id,)
         ).fetchone()
         tips = conn.execute(
@@ -9118,14 +9122,39 @@ def _betradar_match_caption(match_id: int) -> str:
             profit -= 1.0
     eur = profit * 100  # 1u stake = €100 convention
     sign = "+" if profit > 0 else ""
+    flag = _country_flag(g["country"] or "") or "🌍"
+
     return (
-        f"🏆 <b>{g['tournament']}</b>\n"
-        f"<b>{g['home_team']} {g['home_goals']}–{g['away_goals']} {g['away_team']}</b>\n\n"
-        f"🤖 O algoritmo emitiu <b>{len(tips)} picks</b> neste jogo:\n"
-        f"  ✓ {wins} verdes\n"
-        f"  ✗ {losses} reds\n\n"
-        f"💰 Lucro: <b>{sign}{profit:.2f}u (~€{eur:+.0f})</b>"
+        f"{flag} <b>{g['tournament']}</b>\n"
+        f"⚽ <b>{g['home_team']} {g['home_goals']}–{g['away_goals']} {g['away_team']}</b>\n"
+        f"\n"
+        f"🤖 O algoritmo lançou <b>{len(tips)} picks</b>:\n"
+        f"  🟢 <b>{wins}</b> ganhas\n"
+        f"  🔴 <b>{losses}</b> perdidas\n"
+        f"\n"
+        f"💰 Lucro: <b>{sign}{profit:.2f}u  (~€{eur:+.0f})</b> ✅\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📲 Recebe estas picks em tempo real:\n"
+        f"👉 @{BETRADAR_BOT_USERNAME}\n"
+        f"🔗 {BETRADAR_BOT_LINK}\n"
+        f"━━━━━━━━━━━━━━━━━━"
     )
+
+
+def _betradar_share_buttons() -> list:
+    """Inline keyboard for the recap message: opens the bot OR shares it to
+    another Telegram chat via the native switch_inline_query selector."""
+    return [
+        [
+            {"text": "📲 Abrir bot", "url": BETRADAR_BOT_LINK},
+            {"text": "🔗 Partilhar com amigos",
+             "switch_inline_query": (
+                 "Live xG picks de futebol gratuitas — "
+                 f"junta-te a @{BETRADAR_BOT_USERNAME}"
+             )},
+        ],
+    ]
 
 
 @app.route("/api/admin/betradar/recap/<int:match_id>", methods=["POST", "GET"])
@@ -9164,7 +9193,8 @@ def r_betradar_recap(match_id: int):
         return jsonify({"ok": False, "error": f"build failed: {e}"}), 500
 
     caption = _betradar_match_caption(match_id)
-    _send_telegram_animation(chat_id, gif_bytes, caption=caption)
+    _send_telegram_animation(chat_id, gif_bytes, caption=caption,
+                              buttons=_betradar_share_buttons())
 
     return jsonify({
         "ok":         True,
