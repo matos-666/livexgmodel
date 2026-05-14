@@ -3880,6 +3880,7 @@ WIDGET_COPY: dict = {
         "kickoff_in":      "Kickoff in",
         "model_preview":   "Model preview",
         "wc_resumes_in":   "World Cup resumes in",
+        "upcoming_matches": "Upcoming matches",
         # result badges
         "result_won":      "Won",
         "result_lost":     "Lost",
@@ -3918,6 +3919,7 @@ WIDGET_COPY: dict = {
         "kickoff_in":      "Inicio en",
         "model_preview":   "Previa del modelo",
         "wc_resumes_in":   "El Mundial vuelve en",
+        "upcoming_matches": "Próximos partidos",
         "result_won":      "Ganada",
         "result_lost":     "Perdida",
         "result_push":     "Empate",
@@ -3951,6 +3953,7 @@ WIDGET_COPY: dict = {
         "kickoff_in":      "Início em",
         "model_preview":   "Antevisão do modelo",
         "wc_resumes_in":   "Mundial regressa em",
+        "upcoming_matches": "Próximos jogos",
         "result_won":      "Ganha",
         "result_lost":     "Perdida",
         "result_push":     "Empate",
@@ -3984,6 +3987,7 @@ WIDGET_COPY: dict = {
         "kickoff_in":      "Início em",
         "model_preview":   "Prévia do modelo",
         "wc_resumes_in":   "Copa volta em",
+        "upcoming_matches": "Próximos jogos",
         "result_won":      "Ganha",
         "result_lost":     "Perdida",
         "result_push":     "Empate",
@@ -6502,9 +6506,11 @@ def _wc2026_current_state(locale: str = "en") -> dict:
     except Exception as e:
         log.warning(f"_wc2026_current_state: live scan failed: {e}")
 
-    # 2. Next scheduled WC match (from _upcoming_cache, next 4 days)
-    next_match = None
-    next_kickoff_ts = None
+    # 2. Next scheduled WC matches (from _upcoming_cache, next 4 days).
+    # Collects ALL upcoming WC fixtures in window so the off_day card can
+    # render the next 3, then `next_match` is just the chronologically first
+    # one (same value as before for backwards compatibility).
+    upcoming_wc = []
     now_utc = datetime.now(timezone.utc)
     for offset in range(0, 4):
         date_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
@@ -6519,9 +6525,10 @@ def _wc2026_current_state(locale: str = "en") -> dict:
                 continue
             if not _is_wc(m.get("tournament", "")):
                 continue
-            if next_kickoff_ts is None or ts < next_kickoff_ts:
-                next_match = m
-                next_kickoff_ts = ts
+            upcoming_wc.append((ts, m))
+    upcoming_wc.sort(key=lambda x: x[0])
+    next_match = upcoming_wc[0][1] if upcoming_wc else None
+    next_kickoff_ts = upcoming_wc[0][0] if upcoming_wc else None
 
     # 3. Most recently finished WC match (from DB)
     last_finished = None
@@ -6703,6 +6710,20 @@ def _wc2026_current_state(locale: str = "en") -> dict:
     if state == "live" and live_wc_entry is not None:
         xg_timeline = _build_xg_timeline_from_entry(live_wc_entry)
 
+    # Next 3 upcoming WC fixtures — used by the off_day card to surface
+    # what's coming, instead of just a single countdown.
+    upcoming_matches_payload = [
+        {
+            "id":          m.get("id"),
+            "home":        m.get("homeTeam"),
+            "away":        m.get("awayTeam"),
+            "country":     m.get("country", ""),
+            "tournament":  m.get("tournament", ""),
+            "kickoff_ts":  ts,
+        }
+        for (ts, m) in upcoming_wc[:3]
+    ]
+
     return {
         "state":                       state,
         "lang":                        locale,
@@ -6710,6 +6731,7 @@ def _wc2026_current_state(locale: str = "en") -> dict:
         "picks":                       picks_payload,
         "match_pnl":                   match_pnl,
         "next_match":                  next_match_payload,
+        "upcoming_matches":            upcoming_matches_payload,
         "countdown_to_next_kickoff_s": countdown_s,
         "model_preview_text":          model_preview_text,
         "wc_emblem":                   WC2026_EMBLEM_URL,
@@ -7115,15 +7137,34 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
         })
 
     elif state == "off_day":
-        base.update({
-            "state": "off_day",
-            "next_match": {
+        # Three upcoming WC fixtures spread across the next ~2 days, in
+        # chronological order. The first one is also surfaced as next_match
+        # for backwards-compat with the existing countdown logic.
+        upcoming = [
+            {
                 "id": 99000005, "home": xl("South Africa"), "away": xl("Mexico"),
                 "country": "MEX (Mock)",
                 "tournament": "FIFA World Cup 2026 — Opening Match",
                 "kickoff_ts": now_ts + 2 * 86400 + 4 * 3600,
             },
-            "countdown_to_next_kickoff_s": 2 * 86400 + 4 * 3600,
+            {
+                "id": 99000006, "home": xl("France"), "away": xl("Croatia"),
+                "country": "USA (Mock)",
+                "tournament": "FIFA World Cup 2026 — Group Stage",
+                "kickoff_ts": now_ts + 2 * 86400 + 7 * 3600,
+            },
+            {
+                "id": 99000007, "home": xl("Brazil"), "away": xl("Spain"),
+                "country": "CAN (Mock)",
+                "tournament": "FIFA World Cup 2026 — Group Stage",
+                "kickoff_ts": now_ts + 2 * 86400 + 10 * 3600,
+            },
+        ]
+        base.update({
+            "state": "off_day",
+            "next_match": upcoming[0],
+            "upcoming_matches": upcoming,
+            "countdown_to_next_kickoff_s": upcoming[0]["kickoff_ts"] - now_ts,
             "next_poll_after_ms": 300_000,
         })
 
@@ -7368,6 +7409,17 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
   .flag-inline{{height:18px;width:auto;border-radius:2px;vertical-align:middle;margin:0 4px;box-shadow:0 1px 3px rgba(0,0,0,.2)}}
   .flag{{font-size:1.4rem;line-height:1}}
   .flag-fallback{{font-size:1.4rem}}
+  /* Upcoming-matches list (off_day state) */
+  .upcoming-list{{display:flex;flex-direction:column;gap:8px;margin-top:6px}}
+  .upcoming-row{{display:flex;align-items:center;justify-content:space-between;
+    padding:12px 14px;background:var(--card);border:1px solid var(--border);
+    border-radius:10px;gap:12px;font-size:.92rem}}
+  .upcoming-teams{{display:flex;align-items:center;gap:10px;min-width:0;flex:1}}
+  .upcoming-vs{{color:var(--meta);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}}
+  .upcoming-team{{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+  .upcoming-when{{display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex-shrink:0}}
+  .upcoming-when .day{{font-size:.72rem;color:var(--meta);text-transform:uppercase;letter-spacing:.05em}}
+  .upcoming-when .time{{font-weight:700;font-size:1rem;color:var(--accent)}}
   .score{{font-size:1.8rem;font-weight:800;letter-spacing:.05em;padding:0 14px;color:var(--text);min-width:90px;text-align:center}}
   .meta-line{{font-size:.78rem;color:var(--meta);text-align:center;margin-top:10px}}
   .section-title{{font-size:.72rem;color:var(--meta);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 8px}}
@@ -7720,8 +7772,39 @@ _WC_WIDGET_MATCH_HTML = """<!DOCTYPE html>
   function renderOffDay(d){{
     const cd = d.countdown_to_next_kickoff_s != null
       ? '<div class="countdown"><div class="label">' + t('wc_resumes_in') + '</div><div class="value">' + fmtCountdown(d.countdown_to_next_kickoff_s) + '</div></div>'
-      : '<div class="empty">' + t('no_live_match') + '</div>';
-    return cd;
+      : '';
+
+    // List of next 3 upcoming WC fixtures. Each row: home flag + name · vs ·
+    // away name + flag · day-of-week + kickoff time (local browser TZ).
+    const list = Array.isArray(d.upcoming_matches) ? d.upcoming_matches : [];
+    let listHtml = '';
+    if (list.length > 0) {{
+      listHtml = '<div class="section-title">' + t('upcoming_matches') + '</div>'
+        + '<div class="upcoming-list">'
+        + list.slice(0, 3).map(function(m){{
+            const dt = new Date((m.kickoff_ts || 0) * 1000);
+            const day = dt.toLocaleDateString(undefined, {{day:'2-digit', month:'short'}});
+            const time = dt.toLocaleTimeString(undefined, {{hour:'2-digit', minute:'2-digit'}});
+            return ''
+              + '<div class="upcoming-row">'
+              +   '<div class="upcoming-teams">'
+              +     flagImg(m.home, 22)
+              +     '<span class="upcoming-team">' + (m.home || '') + '</span>'
+              +     '<span class="upcoming-vs">vs</span>'
+              +     '<span class="upcoming-team">' + (m.away || '') + '</span>'
+              +     flagImg(m.away, 22)
+              +   '</div>'
+              +   '<div class="upcoming-when">'
+              +     '<span class="day">' + day + '</span>'
+              +     '<span class="time">' + time + '</span>'
+              +   '</div>'
+              + '</div>';
+          }}).join('')
+        + '</div>';
+    }}
+
+    if (!cd && !listHtml) return '<div class="empty">' + t('no_live_match') + '</div>';
+    return cd + listHtml;
   }}
 
   function render(d){{
