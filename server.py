@@ -7398,12 +7398,20 @@ def _wc2026_mock_payload(state: str, locale: str = "en") -> dict:
 def _wc2026_current_state_for_match(match_id: int, locale: str = "en") -> dict:
     """Build a 'live' state payload for any monitored match (non-WC OK).
 
-    Used by ?match_id=<id> to rehearse the widget against a real, currently-live
-    fixture before the World Cup starts. Builds the same payload shape the
-    live branch of _wc2026_current_state produces, just bypassing the WC
-    tournament filter.
+    Powers the match-detail iframe — same fixture on every poll, three
+    states served from one URL: PREVIEW (countdown) before kickoff, LIVE
+    (xG chart + picks) during play, RESULTS indefinitely after the final
+    whistle. Never rotates to a different match.
+
+    Lookup order:
+      1) _live_state  → game is being scraped right now (LIVE or just-FT)
+      2) games table  → game finished and has dropped from live state
+      3) _upcoming_cache or games table → kick-off still in the future
+      4) fall through with an empty payload (rare)
     """
     now_ts = int(time.time())
+
+    # ── 1. Live state (currently scraped) ─────────────────────────────────
     entry = None
     try:
         with _state_lock:
@@ -7411,68 +7419,169 @@ def _wc2026_current_state_for_match(match_id: int, locale: str = "en") -> dict:
             if entry:
                 entry = dict(entry)  # shallow copy for safety
     except Exception as e:
-        log.warning(f"_wc2026_current_state_for_match({match_id}) failed: {e}")
+        log.warning(f"_wc2026_current_state_for_match({match_id}) live state lookup failed: {e}")
 
-    if not entry:
-        # Match not in live state → fall through to off_day with a hint
+    if entry:
+        m = entry.get("match") or {}
+        is_finished = bool(m.get("isFinished"))
+        state = "results_profitable" if is_finished else "live"
+        match_payload = {
+            "id":          m.get("id"),
+            "home":        m.get("homeTeam"),
+            "away":        m.get("awayTeam"),
+            "home_goals":  m.get("homeGoals", 0) or 0,
+            "away_goals":  m.get("awayGoals", 0) or 0,
+            "minute":      m.get("minute"),
+            "country":     m.get("country", ""),
+            "tournament":  m.get("tournament", ""),
+            "is_finished": is_finished,
+        }
+        live_picks = entry.get("livePicks") or entry.get("tips") or []
+        picks_payload = [
+            {
+                "market":  p.get("market", ""),
+                "label":   p.get("label", ""),
+                "odds":    p.get("odds") or p.get("odd_entry") or 0,
+                "edge":    p.get("edge")  or p.get("edge_entry") or 0,
+                "minute":  p.get("minute_entry") if p.get("minute_entry") is not None else p.get("minute"),
+                "result":  p.get("result"),
+            }
+            for p in live_picks
+        ]
+        xg_timeline = [] if is_finished else _build_xg_timeline_from_entry(entry)
         return {
-            "state":               "off_day",
-            "lang":                locale,
-            "match":               None,
-            "picks":               [],
-            "match_pnl":           None,
-            "next_match":          None,
+            "state":                       state,
+            "lang":                        locale,
+            "match":                       match_payload,
+            "picks":                       picks_payload,
+            "match_pnl":                   None,
+            "next_match":                  None,
             "countdown_to_next_kickoff_s": None,
-            "model_preview_text":  f"Match id={match_id} not found in live state. Visit /api/state/tips to list live IDs.",
-            "wc_emblem":           WC2026_EMBLEM_URL,
-            "powered_by":          _t(locale, "powered_by"),
-            "next_poll_after_ms":  60_000,
-            "now_ts":              now_ts,
-            "_override_match_id":  match_id,
+            "model_preview_text":          None,
+            "wc_emblem":                   WC2026_EMBLEM_URL,
+            "powered_by":                  _t(locale, "powered_by"),
+            "next_poll_after_ms":          30_000 if not is_finished else 60_000,
+            "now_ts":                      now_ts,
+            "xg_timeline":                 xg_timeline,
+            "_override_match_id":          int(match_id),
         }
 
-    m = entry.get("match") or {}
-    is_finished = bool(m.get("isFinished"))
-    state = "results_profitable" if is_finished else "live"
-    match_payload = {
-        "id":          m.get("id"),
-        "home":        m.get("homeTeam"),
-        "away":        m.get("awayTeam"),
-        "home_goals":  m.get("homeGoals", 0) or 0,
-        "away_goals":  m.get("awayGoals", 0) or 0,
-        "minute":      m.get("minute"),
-        "country":     m.get("country", ""),
-        "tournament":  m.get("tournament", ""),
-        "is_finished": is_finished,
-    }
-    live_picks = entry.get("livePicks") or entry.get("tips") or []
-    picks_payload = [
-        {
-            "market":  p.get("market", ""),
-            "label":   p.get("label", ""),
-            "odds":    p.get("odds") or p.get("odd_entry") or 0,
-            "edge":    p.get("edge")  or p.get("edge_entry") or 0,
-            "minute":  p.get("minute_entry") if p.get("minute_entry") is not None else p.get("minute"),
-            "result":  p.get("result"),
-        }
-        for p in live_picks
-    ]
+    # ── 2 & 3. DB lookup — finished archived game OR scheduled-but-not-live-yet
+    g_row = None
+    try:
+        with _db() as conn:
+            g_row = conn.execute(
+                "SELECT id, home_team, away_team, home_goals, away_goals, "
+                "       start_ts, tournament, country, is_finished, archived_at "
+                "FROM games WHERE id = ?",
+                (int(match_id),)
+            ).fetchone()
+    except Exception as e:
+        log.warning(f"_wc2026_current_state_for_match({match_id}) DB lookup failed: {e}")
 
+    if g_row:
+        g = dict(g_row)
+        if g.get("is_finished"):
+            # PERSISTED RESULTS — show indefinitely on the match-detail page.
+            tips_rows = []
+            try:
+                with _db() as conn:
+                    tips_rows = conn.execute(
+                        "SELECT market, label, odd_entry, edge_entry, minute_entry, "
+                        "       result, wall_ts FROM tips "
+                        "WHERE match_id = ? AND result IS NOT NULL "
+                        "ORDER BY wall_ts ASC",
+                        (int(match_id),)
+                    ).fetchall()
+            except Exception as e:
+                log.warning(f"_wc2026_current_state_for_match({match_id}) tips fetch failed: {e}")
+            picks_payload = [
+                {
+                    "market":  r["market"],
+                    "label":   r["label"],
+                    "odds":    r["odd_entry"] or 0,
+                    "edge":    r["edge_entry"] or 0,
+                    "minute":  r["minute_entry"],
+                    "result":  r["result"],
+                }
+                for r in tips_rows
+            ]
+            STAKE = get_setting("stake_per_bet", 100.0) or 100.0
+            pnl = sum(
+                ((r["odd_entry"] or 0) - 1) * STAKE if (r["result"] or "").lower() in ("green","win") else
+                (-STAKE if (r["result"] or "").lower() in ("red","loss") else 0)
+                for r in tips_rows
+            )
+            return {
+                "state":                       "results_profitable" if pnl >= 0 else "results_losing",
+                "lang":                        locale,
+                "match": {
+                    "id":          g["id"],
+                    "home":        g["home_team"],
+                    "away":        g["away_team"],
+                    "home_goals":  g["home_goals"] or 0,
+                    "away_goals":  g["away_goals"] or 0,
+                    "minute":      None,
+                    "country":     g.get("country", ""),
+                    "tournament":  g.get("tournament", ""),
+                    "is_finished": True,
+                },
+                "picks":                       picks_payload,
+                "match_pnl":                   round(pnl, 0),
+                "next_match":                  None,
+                "countdown_to_next_kickoff_s": None,
+                "model_preview_text":          None,
+                "wc_emblem":                   WC2026_EMBLEM_URL,
+                "powered_by":                  _t(locale, "powered_by"),
+                # Finished + on a detail page → barely needs polling.
+                "next_poll_after_ms":          600_000,
+                "now_ts":                      now_ts,
+                "_override_match_id":          int(match_id),
+            }
+        else:
+            # NOT finished, NOT in live state yet → pre-match PREVIEW with
+            # countdown. The game row already has the kickoff time.
+            kickoff_ts = int(g.get("start_ts") or 0)
+            countdown_s = max(0, kickoff_ts - now_ts) if kickoff_ts else None
+            return {
+                "state":                       "preview",
+                "lang":                        locale,
+                "match":                       None,
+                "picks":                       [],
+                "match_pnl":                   None,
+                "next_match": {
+                    "id":          g["id"],
+                    "home":        g["home_team"],
+                    "away":        g["away_team"],
+                    "country":     g.get("country", ""),
+                    "tournament":  g.get("tournament", ""),
+                    "kickoff_ts":  kickoff_ts,
+                },
+                "countdown_to_next_kickoff_s": countdown_s,
+                "model_preview_text":          None,
+                "wc_emblem":                   WC2026_EMBLEM_URL,
+                "powered_by":                  _t(locale, "powered_by"),
+                # Tight polling near kickoff so we transition to LIVE quickly.
+                "next_poll_after_ms":          30_000 if (countdown_s or 0) < 1800 else 120_000,
+                "now_ts":                      now_ts,
+                "_override_match_id":          int(match_id),
+            }
+
+    # ── 4. Truly unknown — return a friendly empty preview ────────────────
     return {
-        "state":                       state,
-        "lang":                        locale,
-        "match":                       match_payload,
-        "picks":                       picks_payload,
-        "match_pnl":                   None,
-        "next_match":                  None,
+        "state":               "preview",
+        "lang":                locale,
+        "match":               None,
+        "picks":               [],
+        "match_pnl":           None,
+        "next_match":          None,
         "countdown_to_next_kickoff_s": None,
-        "model_preview_text":          None,
-        "wc_emblem":                   WC2026_EMBLEM_URL,
-        "powered_by":                  _t(locale, "powered_by"),
-        "next_poll_after_ms":          30_000 if not is_finished else 60_000,
-        "now_ts":                      now_ts,
-        "_override_match_id":          int(match_id),
-        "xg_timeline":                 _build_xg_timeline_from_entry(entry) if not is_finished else [],
+        "model_preview_text":  f"Match id={match_id} not found",
+        "wc_emblem":           WC2026_EMBLEM_URL,
+        "powered_by":          _t(locale, "powered_by"),
+        "next_poll_after_ms":  60_000,
+        "now_ts":              now_ts,
+        "_override_match_id":  int(match_id),
     }
 
 
