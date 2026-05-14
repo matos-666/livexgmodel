@@ -115,7 +115,7 @@ def fmt_market(m: str, label: str) -> str:
 
 # ── Animation ──────────────────────────────────────────────────────────────
 def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
-                db_path: str = DB_DEFAULT, fps: int = 12) -> str:
+                db_path: str = DB_DEFAULT, fps: int = 10) -> str:
     data   = load_match(match_id, db_path)
     g      = data["match"]
     tips   = data["tips"]
@@ -130,7 +130,7 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
     score = f"{g['home_goals']}–{g['away_goals']}"
 
     # ── Figure layout ──────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(7.2, 6.4), dpi=110, facecolor=BG)
+    fig = plt.figure(figsize=(6.4, 5.6), dpi=90, facecolor=BG)
     gs = fig.add_gridspec(
         nrows=3, ncols=1,
         height_ratios=[0.18, 0.55, 0.27],
@@ -200,13 +200,12 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
                             fontsize=15, fontweight="bold")
 
     # ── Frame plan ─────────────────────────────────────────────────────────
-    # 1. Intro (0.6s)   — show header only
-    # 2. Clock + xG (5s)— minute advances 0→95
-    # 3. Outro (1.5s)   — final P&L counter highlighted
+    # Shorter than v1 to keep peak memory under the Fly 1GB cap during
+    # GIF encoding (PillowWriter holds every frame in RAM until save).
     fps = int(fps)
-    intro_frames = int(0.6 * fps)
-    play_frames  = int(5.0 * fps)
-    outro_frames = int(1.5 * fps)
+    intro_frames = int(0.4 * fps)
+    play_frames  = int(4.0 * fps)
+    outro_frames = int(1.0 * fps)
     total_frames = intro_frames + play_frames + outro_frames
 
     def update(frame_i):
@@ -276,7 +275,7 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
     anim = FuncAnimation(fig, update, frames=total_frames, interval=1000 / fps, blit=False)
 
     writer = PillowWriter(fps=fps)
-    anim.save(out_path, writer=writer, dpi=110, savefig_kwargs={"facecolor": BG})
+    anim.save(out_path, writer=writer, dpi=90, savefig_kwargs={"facecolor": BG})
     plt.close(fig)
 
     size_kb = Path(out_path).stat().st_size // 1024
