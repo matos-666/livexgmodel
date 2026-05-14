@@ -30,7 +30,7 @@ import urllib.request as _urllib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from matplotlib.patches import FancyBboxPatch
 from PIL import Image
@@ -213,9 +213,11 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
     logo_away = fetch_team_logo(g.get("away_team_id"))
 
     # ── Figure layout: header / chart / picks list ────────────────────────
-    # DPI bumped from 90 → 130 for retina-sharp playback on mobile Telegram.
-    # Header height ratio increased so logos + score + names don't overlap.
-    fig = plt.figure(figsize=(6.8, 7.5), dpi=130, facecolor=BG)
+    # DPI 160 + MP4 output via H.264 gives noticeably sharper playback than
+    # the old 130-DPI palette-GIF: ~720p source, AAC-less H.264 stream,
+    # smaller file at much better fidelity. Telegram renders MP4 inline via
+    # sendAnimation just like a GIF, no UX difference for the user.
+    fig = plt.figure(figsize=(6.8, 7.5), dpi=160, facecolor=BG)
     gs  = fig.add_gridspec(
         nrows=3, ncols=1,
         height_ratios=[0.26, 0.48, 0.26],
@@ -241,25 +243,31 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
                  color=MUTED, fontsize=7, fontweight="bold",
                  ha="center", va="center")
 
-    # Layout in 5 columns to prevent the long team names from colliding
-    # with the centred score (the v1 overlap bug). Logos sit at the edges;
-    # team names sit immediately next to their logo (justified inward);
-    # the score lives alone in the middle column.
-    LOGO_HOME_X, LOGO_AWAY_X = 0.07, 0.93
-    NAME_HOME_X, NAME_AWAY_X = 0.18, 0.82
-    DOT_HOME_X,  DOT_AWAY_X  = 0.155, 0.845
+    # Layout in 5 columns. Logos pushed inward from 0.07/0.93 (which clipped
+    # at the axes edge after the DPI bump) to 0.12/0.88 so they always fit.
+    # clip_on=False on the AnnotationBbox prevents matplotlib from culling
+    # the image when its bbox briefly extends past the axes range.
+    LOGO_HOME_X, LOGO_AWAY_X = 0.12, 0.88
+    NAME_HOME_X, NAME_AWAY_X = 0.22, 0.78
+    DOT_HOME_X,  DOT_AWAY_X  = 0.20, 0.80
     SCORE_X = 0.50
-    Y_ROW = 0.40  # vertical centre of the row
+    Y_ROW = 0.45  # vertical centre of the row
 
     def _draw_logo(img: Image.Image | None, x: float, y: float, fallback_color: str):
         if img is not None:
-            oi = OffsetImage(img, zoom=0.42)
+            # zoom is in points-per-pixel — at DPI 160 a value of ~0.55 sizes
+            # a 128-px crest to roughly 70px on screen, which lines up with
+            # the team-name height.
+            oi = OffsetImage(img, zoom=0.55)
             ab = AnnotationBbox(oi, (x, y), xycoords=ax_head.transAxes,
-                                frameon=False, box_alignment=(0.5, 0.5))
+                                frameon=False, box_alignment=(0.5, 0.5),
+                                pad=0.0)
+            ab.set_clip_on(False)
             ax_head.add_artist(ab)
         else:
             ax_head.scatter([x], [y], s=900, transform=ax_head.transAxes,
-                            facecolor=fallback_color, edgecolor=SUBTLE, linewidths=1.5)
+                            facecolor=fallback_color, edgecolor=SUBTLE, linewidths=1.5,
+                            clip_on=False)
 
     _draw_logo(logo_home, LOGO_HOME_X, Y_ROW, HOME_CLR)
     _draw_logo(logo_away, LOGO_AWAY_X, Y_ROW, AWAY_CLR)
@@ -466,8 +474,27 @@ def build_recap(match_id: int, out_path: str = "/tmp/match_recap.gif",
         return []
 
     anim = FuncAnimation(fig, update, frames=total_frames, interval=1000 / fps, blit=False)
-    writer = PillowWriter(fps=fps)
-    anim.save(out_path, writer=writer, dpi=130, savefig_kwargs={"facecolor": BG})
+
+    # Prefer MP4/H.264 — sharper and smaller than palette-GIF for the same
+    # content. Falls back to GIF when ffmpeg isn't available (e.g. CI or
+    # bare Python install). Output path's extension drives the format so
+    # callers don't have to think about it.
+    want_mp4 = out_path.endswith(".mp4") and FFMpegWriter.isAvailable()
+    if want_mp4:
+        writer = FFMpegWriter(
+            fps=fps,
+            codec="libx264",
+            bitrate=2400,                       # ~2.4 Mbps — crisp at 720p
+            extra_args=["-pix_fmt", "yuv420p",  # broad player compatibility
+                        "-preset", "medium",
+                        "-movflags", "+faststart"],
+        )
+    else:
+        # rewrite extension if caller asked for mp4 but we can't deliver it
+        if out_path.endswith(".mp4"):
+            out_path = out_path[:-4] + ".gif"
+        writer = PillowWriter(fps=fps)
+    anim.save(out_path, writer=writer, dpi=160, savefig_kwargs={"facecolor": BG})
     plt.close(fig)
 
     size_kb = Path(out_path).stat().st_size // 1024

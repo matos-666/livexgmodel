@@ -1021,14 +1021,16 @@ def _generate_monthly_chart() -> bytes | None:
     return _generate_chart("month")
 
 
-def _send_telegram_animation(chat_id: int, gif_bytes: bytes,
-                              caption: str = "", buttons: list | None = None):
-    """Envia GIF animado via Telegram sendAnimation. Mesmo padrão multipart
-    que _send_telegram_photo. Telegram aceita GIF até ~50MB; o nosso recap
-    ronda os 500-900KB."""
+def _send_telegram_animation(chat_id: int, animation_bytes: bytes,
+                              caption: str = "", buttons: list | None = None,
+                              filename: str = "recap.mp4"):
+    """Envia animação via Telegram sendAnimation. Aceita GIF ou MP4 (H.264).
+    Content-Type derivado da extensão do filename — MP4 dá melhor qualidade
+    pelo mesmo file size."""
     if not TELEGRAM_BOT_TOKEN:
         return
     import urllib.request as _urllib
+    content_type = "video/mp4" if filename.lower().endswith(".mp4") else "image/gif"
     try:
         boundary = "TGBotBoundary7x3k"
         CRLF = b"\r\n"
@@ -1047,9 +1049,9 @@ def _send_telegram_animation(chat_id: int, gif_bytes: bytes,
             body += field("reply_markup", json.dumps({"inline_keyboard": buttons}))
         body += (
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="animation"; filename="recap.gif"\r\n'
-            f"Content-Type: image/gif\r\n\r\n"
-        ).encode() + gif_bytes + CRLF
+            f'Content-Disposition: form-data; name="animation"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode() + animation_bytes + CRLF
         body += f"--{boundary}--\r\n".encode()
 
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAnimation"
@@ -9183,23 +9185,31 @@ def r_betradar_recap(match_id: int):
     except Exception as e:
         return jsonify({"ok": False, "error": f"recap import failed: {e}"}), 500
 
-    # Generate the GIF to /tmp
-    out_path = f"/tmp/betradar_recap_{match_id}.gif"
+    # Generate the recap. Prefer MP4 (H.264 via ffmpeg) — falls back to GIF
+    # only if ffmpeg isn't installed. build_recap may rewrite the extension
+    # in that fallback case, so we read whatever it actually produced.
+    requested_path = f"/tmp/betradar_recap_{match_id}.mp4"
+    actual_path = requested_path
     try:
-        build_recap(match_id, out_path, db_path=str(DB_PATH))
-        gif_bytes = open(out_path, "rb").read()
+        result = build_recap(match_id, requested_path, db_path=str(DB_PATH))
+        # build_recap returns "path (size · frames · duration)" — extract path
+        actual_path = result.split(" (", 1)[0] if isinstance(result, str) else requested_path
+        anim_bytes = open(actual_path, "rb").read()
     except Exception as e:
         log.error(f"betradar recap build failed for match {match_id}: {e}")
         return jsonify({"ok": False, "error": f"build failed: {e}"}), 500
 
-    caption = _betradar_match_caption(match_id)
-    _send_telegram_animation(chat_id, gif_bytes, caption=caption,
-                              buttons=_betradar_share_buttons())
+    caption  = _betradar_match_caption(match_id)
+    filename = os.path.basename(actual_path)  # recap.mp4 or recap.gif
+    _send_telegram_animation(chat_id, anim_bytes, caption=caption,
+                              buttons=_betradar_share_buttons(),
+                              filename=filename)
 
     return jsonify({
         "ok":         True,
         "match_id":   match_id,
-        "gif_size":   len(gif_bytes),
+        "format":     filename.rsplit(".", 1)[-1],
+        "size":       len(anim_bytes),
         "chat_id":    chat_id,
         "caption_chars": len(caption),
     })
