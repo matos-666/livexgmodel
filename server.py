@@ -1021,6 +1021,45 @@ def _generate_monthly_chart() -> bytes | None:
     return _generate_chart("month")
 
 
+def _send_telegram_animation(chat_id: int, gif_bytes: bytes,
+                              caption: str = "", buttons: list | None = None):
+    """Envia GIF animado via Telegram sendAnimation. Mesmo padrão multipart
+    que _send_telegram_photo. Telegram aceita GIF até ~50MB; o nosso recap
+    ronda os 500-900KB."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    import urllib.request as _urllib
+    try:
+        boundary = "TGBotBoundary7x3k"
+        CRLF = b"\r\n"
+
+        def field(name: str, value: str) -> bytes:
+            return (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}"
+            ).encode() + CRLF
+
+        body = field("chat_id", str(chat_id)) + field("parse_mode", "HTML")
+        if caption:
+            body += field("caption", caption)
+        if buttons:
+            body += field("reply_markup", json.dumps({"inline_keyboard": buttons}))
+        body += (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="animation"; filename="recap.gif"\r\n'
+            f"Content-Type: image/gif\r\n\r\n"
+        ).encode() + gif_bytes + CRLF
+        body += f"--{boundary}--\r\n".encode()
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAnimation"
+        req = _urllib.Request(url, data=body,
+                              headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        _urllib.urlopen(req, timeout=60)
+    except Exception as e:
+        log.error(f"Telegram send_animation failed to {chat_id}: {e}")
+
+
 def _send_telegram_photo(chat_id: int, photo_bytes: bytes,
                           caption: str = "", buttons: list | None = None):
     """Envia foto (PNG) via Telegram sendPhoto com multipart/form-data."""
@@ -9049,6 +9088,92 @@ def r_refresh_logos():
         "team":          name or None,
         "team_url":      team_url,
     })
+
+
+# ─── BetRadarAI match recap (animated GIF + caption) ────────────────────────
+def _betradar_match_caption(match_id: int) -> str:
+    """Build a Portuguese-language summary caption shown above the GIF in
+    the BetRadarAI bot. Numbers are derived from the DB so the text matches
+    the visual frames."""
+    with _db() as conn:
+        g = conn.execute(
+            "SELECT home_team, away_team, home_goals, away_goals, tournament "
+            "FROM games WHERE id = ?", (match_id,)
+        ).fetchone()
+        tips = conn.execute(
+            "SELECT market, label, odd_entry, edge_entry, minute_entry, result "
+            "FROM tips WHERE match_id = ? "
+            "AND result IN ('green','red','win','loss') "
+            "ORDER BY minute_entry", (match_id,)
+        ).fetchall()
+    if not g or not tips:
+        return ""
+    wins   = sum(1 for t in tips if t["result"] in ("green","win"))
+    losses = len(tips) - wins
+    profit = 0.0
+    for t in tips:
+        if t["result"] in ("green","win"):
+            profit += float(t["odd_entry"] or 0) - 1.0
+        else:
+            profit -= 1.0
+    eur = profit * 100  # 1u stake = €100 convention
+    sign = "+" if profit > 0 else ""
+    return (
+        f"🏆 <b>{g['tournament']}</b>\n"
+        f"<b>{g['home_team']} {g['home_goals']}–{g['away_goals']} {g['away_team']}</b>\n\n"
+        f"🤖 O algoritmo emitiu <b>{len(tips)} picks</b> neste jogo:\n"
+        f"  ✓ {wins} verdes\n"
+        f"  ✗ {losses} reds\n\n"
+        f"💰 Lucro: <b>{sign}{profit:.2f}u (~€{eur:+.0f})</b>"
+    )
+
+
+@app.route("/api/admin/betradar/recap/<int:match_id>", methods=["POST", "GET"])
+def r_betradar_recap(match_id: int):
+    """Generate the GIF recap for a match and send to a chat_id (defaults to
+    the admin). Used both for manual testing and as the production fan-out
+    handler when a match's settled profit crosses the threshold.
+
+    Query params:
+      chat_id  — target Telegram chat (defaults to first TELEGRAM_ADMIN_CHAT_IDS)
+    """
+    # Resolve target chat
+    chat_id_raw = (flask_request.args.get("chat_id") or "").strip()
+    if chat_id_raw.lstrip("-").isdigit():
+        chat_id = int(chat_id_raw)
+    elif TELEGRAM_ADMIN_CHAT_IDS:
+        chat_id = next(iter(TELEGRAM_ADMIN_CHAT_IDS))
+    else:
+        return jsonify({"ok": False, "error": "no chat_id and no TELEGRAM_ADMIN_CHAT_IDS"}), 400
+
+    # Lazy-import the recap builder (matplotlib pulls a lot of memory; only
+    # imported when this endpoint actually runs).
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        from tools.build_match_recap import build_recap  # type: ignore
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"recap import failed: {e}"}), 500
+
+    # Generate the GIF to /tmp
+    out_path = f"/tmp/betradar_recap_{match_id}.gif"
+    try:
+        build_recap(match_id, out_path, db_path=str(DB_PATH))
+        gif_bytes = open(out_path, "rb").read()
+    except Exception as e:
+        log.error(f"betradar recap build failed for match {match_id}: {e}")
+        return jsonify({"ok": False, "error": f"build failed: {e}"}), 500
+
+    caption = _betradar_match_caption(match_id)
+    _send_telegram_animation(chat_id, gif_bytes, caption=caption)
+
+    return jsonify({
+        "ok":         True,
+        "match_id":   match_id,
+        "gif_size":   len(gif_bytes),
+        "chat_id":    chat_id,
+        "caption_chars": len(caption),
+    })
+
 
 
 @app.route("/api/team_logos")
