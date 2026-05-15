@@ -3465,17 +3465,98 @@ def r_search():
 def r_match(eid):
     """Full match data including odds & value analysis.
 
-    The 'tournament' field is canonicalised before returning — SPA
-    breadcrumbs/links use this to land users on the unified league page
-    instead of split-format variants like 'Pro League, Conference League
-    Playoffs' (Belgium) or 'Eredivisie, Championship Round'.
+    Three-tier resolution so the SPA always gets *something* renderable:
+      1. Sofascore live event       (full live data: shots, incidents, odds)
+      2. Our games table             (stored match: teams, score, tournament,
+                                       country — enough to render the basic
+                                       card + tip history)
+      3. 404                         (truly unknown ID)
+
+    Without tier 2, a Sofascore outage or a stale match id (older games
+    Sofascore drops from public endpoints) made the SPA render a blank
+    page — the very bug the user reported.
+
+    The 'tournament' field is canonicalised before returning so SPA
+    breadcrumbs/links land users on the unified league page.
     """
     try:
-        d = get_event(eid)
-        if not d: return jsonify({"error": "Not found"}), 404
-        shots = get_shotmap(eid)
-        incidents = get_incidents(eid)
-        odds = get_full_odds_analysis(d, shots)
+        d         = None
+        shots     = {"homeShots": [], "awayShots": [], "homeXg": 0, "awayXg": 0, "totalShots": 0}
+        incidents = []
+        odds      = None
+        from_source = "live"
+
+        # Tier 1: Sofascore live event
+        try:
+            d = get_event(eid)
+        except Exception as e:
+            log.debug(f"r_match: get_event failed for {eid}: {e}")
+            d = None
+
+        if d:
+            try:    shots     = get_shotmap(eid)
+            except Exception: pass
+            try:    incidents = get_incidents(eid)
+            except Exception: pass
+            try:    odds      = get_full_odds_analysis(d, shots)
+            except Exception: pass
+        else:
+            # Tier 2: hydrate from local DB (resilient to Sofascore outages
+            # AND to old matches Sofascore dropped from /event/<id>)
+            from_source = "db"
+            try:
+                with _db() as conn:
+                    g = conn.execute(
+                        "SELECT id, home_team, away_team, home_goals, away_goals, "
+                        "       home_team_id, away_team_id, tournament, country, "
+                        "       start_ts, is_finished FROM games WHERE id = ?",
+                        (eid,)
+                    ).fetchone()
+                if not g:
+                    return jsonify({"error": "Not found"}), 404
+                d = {
+                    "id":             g["id"],
+                    "homeTeam":       g["home_team"],
+                    "awayTeam":       g["away_team"],
+                    "homeGoals":      g["home_goals"],
+                    "awayGoals":      g["away_goals"],
+                    "homeTeamId":     g["home_team_id"],
+                    "awayTeamId":     g["away_team_id"],
+                    "tournament":     g["tournament"] or "",
+                    "country":        g["country"] or "",
+                    "startTimestamp": g["start_ts"],
+                    "isFinished":     bool(g["is_finished"]),
+                    "isLive":         False,
+                    "minute":         None,
+                    "status":         {"type": "finished" if g["is_finished"] else "notstarted"},
+                    "_source":        "db_fallback",
+                }
+                # Pull persisted shots from match_shots so the chart still has
+                # data when Sofascore is unreachable.
+                try:
+                    with _db() as conn:
+                        rows = conn.execute(
+                            "SELECT minute, added_time, is_home, xg, is_goal, is_penalty "
+                            "FROM match_shots WHERE match_id = ? AND minute >= 0 "
+                            "ORDER BY minute, added_time",
+                            (eid,)
+                        ).fetchall()
+                    home_shots = [dict(r) for r in rows if r["is_home"]]
+                    away_shots = [dict(r) for r in rows if not r["is_home"]]
+                    home_xg = sum(s["xg"] for s in home_shots if not s["is_penalty"])
+                    away_xg = sum(s["xg"] for s in away_shots if not s["is_penalty"])
+                    shots = {
+                        "homeShots":  home_shots,
+                        "awayShots":  away_shots,
+                        "homeXg":     round(home_xg, 3),
+                        "awayXg":     round(away_xg, 3),
+                        "totalShots": len(home_shots) + len(away_shots),
+                    }
+                except Exception:
+                    pass
+            except Exception as e:
+                log.exception(f"r_match: DB fallback failed for {eid}: {e}")
+                return jsonify({"error": "Not found"}), 404
 
         # Canonicalise tournament + add the raw form for traceability.
         tourn_raw = d.get("tournament", "")
@@ -3485,10 +3566,11 @@ def r_match(eid):
             d["tournament"]     = canonical
 
         return jsonify({
-            "match": d,
-            "shots": shots,
+            "match":     d,
+            "shots":     shots,
             "incidents": incidents,
-            "odds": odds,
+            "odds":      odds,
+            "_source":   from_source,
         })
     except Exception as e:
         log.exception(f"Error in /api/match/{eid}")
