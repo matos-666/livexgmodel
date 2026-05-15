@@ -5630,6 +5630,114 @@ def _resolve_finished_tips():
     except Exception as e:
         log.error(f"_resolve_finished_tips failed: {e}")
 
+    # After settling, fan out the BetRadar match recap for matches that just
+    # crossed the +2.5u (€250) profit threshold. Dedup'd via DB so each match
+    # is broadcast only once even if _resolve_finished_tips runs again.
+    try:
+        _maybe_broadcast_match_recaps()
+    except Exception as e:
+        log.error(f"_maybe_broadcast_match_recaps failed: {e}")
+
+
+# Threshold above which a finished match's recap is auto-broadcast to all
+# BetRadarAI subscribers. 2.5u with 100€ stake = €250 profit.
+BETRADAR_RECAP_THRESHOLD_U = 2.5
+
+
+def _maybe_broadcast_match_recaps():
+    """Find finished matches whose settled profit is ≥ threshold AND that
+    haven't been broadcast yet. Generate the animated recap once per match
+    and fan out to all subscribers (uploads once, forwards via file_id)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    STAKE = get_setting("stake_per_bet", 100.0) or 100.0
+
+    # Make sure the dedup table exists (idempotent).
+    try:
+        with _db() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS betradar_recap_sent ("
+                "  match_id INTEGER PRIMARY KEY, "
+                "  profit_u REAL, "
+                "  sent_at  INTEGER NOT NULL"
+                ")"
+            )
+    except Exception as e:
+        log.warning(f"_maybe_broadcast_match_recaps: dedup table init failed: {e}")
+        return
+
+    # Pull eligible candidates: finished games with at least one settled tip
+    # whose summed profit clears the threshold AND no broadcast row yet.
+    # Recency filter: only matches kicked off in the last 36h, so a fresh
+    # deploy (or a revived dedup table) doesn't retroactively spam old wins.
+    cutoff_ts = int(time.time()) - 36 * 3600
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT g.id, "
+                "       SUM(CASE WHEN t.result IN ('green','win') THEN (t.odd_entry - 1) "
+                "                WHEN t.result IN ('red','loss')  THEN -1 ELSE 0 END) AS profit_u "
+                "FROM games g JOIN tips t ON t.match_id = g.id "
+                "WHERE g.is_finished = 1 AND t.result IS NOT NULL "
+                "  AND g.start_ts >= ? "
+                "  AND NOT EXISTS (SELECT 1 FROM betradar_recap_sent s WHERE s.match_id = g.id) "
+                "GROUP BY g.id "
+                "HAVING profit_u >= ?",
+                (cutoff_ts, BETRADAR_RECAP_THRESHOLD_U)
+            ).fetchall()
+    except Exception as e:
+        log.warning(f"_maybe_broadcast_match_recaps: candidate query failed: {e}")
+        return
+
+    if not rows:
+        return
+
+    log.info(f"BetRadar recap: {len(rows)} match(es) cross threshold, broadcasting…")
+    subs = _tg_subscribers() or []
+    chat_ids = [int(c) for c in subs if str(c).lstrip("-").isdigit()]
+
+    # Lazy-import the recap builder so this hot-path stays cheap on the
+    # 99% of cycles where no match qualifies.
+    sys.path.insert(0, os.path.dirname(__file__))
+    try:
+        from tools.build_match_recap import build_recap  # type: ignore
+    except Exception as e:
+        log.error(f"BetRadar recap: import builder failed: {e}")
+        return
+
+    now_ts = int(time.time())
+    for r in rows:
+        mid = r["id"]
+        try:
+            out_path = f"/tmp/betradar_auto_{mid}.mp4"
+            result = build_recap(mid, out_path, db_path=str(DB_PATH))
+            actual_path = result.split(" (", 1)[0] if isinstance(result, str) else out_path
+            with open(actual_path, "rb") as fh:
+                anim_bytes = fh.read()
+            caption  = _betradar_match_caption(mid)
+            filename = os.path.basename(actual_path)
+
+            if chat_ids:
+                stats = _broadcast_telegram_animation(
+                    chat_ids, anim_bytes, caption=caption,
+                    buttons=_betradar_share_buttons(),
+                    filename=filename,
+                )
+                log.info(
+                    f"BetRadar recap: match #{mid} (+{r['profit_u']:.2f}u) — "
+                    f"upload {stats['sent_with_upload']}, by_id {stats['sent_with_id']}, "
+                    f"failed {stats['failed']}"
+                )
+
+            with _db() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO betradar_recap_sent "
+                    "(match_id, profit_u, sent_at) VALUES (?, ?, ?)",
+                    (mid, float(r["profit_u"]), now_ts)
+                )
+        except Exception as e:
+            log.error(f"BetRadar recap: match #{mid} failed: {e}")
+
 
 def _background_loop():
     """Runs forever, sleeping BG_INTERVAL seconds between cycles."""

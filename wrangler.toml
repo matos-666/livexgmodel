@@ -17,7 +17,7 @@
 name        = "webpronos-seo-proxy"            # matches the existing worker (confirmed via dashboard 2026-05-13)
 main        = "cloudflare-worker.js"
 compatibility_date = "2025-01-01"
-account_id  = "619a36f905889629b34f6db8d70dcd2e"
+account_id  = "619a36f905899629b34f6db8d70dcd2e"
 
 # Routes that fire this worker. Mirrors the two routes already registered
 # in the dashboard so wrangler deploys keep them in sync:
