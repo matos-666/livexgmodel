@@ -5284,6 +5284,13 @@ def _run_background_cycle():
     # Finalize games that dropped off the live feed, then resolve their tips
     live_ids = {m["id"] for m in monitored}
     _finalize_dropped_games(live_ids)
+    # Catch matches we never observed live (Sofascore was blocked during their
+    # kickoff window) — direct event-fetch retry, with eventual void after 36h
+    # so a tip never stays 'pending' forever.
+    try:
+        _recover_stale_game_results()
+    except Exception as e:
+        log.warning(f"_recover_stale_game_results failed: {e}")
     _resolve_finished_tips()
 
     # Keep upcoming cache warm — runs in same bg thread (curl_cffi safe here)
@@ -5369,6 +5376,101 @@ def _finalize_dropped_games(live_ids: set):
                     )
         except Exception as e:
             log.warning(f"_finalize_dropped_games: failed for game {gid}: {e}")
+
+
+def _recover_stale_game_results(min_hours_after_kickoff: int = 4,
+                                  give_up_after_hours: int = 36):
+    """Safety net for matches whose final state we never observed live.
+
+    A game might never enter _live_state if Sofascore blocks our region
+    during its kickoff window. Without intervention its tips stay pending
+    forever. This helper:
+
+      1. Finds games with pending tips whose scheduled kickoff was at least
+         `min_hours_after_kickoff` ago AND that aren't marked finished yet.
+      2. For each, hits Sofascore /event/{id} directly via _session
+         (curl_cffi — passes anti-bot). On success: writes the final score
+         + is_finished=1 and lets _resolve_finished_tips do its job.
+      3. If we still can't reach Sofascore after `give_up_after_hours`
+         (~36h), gives up and marks the tip as 'void' — better to refund
+         than to keep it pending forever.
+
+    Runs every BG cycle (cheap when there's nothing stale).
+    """
+    now_ts = int(time.time())
+    min_age = now_ts - min_hours_after_kickoff * 3600
+    give_up = now_ts - give_up_after_hours * 3600
+    try:
+        with _db() as conn:
+            stale = conn.execute(
+                "SELECT g.id, g.start_ts, g.home_team, g.away_team "
+                "FROM games g WHERE g.is_finished = 0 AND g.start_ts < ? "
+                "AND EXISTS (SELECT 1 FROM tips t WHERE t.match_id = g.id AND t.result IS NULL) "
+                "ORDER BY g.start_ts ASC LIMIT 30",
+                (min_age,)
+            ).fetchall()
+    except Exception as e:
+        log.warning(f"_recover_stale_game_results: query failed: {e}")
+        return
+
+    if not stale:
+        return
+    log.info(f"_recover_stale_game_results: {len(stale)} stale games to retry")
+
+    recovered, voided = 0, 0
+    for g in stale:
+        gid       = g["id"]
+        start_ts  = int(g["start_ts"] or 0)
+        is_ancient = start_ts > 0 and start_ts < give_up
+
+        # Try to fetch the event directly from Sofascore — works if the
+        # current region isn't blocked even if it was during the live window.
+        ev = None
+        try:
+            r = _session.get(f"{SOFASCORE_API}/event/{gid}", timeout=10)
+            if r.status_code == 200:
+                d = r.json()
+                ev = d.get("event") or d
+        except Exception as e:
+            log.debug(f"_recover_stale_game_results: fetch failed for {gid}: {e}")
+
+        if ev:
+            status = ((ev.get("status") or {}).get("type") or "").lower()
+            hg = (ev.get("homeScore") or {}).get("current")
+            ag = (ev.get("awayScore") or {}).get("current")
+            if status == "finished" and hg is not None and ag is not None:
+                try:
+                    with _db() as conn:
+                        conn.execute(
+                            "UPDATE games SET is_finished = 1, home_goals = ?, "
+                            "away_goals = ?, archived_at = ? WHERE id = ?",
+                            (int(hg), int(ag), now_ts, gid)
+                        )
+                    recovered += 1
+                    log.info(f"_recover_stale_game_results: recovered #{gid} "
+                              f"{g['home_team']} {hg}-{ag} {g['away_team']}")
+                    continue
+                except Exception as e:
+                    log.warning(f"_recover_stale_game_results: db write failed for {gid}: {e}")
+
+        # Couldn't recover AND game is ancient → void the tips so the user
+        # gets stake refunded rather than seeing 'pending' forever.
+        if is_ancient:
+            try:
+                with _db() as conn:
+                    conn.execute(
+                        "UPDATE tips SET result = 'void' WHERE match_id = ? AND result IS NULL",
+                        (gid,)
+                    )
+                voided += 1
+                log.warning(f"_recover_stale_game_results: gave up on #{gid} "
+                            f"({g['home_team']} vs {g['away_team']}) — voided pending tips")
+            except Exception as e:
+                log.warning(f"_recover_stale_game_results: void write failed for {gid}: {e}")
+
+    if recovered or voided:
+        log.info(f"_recover_stale_game_results: recovered={recovered}, voided={voided}")
+        _resolve_finished_tips()
 
 
 def _resolve_finished_tips():
@@ -9444,6 +9546,23 @@ def r_prewarm_logos():
     """Manually trigger the fuzzy logo prewarm (also runs automatically on boot)."""
     threading.Thread(target=_prewarm_fuzzy_logos, daemon=True).start()
     return jsonify({"ok": True, "message": "Prewarm started in background — check logs"})
+
+
+@app.route("/api/admin/recover-stale-tips", methods=["POST", "GET"])
+def r_admin_recover_stale_tips():
+    """Manually trigger the stale-game recovery loop. Same logic that runs
+    each BG cycle — direct fetch, settle, void after 36h."""
+    try:
+        _recover_stale_game_results()
+        _resolve_finished_tips()
+        with _db() as conn:
+            still_pending = conn.execute(
+                "SELECT COUNT(*) AS n FROM tips WHERE result IS NULL"
+            ).fetchone()["n"]
+        return jsonify({"ok": True, "still_pending": still_pending})
+    except Exception as e:
+        log.error(f"r_admin_recover_stale_tips: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/admin/refresh-logos", methods=["POST", "GET"])
@@ -13523,12 +13642,18 @@ def _format_pick_row(row, *, perspective_team: str | None = None) -> dict:
     score = (f'{row["home_goals"]}-{row["away_goals"]}'
              if row["home_goals"] is not None and is_finished else None)
 
-    # Result normalization: "win"/"green" → "win", "loss"/"red" → "loss"
-    raw_result = row["result"]
+    # Result normalization: "win"/"green" → "win", "loss"/"red" → "loss",
+    # "void"/"push" → "void" (settled with stake returned, not pending).
+    # Anything else (including None) → None, which the frontend renders as
+    # 'pending'. Without the explicit 'void' branch, Handicap pushes
+    # (e.g. Team -1 ending in a 1-goal win) showed as PENDING forever.
+    raw_result = (row["result"] or "").lower() if row["result"] else None
     if raw_result in ("win", "green"):
         result = "win"
     elif raw_result in ("loss", "red"):
         result = "loss"
+    elif raw_result in ("void", "push"):
+        result = "void"
     else:
         result = None
 
