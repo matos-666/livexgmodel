@@ -6493,7 +6493,16 @@ def _team_performance(name: str, recent_n: int = 5) -> dict:
                 "date":       date_str,
                 "opponent":   opponent,
                 "was_home":   was_home,
-                "score":      f"{gf}-{ga}",     # always team's perspective
+                # 'score' uses the universal home-first convention so the
+                # SPA can render "Grêmio 0-1 Flamengo" naturally. Earlier
+                # this field was in team-perspective (gf-ga), which made
+                # the SPA show "1-0" for an away game and read like the
+                # home team had scored first — wrong.
+                "score":      f"{g['home_goals']}-{g['away_goals']}",
+                # 'team_score' / 'opp_score' for callers who want the
+                # team-perspective view explicitly.
+                "team_score": gf,
+                "opp_score":  ga,
                 "result":     result,
                 "xg_for":     round(xg_for, 2)     if xg_for     is not None else None,
                 "xg_against": round(xg_against, 2) if xg_against is not None else None,
@@ -9546,6 +9555,66 @@ def r_prewarm_logos():
     """Manually trigger the fuzzy logo prewarm (also runs automatically on boot)."""
     threading.Thread(target=_prewarm_fuzzy_logos, daemon=True).start()
     return jsonify({"ok": True, "message": "Prewarm started in background — check logs"})
+
+
+def _backfill_xg_for_finished_games(limit: int = 50, only_recent_days: int = 60) -> dict:
+    """For finished games we have NO match_shots persisted, fetch the
+    /event/{id}/shotmap from Sofascore and store them. Lets historical
+    team pages show 'xG (for-against)' for matches we never observed
+    live (e.g. when our region was blocked during their kickoff window).
+
+    Bounded to `only_recent_days` so we don't hammer Sofascore for
+    dead-old games no user will look at, and to `limit` per call so a
+    single invocation stays fast.
+    """
+    now_ts  = int(time.time())
+    cutoff  = now_ts - only_recent_days * 86400
+    fetched, persisted, errors = 0, 0, 0
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT g.id FROM games g "
+                "WHERE g.is_finished = 1 AND g.start_ts >= ? "
+                "  AND NOT EXISTS (SELECT 1 FROM match_shots ms WHERE ms.match_id = g.id) "
+                "ORDER BY g.start_ts DESC LIMIT ?",
+                (cutoff, limit)
+            ).fetchall()
+    except Exception as e:
+        return {"ok": False, "error": f"query failed: {e}"}
+
+    for r in rows:
+        gid = r["id"]
+        try:
+            shots = get_shotmap(gid)
+        except Exception as e:
+            log.debug(f"_backfill_xg: shotmap failed for {gid}: {e}")
+            errors += 1
+            continue
+        # get_shotmap returns dict with homeShots/awayShots even on empty
+        if shots and (shots.get("homeShots") or shots.get("awayShots")):
+            _persist_shots(gid, shots)
+            persisted += 1
+        fetched += 1
+
+    log.info(f"_backfill_xg: fetched={fetched} · persisted={persisted} · errors={errors} (limit={limit})")
+    return {"ok": True, "fetched": fetched, "persisted": persisted, "errors": errors}
+
+
+@app.route("/api/admin/backfill-xg", methods=["POST", "GET"])
+def r_admin_backfill_xg():
+    """Backfill missing xG (match_shots rows) for recently-finished games.
+    Useful after the team-page perspective fix — older games whose live
+    state we never captured can now show their post-match xG once this
+    runs. Rate-limited per call (limit=50) so a manual trigger never
+    overloads the Sofascore API."""
+    try:
+        limit = int(flask_request.args.get("limit", 50))
+        days  = int(flask_request.args.get("days",  60))
+    except ValueError:
+        return jsonify({"ok": False, "error": "limit/days must be ints"}), 400
+    result = _backfill_xg_for_finished_games(limit=limit, only_recent_days=days)
+    status = 200 if result.get("ok") else 500
+    return jsonify(result), status
 
 
 @app.route("/api/admin/recover-stale-tips", methods=["POST", "GET"])
