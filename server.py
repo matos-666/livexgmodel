@@ -9105,6 +9105,17 @@ _logos_norm_cache: dict = {}   # normalized_name → url  (for fuzzy lookup)
 _logos_ts: float  = 0.0
 _LOGOS_TTL = 600               # refresh every 10 min
 
+# Shared on-disk snapshot. With multiple gunicorn workers each process has
+# its own _logos_cache; one worker calling /api/admin/refresh-logos only
+# updates ITS cache, leaving the others returning stale fuzzy matches (or
+# stale 'None' entries cached in _fuzzy_logo_memo). Solution: every refresh
+# also writes to /data/logos_cache.json (persistent volume), and every
+# worker's _get_logos() checks the file mtime — if newer than its in-memory
+# state, the worker reloads from disk (fast) and clears its memo. End result:
+# changes propagate across all workers within one request.
+_LOGOS_DISK_SNAPSHOT = "/data/logos_cache.json"
+_logos_disk_mtime_seen: float = 0.0
+
 # Words to strip when normalizing team names for matching
 _NOISE_WORDS = {"fc", "cf", "sc", "ac", "as", "afc", "fk", "sk", "bk", "1fc",
                 "club", "calcio", "united", "city", "town", "rovers", "wanderers",
@@ -9180,11 +9191,60 @@ def _load_logos():
     _logos_cache      = logos
     _logos_norm_cache = logos_norm
     _logos_ts         = time.time()
-    # Bust the long-lived memoization cache so sheet edits propagate.
     _fuzzy_logo_memo.clear()
-    log.info(f"Team logos loaded: {len(logos)} entries ({len(logos_norm)} normalized); memo cleared")
+
+    # Persist to /data so other gunicorn workers can pick up the same data
+    # on their next request without each having to re-fetch the sheet.
+    try:
+        import json as _json, tempfile, os as _os
+        snap = {"ts": _logos_ts, "logos": logos, "logos_norm": logos_norm}
+        # Atomic write: tmp file + rename so concurrent reads never see a
+        # half-written JSON.
+        d = _os.path.dirname(_LOGOS_DISK_SNAPSHOT)
+        _os.makedirs(d, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=d, delete=False) as fh:
+            _json.dump(snap, fh)
+            tmp_path = fh.name
+        _os.replace(tmp_path, _LOGOS_DISK_SNAPSHOT)
+        global _logos_disk_mtime_seen
+        _logos_disk_mtime_seen = _os.path.getmtime(_LOGOS_DISK_SNAPSHOT)
+    except Exception as e:
+        log.warning(f"_load_logos: failed to write disk snapshot: {e}")
+
+    log.info(f"Team logos loaded: {len(logos)} entries ({len(logos_norm)} normalized); memo cleared; disk snapshot updated")
+
+
+def _maybe_reload_from_disk():
+    """If a sibling worker wrote a fresher snapshot since we last looked,
+    reload our in-memory cache from it. Cheap: only stat() the file."""
+    global _logos_cache, _logos_norm_cache, _logos_ts, _logos_disk_mtime_seen
+    try:
+        import os as _os, json as _json
+        if not _os.path.exists(_LOGOS_DISK_SNAPSHOT):
+            return False
+        mtime = _os.path.getmtime(_LOGOS_DISK_SNAPSHOT)
+        if mtime <= _logos_disk_mtime_seen:
+            return False
+        with open(_LOGOS_DISK_SNAPSHOT, "r") as fh:
+            snap = _json.load(fh)
+        _logos_cache      = snap.get("logos", {}) or {}
+        _logos_norm_cache = snap.get("logos_norm", {}) or {}
+        _logos_ts         = float(snap.get("ts") or time.time())
+        _logos_disk_mtime_seen = mtime
+        _fuzzy_logo_memo.clear()
+        log.info(f"_maybe_reload_from_disk: synced from disk snapshot ({len(_logos_cache)} entries)")
+        return True
+    except Exception as e:
+        log.warning(f"_maybe_reload_from_disk failed: {e}")
+        return False
+
 
 def _get_logos():
+    # FIRST: pick up any fresher snapshot another worker may have just written.
+    # This is the cross-worker sync point — without it, a refresh on worker A
+    # leaves worker B serving stale data until its own TTL kicks in.
+    _maybe_reload_from_disk()
+
     # NEVER block a gevent worker — curl_cffi is not gevent-compatible.
     # If cache is empty or stale, kick off a background thread and return
     # whatever we have immediately (empty dict on first boot, stale on refresh).
