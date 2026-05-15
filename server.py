@@ -9078,11 +9078,24 @@ def r_delete_tip(match_id):
 
 
 # ── Team Logos ──
-_LOGOS_SHEET = (
+# We read from TWO tabs in the same sheet:
+#   1. team_logos_master     — primary, we own. Auto-populated with every team
+#                              name we've ever seen (col A) + manual logo URL (col B).
+#                              Wins on conflicts.
+#   2. footballstats team logo — legacy, large but with name-mismatch issues.
+#                              Used as fallback for teams not yet filled in tab 1.
+_LOGOS_SHEET_PRIMARY = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1tDUlWmZZcJKXHd0Nlr5QIm1V15OMsvkOgfhXUuPI9_M/"
+    "gviz/tq?tqx=out:csv&sheet=team_logos_master"
+)
+_LOGOS_SHEET_LEGACY = (
     "https://docs.google.com/spreadsheets/d/"
     "1tDUlWmZZcJKXHd0Nlr5QIm1V15OMsvkOgfhXUuPI9_M/"
     "gviz/tq?tqx=out:csv&sheet=footballstats+team+logo"
 )
+# Kept for backwards-compat callers — points to the primary tab now.
+_LOGOS_SHEET = _LOGOS_SHEET_PRIMARY
 _logos_cache: dict = {}        # original_name → url
 _logos_norm_cache: dict = {}   # normalized_name → url  (for fuzzy lookup)
 _logos_ts: float  = 0.0
@@ -9113,37 +9126,59 @@ def _normalize_team_for_logo(name: str) -> str:
     return cleaned
 
 def _load_logos():
+    """Pull both sheet tabs and merge into one cache.
+
+    Order of precedence (last write wins per key):
+      1. legacy tab loaded FIRST (broad coverage, name-mismatch risk)
+      2. primary 'team_logos_master' loaded SECOND, overwrites legacy entries
+         when a curated row exists. This guarantees the manual list always
+         beats stale fuzzy hits from the old tab.
+    """
     global _logos_cache, _logos_norm_cache, _logos_ts
     import csv, io
-    try:
-        resp = _session.get(_LOGOS_SHEET, timeout=30)
-        resp.raise_for_status()
-        reader = csv.reader(io.StringIO(resp.text))
-        logos = {}
-        logos_norm = {}
-        for row in reader:
-            # Two paired columns: (col0=name, col1=url) and (col3=name, col5=url)
+
+    def _ingest(csv_text: str, into_logos: dict, into_norm: dict, label: str) -> int:
+        added = 0
+        for row in csv.reader(io.StringIO(csv_text)):
+            # Primary tab uses 2 cols (name, url). Legacy uses 6 cols with
+            # paired (name,url) at positions (0,1) and (3,5). We try both
+            # patterns on every row — extra positions are no-ops on the
+            # primary tab.
             for name_i, url_i in [(0, 1), (3, 5)]:
                 if len(row) > url_i:
-                    name = row[name_i].strip()
-                    url  = row[url_i].strip()
+                    name = (row[name_i] or "").strip()
+                    url  = (row[url_i]  or "").strip()
                     if name and url.startswith("http"):
-                        logos[name] = url
-                        # also index by normalized key for fuzzy lookups
+                        into_logos[name] = url
                         nkey = _normalize_team_for_logo(name)
-                        if nkey and nkey not in logos_norm:
-                            logos_norm[nkey] = url
-        _logos_cache      = logos
-        _logos_norm_cache = logos_norm
-        _logos_ts         = time.time()
-        # Bust the long-lived memoization cache so URL edits in the sheet
-        # (e.g. swapping a team's logo to a new file) actually propagate.
-        # Without this, _fuzzy_logo_memo[name] keeps returning the original
-        # URL forever even after the sheet was updated — observed bug.
-        _fuzzy_logo_memo.clear()
-        log.info(f"Team logos loaded: {len(logos)} entries ({len(logos_norm)} normalized); memo cleared")
-    except Exception as e:
-        log.error(f"Failed to load team logos: {e}")
+                        if nkey:
+                            into_norm[nkey] = url   # latest wins
+                        added += 1
+        log.info(f"  · {label}: ingested {added} entries")
+        return added
+
+    logos: dict = {}
+    logos_norm: dict = {}
+
+    for sheet_url, label in [(_LOGOS_SHEET_LEGACY,  "legacy tab"),
+                              (_LOGOS_SHEET_PRIMARY, "team_logos_master tab")]:
+        try:
+            resp = _session.get(sheet_url, timeout=30)
+            resp.raise_for_status()
+            _ingest(resp.text, logos, logos_norm, label)
+        except Exception as e:
+            log.warning(f"_load_logos: {label} fetch failed: {e}")
+
+    if not logos:
+        log.error("_load_logos: BOTH tabs failed — keeping previous cache")
+        return
+
+    _logos_cache      = logos
+    _logos_norm_cache = logos_norm
+    _logos_ts         = time.time()
+    # Bust the long-lived memoization cache so sheet edits propagate.
+    _fuzzy_logo_memo.clear()
+    log.info(f"Team logos loaded: {len(logos)} entries ({len(logos_norm)} normalized); memo cleared")
 
 def _get_logos():
     # NEVER block a gevent worker — curl_cffi is not gevent-compatible.
@@ -9368,6 +9403,88 @@ def r_refresh_logos():
         "memo_cleared":  True,
         "team":          name or None,
         "team_url":      team_url,
+    })
+
+
+@app.route("/api/admin/logos/missing-teams", methods=["GET"])
+def r_logos_missing_teams():
+    """Lists every team in our DB + upcoming cache + live state for which the
+    logo cache currently has NO entry. Use this to know exactly which rows
+    you need to fill in the team_logos_master sheet tab.
+
+    Query params:
+      ?format=tsv  → returns tab-separated text ready to paste into Sheets
+                     (columns: team_name, logo_url, total_games, competitions)
+      (default JSON)
+    """
+    from collections import Counter
+    seen = Counter()
+    tournaments_for = {}
+
+    # 1. Games table
+    try:
+        with _db() as conn:
+            for r in conn.execute(
+                "SELECT home_team AS team, tournament FROM games WHERE home_team IS NOT NULL "
+                "UNION ALL "
+                "SELECT away_team AS team, tournament FROM games WHERE away_team IS NOT NULL"
+            ):
+                t = (r["team"] or "").strip()
+                if not t: continue
+                seen[t] += 1
+                tournaments_for.setdefault(t, set()).add(r["tournament"] or "")
+    except Exception as e:
+        log.warning(f"missing-teams: games query failed: {e}")
+
+    # 2. Upcoming cache + live state
+    try:
+        for cached in (_upcoming_cache or {}).values():
+            for m in (cached or {}).get("matches", []):
+                for k in ("homeTeam", "awayTeam"):
+                    t = (m.get(k) or "").strip()
+                    if t and t not in seen:
+                        seen[t] = 1
+                        tournaments_for.setdefault(t, set()).add(m.get("tournament", ""))
+        with _state_lock:
+            for entry in _live_state.values():
+                m = entry.get("match", {})
+                for k in ("homeTeam", "awayTeam"):
+                    t = (m.get(k) or "").strip()
+                    if t and t not in seen:
+                        seen[t] = 1
+                        tournaments_for.setdefault(t, set()).add(m.get("tournament", ""))
+    except Exception:
+        pass
+
+    # 3. Cross-reference against the merged logo cache
+    have = set(_logos_cache.keys())
+    have_norm = set(_logos_norm_cache.keys())
+    missing = []
+    for team, n in seen.most_common():
+        if team in have:
+            continue
+        if _normalize_team_for_logo(team) in have_norm:
+            continue
+        missing.append({
+            "team_name":     team,
+            "total_games":   n,
+            "competitions":  " · ".join(sorted(c for c in tournaments_for.get(team, set()) if c))[:120],
+        })
+
+    fmt = (flask_request.args.get("format") or "json").strip().lower()
+    if fmt == "tsv":
+        lines = ["team_name\tlogo_url\ttotal_games\tcompetitions"]
+        for m in missing:
+            lines.append(f"{m['team_name']}\t\t{m['total_games']}\t{m['competitions']}")
+        body = "\n".join(lines) + "\n"
+        return Response(body, mimetype="text/tab-separated-values",
+                        headers={"Content-Disposition":
+                                 f"inline; filename=missing_team_logos.tsv"})
+
+    return jsonify({
+        "total_teams_in_system": len(seen),
+        "teams_with_logo":       len(seen) - len(missing),
+        "missing":               missing,
     })
 
 
