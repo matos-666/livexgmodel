@@ -5705,12 +5705,61 @@ def _maybe_broadcast_match_recaps():
         log.error(f"BetRadar recap: import builder failed: {e}")
         return
 
+    # Same logo-fetch helper used by the admin endpoint — TLS-impersonated
+    # via curl_cffi so Sofascore's CDN actually serves the image.
+    def _fetch_logo_img(team_id):
+        if not team_id or not _session:
+            return None
+        try:
+            url = f"https://api.sofascore.app/api/v1/team/{team_id}/image"
+            resp = _session.get(url, timeout=6)
+            if resp.status_code != 200 or not resp.content:
+                return None
+            from PIL import Image as _PIL
+            import io as _io
+            img = _PIL.open(_io.BytesIO(resp.content)).convert("RGBA")
+            img.thumbnail((192, 192), _PIL.LANCZOS)
+            return img
+        except Exception as e:
+            log.warning(f"recap logo fetch failed team_id={team_id}: {e}")
+            return None
+
     now_ts = int(time.time())
     for r in rows:
         mid = r["id"]
+        # CLAIM-FIRST: insert the dedup row before any heavy work. INSERT OR
+        # IGNORE means a concurrent caller (e.g. an admin/resolve while the
+        # BG cycle is also running) gets rowcount=0 and bails — guarantees
+        # exactly-once broadcast even under races. The row is updated with
+        # the real profit_u after the broadcast succeeds.
         try:
+            with _db() as conn:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO betradar_recap_sent "
+                    "(match_id, profit_u, sent_at) VALUES (?, ?, ?)",
+                    (mid, float(r["profit_u"]), now_ts)
+                )
+                if cur.rowcount == 0:
+                    log.info(f"BetRadar recap: match #{mid} already claimed, skipping")
+                    continue
+        except Exception as e:
+            log.error(f"BetRadar recap: claim failed for match #{mid}: {e}")
+            continue
+
+        try:
+            # Pull team_ids for logo fetch.
+            with _db() as conn:
+                team_ids = conn.execute(
+                    "SELECT home_team_id, away_team_id FROM games WHERE id = ?",
+                    (mid,)
+                ).fetchone()
+            logo_home_img = _fetch_logo_img(team_ids["home_team_id"]) if team_ids else None
+            logo_away_img = _fetch_logo_img(team_ids["away_team_id"]) if team_ids else None
+
             out_path = f"/tmp/betradar_auto_{mid}.mp4"
-            result = build_recap(mid, out_path, db_path=str(DB_PATH))
+            result = build_recap(mid, out_path, db_path=str(DB_PATH),
+                                  home_logo_img=logo_home_img,
+                                  away_logo_img=logo_away_img)
             actual_path = result.split(" (", 1)[0] if isinstance(result, str) else out_path
             with open(actual_path, "rb") as fh:
                 anim_bytes = fh.read()
@@ -5728,15 +5777,15 @@ def _maybe_broadcast_match_recaps():
                     f"upload {stats['sent_with_upload']}, by_id {stats['sent_with_id']}, "
                     f"failed {stats['failed']}"
                 )
-
-            with _db() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO betradar_recap_sent "
-                    "(match_id, profit_u, sent_at) VALUES (?, ?, ?)",
-                    (mid, float(r["profit_u"]), now_ts)
-                )
         except Exception as e:
-            log.error(f"BetRadar recap: match #{mid} failed: {e}")
+            log.error(f"BetRadar recap: match #{mid} broadcast failed: {e}")
+            # Roll back the claim so a future cycle can retry. Without this,
+            # a transient curl_cffi error would silently swallow the recap.
+            try:
+                with _db() as conn:
+                    conn.execute("DELETE FROM betradar_recap_sent WHERE match_id = ?", (mid,))
+            except Exception:
+                pass
 
 
 def _background_loop():
