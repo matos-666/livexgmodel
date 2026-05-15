@@ -3463,13 +3463,26 @@ def r_search():
 
 @app.route("/api/match/<int:eid>")
 def r_match(eid):
-    """Full match data including odds & value analysis."""
+    """Full match data including odds & value analysis.
+
+    The 'tournament' field is canonicalised before returning — SPA
+    breadcrumbs/links use this to land users on the unified league page
+    instead of split-format variants like 'Pro League, Conference League
+    Playoffs' (Belgium) or 'Eredivisie, Championship Round'.
+    """
     try:
         d = get_event(eid)
         if not d: return jsonify({"error": "Not found"}), 404
         shots = get_shotmap(eid)
         incidents = get_incidents(eid)
         odds = get_full_odds_analysis(d, shots)
+
+        # Canonicalise tournament + add the raw form for traceability.
+        tourn_raw = d.get("tournament", "")
+        if tourn_raw:
+            canonical = _normalize_tournament_pretty(tourn_raw) or tourn_raw
+            d["tournament_raw"] = tourn_raw
+            d["tournament"]     = canonical
 
         return jsonify({
             "match": d,
@@ -9079,6 +9092,12 @@ def r_state_tips():
             # Inject logos directly so the frontend makes zero extra requests
             gd["home_logo"] = _quick_logo(g["home_team"])
             gd["away_logo"] = _quick_logo(g["away_team"])
+            # Canonicalise tournament so cards/links land users on the
+            # unified league page (e.g. 'Pro League, Conference League
+            # Playoffs' → 'Pro League'). Raw kept for traceability.
+            if gd.get("tournament"):
+                gd["tournament_raw"] = gd["tournament"]
+                gd["tournament"] = _normalize_tournament_pretty(gd["tournament"]) or gd["tournament"]
             result.append(gd)
     return jsonify({"games": result, "count": len(result)})
 
@@ -12051,7 +12070,12 @@ def prerender_match(match_id: int):
             iso_start = _dt.fromtimestamp(ts, tz=_tz.utc).isoformat() if ts else ""
             home = event.get('homeTeam', '')
             away = event.get('awayTeam', '')
-            tourn_name = event.get('tournament', '')
+            tourn_raw      = event.get('tournament', '')
+            # Collapse split-format tournaments ('Pro League, Conference
+            # League Playoffs', 'Eredivisie, Championship Round', etc.)
+            # into the canonical league name so the breadcrumb and the
+            # /league/<slug> link both point to the unified page.
+            tourn_canonical = _normalize_tournament_pretty(tourn_raw) or tourn_raw
             jsonld = json.dumps([
                 {
                     "@context":  "https://schema.org",
@@ -12062,11 +12086,11 @@ def prerender_match(match_id: int):
                     "url":       canonical,
                     "homeTeam":  {"@type": "SportsTeam", "name": home},
                     "awayTeam":  {"@type": "SportsTeam", "name": away},
-                    "location":  {"@type": "Place", "name": tourn_name},
+                    "location":  {"@type": "Place", "name": tourn_canonical},
                 },
                 _breadcrumb_jsonld([
                     ("WebPronos", "/"),
-                    *([(tourn_name, f"/league/{_slug(tourn_name)}")] if tourn_name else []),
+                    *([(tourn_canonical, f"/league/{_slug(tourn_canonical)}")] if tourn_canonical else []),
                     (f"{home} vs {away}", canonical.replace(SITE_URL, "")),
                 ]),
             ], ensure_ascii=False)
