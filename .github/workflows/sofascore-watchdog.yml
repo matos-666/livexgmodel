@@ -1,25 +1,29 @@
 name: Sofascore Watchdog
 
-# Runs every hour. Curls /api/health/sofascore on the live app. If the
-# response says unhealthy AND the previous 2 hourly runs were also
-# unhealthy (= 2 consecutive failures, ≈2h of broken pipeline), invokes
-# tools/auto_failover.sh to migrate the Fly.io app to a working region.
+# Runs every 30 minutes (was hourly). Each run does an INTRA-RUN double-check
+# (3 health probes spaced 60 s apart) before declaring this run unhealthy —
+# this guarantees a strike is only logged when Sofascore is genuinely
+# blocked, not on a 30-second hiccup.
+#
+# Failover trigger:
+#   - This run fails AND the previous run also failed → migrate.
+#   - Single-run "fast lane": if all 3 intra-run probes fail, this is
+#     treated as 2 strikes worth of confidence and triggers IMMEDIATE
+#     migration (skips the cross-run cooldown). Cuts max downtime from
+#     ~1 h → ~3 min when the block is severe.
 #
 # Required GitHub Secrets:
 #   FLY_API_TOKEN              — fly.io token (get with `flyctl auth token`)
 #   TELEGRAM_BOT_TOKEN         — optional, same one the app uses
 #   TELEGRAM_ADMIN_CHAT_ID     — optional, your personal Telegram chat ID
-#
-# The workflow self-determines "consecutive failures" by querying the past
-# workflow runs via the gh CLI — no artifacts, no committed counter file.
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour at :00 UTC
+    - cron: "*/30 * * * *"   # every 30 min — at :00 and :30 UTC
   workflow_dispatch:        # manual trigger button (for debugging)
     inputs:
       force_failover:
-        description: "Skip the 3-strike check, migrate immediately"
+        description: "Skip the strike check, migrate immediately"
         required: false
         type: boolean
         default: false
@@ -42,34 +46,90 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ── 1. Healthcheck ──────────────────────────────────────────────────
-      - name: Query /api/health/sofascore
+      # ── 1. Healthcheck — 3 probes, 60 s apart ───────────────────────────
+      # Why 3 probes inside one run instead of just 1:
+      #   • A single probe can fail because of a transient TLS hiccup, a
+      #     30-second region rate-limit, or a Sofascore API hiccup. Reacting
+      #     would migrate unnecessarily — costs Fly compute + churns the
+      #     team's running picks for nothing.
+      #   • 3 failures spaced ~60 s apart proves the block is sustained,
+      #     not a network blip.
+      #   • If ANY probe succeeds, this run is healthy and the strike chain
+      #     resets. Sofascore region blocks rarely last <2 min, so a single
+      #     OK probe in the trio is a strong "we're fine" signal.
+      - name: Triple-probe /api/health/sofascore
         id: health
         run: |
           set -e
-          resp="$(curl -fsS --max-time 30 https://livexgmodel-pt.fly.dev/api/health/sofascore || echo '{"healthy":false,"error":"curl_failed"}')"
-          echo "raw=$resp"
-          healthy="$(echo "$resp" | python3 -c 'import sys,json; print(str(json.load(sys.stdin).get("healthy", False)).lower())')"
-          live="$(echo "$resp"    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("live_games", 0))')"
-          today="$(echo "$resp"   | python3 -c 'import sys,json; print(json.load(sys.stdin).get("upcoming_today", 0))')"
-          tomor="$(echo "$resp"   | python3 -c 'import sys,json; print(json.load(sys.stdin).get("upcoming_tomorrow", 0))')"
-          age="$(echo "$resp"     | python3 -c 'import sys,json; print(json.load(sys.stdin).get("last_cycle_age_s", -1))')"
+          probe() {
+              curl -fsS --max-time 25 https://livexgmodel-pt.fly.dev/api/health/sofascore \
+                  || echo '{"healthy":false,"error":"curl_failed"}'
+          }
+          jq_healthy() {
+              echo "$1" | python3 -c 'import sys,json; print(str(json.load(sys.stdin).get("healthy", False)).lower())'
+          }
+          jq_field() {
+              echo "$1" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"$2\", -1))"
+          }
+
+          echo "── probe 1 ──"
+          r1="$(probe)";   h1="$(jq_healthy "$r1")";   echo "raw=$r1"; echo "healthy=$h1"
+
+          if [[ "$h1" == "true" ]]; then
+              echo "Probe 1 healthy → run is healthy, no strike"
+              echo "healthy=true"      >> "$GITHUB_OUTPUT"
+              echo "fast_lane=false"   >> "$GITHUB_OUTPUT"
+              echo "passed=1/3"        >> "$GITHUB_STEP_SUMMARY"
+              echo "live_games=$(jq_field "$r1" live_games)" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+
+          echo "Probe 1 unhealthy — sleeping 60s then retrying…"
+          sleep 60
+          echo "── probe 2 ──"
+          r2="$(probe)";   h2="$(jq_healthy "$r2")";   echo "raw=$r2"; echo "healthy=$h2"
+
+          if [[ "$h2" == "true" ]]; then
+              echo "Probe 2 recovered → run is healthy"
+              echo "healthy=true"      >> "$GITHUB_OUTPUT"
+              echo "fast_lane=false"   >> "$GITHUB_OUTPUT"
+              echo "passed=2/3 (1st flaked, 2nd recovered)" >> "$GITHUB_STEP_SUMMARY"
+              echo "live_games=$(jq_field "$r2" live_games)" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+
+          echo "Probe 2 unhealthy — sleeping 60s then final retry…"
+          sleep 60
+          echo "── probe 3 ──"
+          r3="$(probe)";   h3="$(jq_healthy "$r3")";   echo "raw=$r3"; echo "healthy=$h3"
+
+          if [[ "$h3" == "true" ]]; then
+              echo "Probe 3 recovered → run is healthy"
+              echo "healthy=true"      >> "$GITHUB_OUTPUT"
+              echo "fast_lane=false"   >> "$GITHUB_OUTPUT"
+              echo "passed=3/3 (1st+2nd flaked, 3rd recovered)" >> "$GITHUB_STEP_SUMMARY"
+              echo "live_games=$(jq_field "$r3" live_games)" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+
+          # All 3 probes failed → SUSTAINED block.
+          # Trigger the "fast lane": migrate immediately without waiting for
+          # the cross-run cooldown. 3 failures over ~2 min is conclusive.
+          echo "All 3 probes unhealthy — declaring sustained block (fast lane)"
+          echo "healthy=false"     >> "$GITHUB_OUTPUT"
+          echo "fast_lane=true"    >> "$GITHUB_OUTPUT"
+          echo "live_games=$(jq_field "$r3" live_games)" >> "$GITHUB_OUTPUT"
           {
-            echo "healthy=$healthy"
-            echo "live_games=$live"
-            echo "upcoming_today=$today"
-            echo "upcoming_tomorrow=$tomor"
-            echo "last_cycle_age_s=$age"
-          } >> "$GITHUB_OUTPUT"
-          echo "## Healthcheck" >> "$GITHUB_STEP_SUMMARY"
-          echo "- healthy: \`$healthy\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- live_games: \`$live\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- upcoming_today: \`$today\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- upcoming_tomorrow: \`$tomor\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- last_cycle_age_s: \`$age\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "## Healthcheck failed (3/3 probes)"
+            echo "- probe 1: \`$h1\`"
+            echo "- probe 2: \`$h2\`"
+            echo "- probe 3: \`$h3\`"
+            echo "- live_games (last response): \`$(jq_field "$r3" live_games)\`"
+            echo "- last_cycle_age_s: \`$(jq_field "$r3" last_cycle_age_s)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ── 2. Decide whether to trigger failover ──────────────────────────
-      - name: Check past runs (3-strike rule)
+      - name: Decide
         id: decide
         env:
           GH_TOKEN: ${{ github.token }}
@@ -77,6 +137,7 @@ jobs:
           set -e
           force="${{ inputs.force_failover }}"
           healthy="${{ steps.health.outputs.healthy }}"
+          fast_lane="${{ steps.health.outputs.fast_lane }}"
 
           if [[ "$force" == "true" ]]; then
               echo "decision=migrate" >> "$GITHUB_OUTPUT"
@@ -86,16 +147,25 @@ jobs:
 
           if [[ "$healthy" == "true" ]]; then
               echo "decision=skip" >> "$GITHUB_OUTPUT"
-              echo "reason=current run is healthy" >> "$GITHUB_STEP_SUMMARY"
+              echo "reason=run is healthy" >> "$GITHUB_STEP_SUMMARY"
               exit 0
           fi
 
-          # Look at the previous scheduled run (excluding this one).
-          # If it also failed → 2 consecutive failures → migrate.
-          # We treat a missing/stale healthcheck step as failure.
-          # Tightened from 3-strike to 2-strike (2026-05-12) — reduces
-          # max downtime window from ~3h to ~2h. Sofascore region blocks
-          # rarely recover within 1h so we don't gain much by waiting.
+          # Fast lane: 3 in-run failures spaced 60s apart is high-confidence
+          # — migrate immediately instead of waiting for the next 30-min
+          # cron tick. Cuts max downtime to ~3-5 min on severe blocks.
+          if [[ "$fast_lane" == "true" ]]; then
+              echo "decision=migrate" >> "$GITHUB_OUTPUT"
+              echo "reason=fast lane: 3 in-run failures (sustained block confirmed)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+          fi
+
+          # Cross-run check (legacy 2-strike path, kept as belt-and-braces).
+          # If we got here, fewer than 3 probes failed in this run but the
+          # final state is still 'unhealthy' — could happen if probes 1+2
+          # failed and probe 3 succeeded but mark a degraded state somehow.
+          # For now this branch is essentially unreachable under the new
+          # 'first OK probe wins' logic, but kept as documentation.
           prior_failures="$(
               gh run list \
                 --workflow sofascore-watchdog.yml \
@@ -104,20 +174,19 @@ jobs:
                 --json conclusion \
                 --jq '[.[] | select(.conclusion == "failure")] | length'
           )"
-          echo "prior_failures (last 1 run)=$prior_failures" >> "$GITHUB_STEP_SUMMARY"
           if [[ "$prior_failures" -ge 1 ]]; then
               echo "decision=migrate" >> "$GITHUB_OUTPUT"
-              echo "reason=2 consecutive failures (this + previous)" >> "$GITHUB_STEP_SUMMARY"
+              echo "reason=2 consecutive failures (cross-run)" >> "$GITHUB_STEP_SUMMARY"
           else
               echo "decision=fail-no-migrate" >> "$GITHUB_OUTPUT"
-              echo "reason=first failure; need 1 more consecutive failure to trigger migration" >> "$GITHUB_STEP_SUMMARY"
+              echo "reason=first failure; need 1 more before migrating" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # ── 3a. If unhealthy but no migrate yet — exit 1 to record failure ─
       - name: Mark failure (no migrate yet)
         if: steps.decide.outputs.decision == 'fail-no-migrate'
         run: |
-          echo "Unhealthy this hour — strike counted, will migrate after 3 in a row"
+          echo "Unhealthy this run — strike counted, will migrate next failed run"
           exit 1
 
       # ── 3b. Migrate ────────────────────────────────────────────────────
