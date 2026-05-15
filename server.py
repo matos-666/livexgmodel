@@ -6464,7 +6464,7 @@ def _team_performance(name: str, recent_n: int = 5) -> dict:
             ids_csv = ",".join(str(g["id"]) for g in games)
             xg_rows = conn.execute(
                 f"SELECT match_id, is_home, SUM(xg) AS sum_xg "
-                f"FROM match_shots WHERE match_id IN ({ids_csv}) "
+                f"FROM match_shots WHERE match_id IN ({ids_csv}) AND minute >= 0 "
                 f"GROUP BY match_id, is_home"
             ).fetchall()
             xg_by = {}
@@ -6625,7 +6625,7 @@ def _league_performance(variants: list[str], recent_days: int = 30) -> dict:
             ids_csv = ",".join(str(g["id"]) for g in games)
             xg_rows = conn.execute(
                 f"SELECT match_id, SUM(xg) AS total_xg "
-                f"FROM match_shots WHERE match_id IN ({ids_csv}) "
+                f"FROM match_shots WHERE match_id IN ({ids_csv}) AND minute >= 0 "
                 f"GROUP BY match_id"
             ).fetchall()
             if xg_rows:
@@ -8818,7 +8818,7 @@ def r_match_timeline(mid: int):
                 SELECT minute, added_time, is_home, xg, is_goal, is_penalty,
                        player, shot_type, situation, body_part
                 FROM match_shots
-                WHERE match_id = ?
+                WHERE match_id = ? AND minute >= 0
                 ORDER BY minute, added_time, is_home
             """, (mid,)).fetchall()
 
@@ -8879,7 +8879,7 @@ def r_match_timeline_export(mid: int):
                 return Response("Match not found", status=404, mimetype="text/plain")
             shots = conn.execute("""
                 SELECT minute, added_time, is_home, xg, is_goal
-                FROM match_shots WHERE match_id = ?
+                FROM match_shots WHERE match_id = ? AND minute >= 0
                 ORDER BY minute, added_time
             """, (mid,)).fetchall()
             tips = conn.execute("""
@@ -9594,6 +9594,23 @@ def _backfill_xg_for_finished_games(limit: int = 50, only_recent_days: int = 60)
         if shots and (shots.get("homeShots") or shots.get("awayShots")):
             _persist_shots(gid, shots)
             persisted += 1
+        else:
+            # Empty/unavailable shotmap (lower divisions, women's, archived
+            # data) — write a sentinel row so future backfill calls skip
+            # this game instead of retrying it forever. Sentinel has xg=0
+            # and minute=-1; readers filter on xg > 0 so it's invisible
+            # to chart/stat code.
+            try:
+                with _db() as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO match_shots "
+                        "(match_id, minute, added_time, is_home, xg, is_goal, is_penalty, "
+                        " player, shot_type, situation, body_part, recorded_at) "
+                        "VALUES (?, -1, 0, 0, 0, 0, 0, '_no_data', '_no_data', '_no_data', '_no_data', ?)",
+                        (gid, now_ts)
+                    )
+            except Exception as e:
+                log.debug(f"_backfill_xg: sentinel insert failed for {gid}: {e}")
         fetched += 1
 
     log.info(f"_backfill_xg: fetched={fetched} · persisted={persisted} · errors={errors} (limit={limit})")
