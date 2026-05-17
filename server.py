@@ -6205,14 +6205,37 @@ def _is_monitored_league_strict(tournament, country):
     return False
 
 
+# In-memory cache for /api/today/monitored. Today's fixture list doesn't
+# change minute-by-minute (kickoffs are scheduled hours ahead, only the
+# isFinished/isLive flags flip during play — and live data is already
+# served by /api/state). 60s TTL gives a ~150ms cache-HIT path on the
+# home critical chain (was 0.4-2.5s cold hit to Sofascore).
+_today_monitored_cache: dict = {}   # date_str → (ts, response_dict)
+_TODAY_MONITORED_TTL = 60
+
+
 @app.route("/api/today/monitored")
 def r_today_monitored():
-    """Scheduled games for a given date (default: today) for monitored leagues only."""
+    """Scheduled games for a given date (default: today) for monitored leagues only.
+
+    Response is trimmed to the fields the home/today UI actually renders —
+    Sofascore's raw `tournament` object alone is ~2 KB per match, ×100
+    matches that's 200 KB of bloat that just inflates page weight without
+    being displayed anywhere.
+    """
     try:
         # Parse optional date parameter (YYYY-MM-DD)
         date_str = flask_request.args.get("date")
         if not date_str:
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Cache fast lane (skip Sofascore + filtering + trimming on hot path).
+        cached = _today_monitored_cache.get(date_str)
+        if cached and (time.time() - cached[0]) < _TODAY_MONITORED_TTL:
+            resp = jsonify(cached[1])
+            resp.headers["Cache-Control"] = f"public, max-age={_TODAY_MONITORED_TTL}, s-maxage={_TODAY_MONITORED_TTL}"
+            resp.headers["X-Cache"] = "HIT"
+            return resp
 
         # Fetch scheduled games for the given date
         url = f"{SOFASCORE_API}/sport/football/scheduled-events/{date_str}"
@@ -6247,16 +6270,42 @@ def r_today_monitored():
                 country_name = ""
 
             if _is_monitored_league_strict(tourn_name, country_name):
-                sk = _resolve_sport_key(tourn_name, country_name)
-                m["_sport_key"] = sk
                 # Extract team names from team objects if needed
-                if isinstance(m.get("homeTeam"), dict):
-                    m["homeTeam"] = m["homeTeam"].get("name", "")
-                if isinstance(m.get("awayTeam"), dict):
-                    m["awayTeam"] = m["awayTeam"].get("name", "")
-                result.append(m)
+                home_name = m.get("homeTeam")
+                if isinstance(home_name, dict):
+                    home_name = home_name.get("name", "")
+                away_name = m.get("awayTeam")
+                if isinstance(away_name, dict):
+                    away_name = away_name.get("name", "")
+
+                # Trim to the only fields the home/today UI actually consumes.
+                # Cuts payload ~70% (305 KB → ~95 KB) without losing anything
+                # rendered. Re-fetch full data via /api/match/<id> on detail page.
+                trimmed = {
+                    "id":             m.get("id"),
+                    "homeTeam":       home_name,
+                    "awayTeam":       away_name,
+                    "startTimestamp": ts,
+                    "tournament":     tourn_name,
+                    "country":        country_name,
+                    "slug":           m.get("slug"),
+                    "status":         m.get("status") or {},
+                    "isFinished":     bool(m.get("isFinished")),
+                    "isLive":         bool(m.get("isLive")),
+                    "_sport_key":     _resolve_sport_key(tourn_name, country_name),
+                    # Country-aware logos so homonyms (Athletic Club, etc.)
+                    # resolve to the right crest. Cheap — exact lookup only.
+                    "home_logo":      _quick_logo(home_name, country_name or None),
+                    "away_logo":      _quick_logo(away_name, country_name or None),
+                }
+                result.append(trimmed)
         result.sort(key=lambda m: m.get("startTimestamp") or 0)
-        return jsonify({"count": len(result), "matches": result, "date": date_str})
+        body = {"count": len(result), "matches": result, "date": date_str}
+        _today_monitored_cache[date_str] = (time.time(), body)
+        resp = jsonify(body)
+        resp.headers["Cache-Control"] = f"public, max-age={_TODAY_MONITORED_TTL}, s-maxage={_TODAY_MONITORED_TTL}"
+        resp.headers["X-Cache"] = "MISS"
+        return resp
     except Exception as e:
         log.error(f"r_today_monitored error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -9264,10 +9313,15 @@ def r_state():
     """
     Returns the full pre-computed live state for all monitored games.
     This is what the dashboard polls — zero Odds API requests from the browser.
+
+    Short Cache-Control header (5s) so back-to-back navigations don't
+    re-hit Flask for the same payload. The state itself refreshes from
+    the BG cycle every 30-120s; 5s of browser cache is invisible to
+    users but eliminates redundant fetches during SPA route transitions.
     """
     with _state_lock:
         state_copy = dict(_live_state)
-    return jsonify({
+    resp = jsonify({
         "games":    list(state_copy.values()),
         "count":    len(state_copy),
         "cycleTsIso": datetime.fromtimestamp(_last_cycle_ts, tz=timezone.utc).isoformat() if _last_cycle_ts else None,
@@ -9275,6 +9329,8 @@ def r_state():
         "quotaRemaining": _api_requests_remaining,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+    resp.headers["Cache-Control"] = "public, max-age=5, s-maxage=5"
+    return resp
 
 
 @app.route("/api/match/<int:mid>/timeline")
