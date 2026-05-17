@@ -3577,6 +3577,22 @@ def r_match(eid):
             d["tournament_raw"] = tourn_raw
             d["tournament"]     = canonical
 
+        # Inject team crests resolved with country context. The match page
+        # otherwise calls /api/team_logo/<name> with the plain name, which
+        # makes homonyms (e.g. Athletic Club Spain/Brazil) collide on the
+        # same cache key. Embedding them here means the SPA can render the
+        # right crest immediately without any extra round-trip.
+        try:
+            _h = d.get("homeTeam") or ""
+            _a = d.get("awayTeam") or ""
+            if isinstance(_h, dict): _h = _h.get("name", "")
+            if isinstance(_a, dict): _a = _a.get("name", "")
+            _country = d.get("country") or ""
+            d["home_logo"] = _quick_logo(_h, _country or None)
+            d["away_logo"] = _quick_logo(_a, _country or None)
+        except Exception:
+            pass
+
         return jsonify({
             "match":     d,
             "shots":     shots,
@@ -5368,9 +5384,12 @@ def _run_background_cycle():
                     "minute":     minute,
                 })
 
-            # Inject logos inline — zero extra requests from the frontend
-            m["home_logo"] = _quick_logo(m.get("home_team", ""))
-            m["away_logo"] = _quick_logo(m.get("away_team", ""))
+            # Inject logos inline — zero extra requests from the frontend.
+            # Pass country so homonyms like Athletic Club (Spain/Brazil)
+            # resolve to the right crest.
+            _country = m.get("country") or ""
+            m["home_logo"] = _quick_logo(m.get("home_team", ""), _country or None)
+            m["away_logo"] = _quick_logo(m.get("away_team", ""), _country or None)
 
             new_state[mid] = {
                 "match":     m,
@@ -6284,8 +6303,8 @@ def _fetch_day_matches(date_str: str) -> list:
             "id":             m["id"],
             "homeTeam":       home,
             "awayTeam":       away,
-            "home_logo":      _quick_logo(home),
-            "away_logo":      _quick_logo(away),
+            "home_logo":      _quick_logo(home, country_name or None),
+            "away_logo":      _quick_logo(away, country_name or None),
             "tournament":     tourn_name,
             "tournamentId":   unique_tournament_id,
             "country":        country_name,
@@ -9340,9 +9359,11 @@ def r_state_tips():
                 (g["id"], get_setting("max_minute_for_tips", 85))
             ).fetchall()
             gd["tips"] = [dict(t) for t in tips_rows]
-            # Inject logos directly so the frontend makes zero extra requests
-            gd["home_logo"] = _quick_logo(g["home_team"])
-            gd["away_logo"] = _quick_logo(g["away_team"])
+            # Inject logos directly so the frontend makes zero extra requests.
+            # Pass country to disambiguate homonyms (Athletic Club, etc).
+            _country = g["country"] if "country" in g.keys() else None
+            gd["home_logo"] = _quick_logo(g["home_team"], _country or None)
+            gd["away_logo"] = _quick_logo(g["away_team"], _country or None)
             # Canonicalise tournament so cards/links land users on the
             # unified league page (e.g. 'Pro League, Conference League
             # Playoffs' → 'Pro League'). Raw kept for traceability.
@@ -9637,15 +9658,39 @@ def _get_logos():
 # so each unique team is fuzzy-matched only ONCE per server lifetime.
 _fuzzy_logo_memo: dict = {}
 
-def _quick_logo(name: str) -> str | None:
+def _quick_logo(name: str, country: str | None = None) -> str | None:
     """
     Fast logo lookup — exact + normalized only, NO fuzzy fallback.
     Use this in bulk endpoints (state/tips, upcoming, live state) where 700+
     teams may be looked up per request. Fuzzy matching against 10k logos is
     far too slow for that path. Returns None if no exact match.
+
+    `country` (optional) disambiguates homonyms like "Athletic Club" (Spain
+    = Bilbao) vs "Athletic Club" (Brazil = Belo Horizonte). The sheet
+    should carry rows keyed `"<Team> (<Country>)"` for the disambiguated
+    versions; this lookup tries those FIRST when country is provided,
+    then falls back to the plain name.
     """
     if not name:
         return None
+    # Country-qualified lookup runs first so disambiguated rows win.
+    if country:
+        qkey = f"{name} ({country})"
+        memo_key = f"{qkey}::{country}"
+        if memo_key in _fuzzy_logo_memo:
+            return _fuzzy_logo_memo[memo_key]
+        logos = _get_logos()
+        if logos and qkey in logos:
+            _fuzzy_logo_memo[memo_key] = logos[qkey]
+            return logos[qkey]
+        nkey = _normalize_team_for_logo(qkey)
+        if nkey in _logos_norm_cache:
+            url = _logos_norm_cache[nkey]
+            _fuzzy_logo_memo[memo_key] = url
+            return url
+        # Country-qualified miss — don't cache as None; let the unqualified
+        # path below try, then memo the final result.
+
     if name in _fuzzy_logo_memo:
         return _fuzzy_logo_memo[name]
     logos = _get_logos()
@@ -10351,7 +10396,17 @@ def r_team_logo_lookup(name: str):
     Fuzzy logo lookup for a single team name.
     GET /api/team_logo/Manchester%20Utd
     → {"name": "Manchester Utd", "url": "https://...", "matched": true}
+
+    Optional ?country=Spain disambiguates homonyms like Athletic Club
+    (Spain = Bilbao) vs Athletic Club (Brazil). When provided we try the
+    country-qualified key first, then fall back to the plain name.
     """
+    country = (flask_request.args.get("country") or "").strip() or None
+    # Country-qualified exact-match path first (fast lane).
+    if country:
+        q = _quick_logo(name, country)
+        if q:
+            return jsonify({"name": name, "url": q, "matched": True, "country": country})
     url = _fuzzy_logo(name)
     if url:
         return jsonify({"name": name, "url": url, "matched": True})
@@ -10363,12 +10418,24 @@ def r_team_logos_batch():
     Resolve logos for many teams in one request.
     POST JSON: {"teams": ["Manchester Utd", "Real Betis", ...]}
     → {"results": {"Manchester Utd": "https://...", "Real Betis": null}}
+
+    Each team may be passed as a string OR as {"name": "...", "country": "..."}.
+    The dict form goes through the country-qualified fast lane so homonyms
+    resolve to the right crest. String form keeps backwards compatibility.
     """
     data  = flask_request.get_json(force=True, silent=True) or {}
     names = data.get("teams", [])
     results = {}
-    for n in names[:200]:   # cap at 200 per call
-        results[n] = _fuzzy_logo(n)
+    for item in names[:200]:   # cap at 200 per call
+        if isinstance(item, dict):
+            n = (item.get("name") or "").strip()
+            c = (item.get("country") or "").strip() or None
+            if not n:
+                continue
+            results[n] = _quick_logo(n, c) or _fuzzy_logo(n)
+        else:
+            n = str(item)
+            results[n] = _fuzzy_logo(n)
     return jsonify({"results": results, "resolved": sum(1 for v in results.values() if v)})
 
 @app.route("/api/team_logos/refresh", methods=["POST", "GET"])
