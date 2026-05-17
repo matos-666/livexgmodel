@@ -813,9 +813,17 @@ def _send_daily_summary(days_back: int = 0, force_send: bool = False):
 
         settled = wins + losses
 
-        # Only send if lucro > €25 (unless force_send)
+        # Only send the DAILY recap if lucro > €25. Otherwise (day was
+        # flat or losing) try the monthly fallback — same time slot, same
+        # animation style, but the window is the month-to-date and we
+        # only send if THAT total is in profit. Keeps the bot useful on
+        # quiet/down days without spamming losses.
         if not force_send and lucro <= 25:
-            log.info(f"_send_daily_summary: lucro €{lucro:.2f} below threshold (€25) for {days_back} day(s) ago (use force_send=True to override)")
+            log.info(f"_send_daily_summary: lucro €{lucro:.2f} below threshold (€25) for {days_back} day(s) ago — trying monthly fallback")
+            try:
+                _send_monthly_summary_if_profitable(now_lisbon=now_lisbon)
+            except Exception as e:
+                log.error(f"_send_monthly_summary_if_profitable failed: {e}")
             return
 
         # Calculate average odds and ROI
@@ -917,6 +925,197 @@ def _send_daily_summary(days_back: int = 0, force_send: bool = False):
 
     except Exception as e:
         log.error(f"_send_daily_summary error: {e}", exc_info=True)
+
+
+def _send_monthly_summary_if_profitable(now_lisbon=None, force_send: bool = False):
+    """Fallback for flat/losing days: send a month-to-date recap, but ONLY
+    when the month is in profit. Same Telegram animation style as the
+    daily recap, just with a 'RESUMO MENSAL' header and the window set
+    to [1st of current month 00:00 .. now].
+
+    Dedup'd via the monthly_summary_locks table so a month can only be
+    broadcast once per day even if _send_daily_summary fires multiple
+    times (e.g. retries). The same month CAN re-broadcast on a later
+    day if it's still profitable and that day is also flat — by design,
+    keeps the channel alive on quiet stretches.
+    """
+    try:
+        from datetime import datetime, timedelta
+        lisbon_tz = pytz.timezone('Europe/Lisbon')
+        if now_lisbon is None:
+            now_lisbon = datetime.now(lisbon_tz)
+
+        month_start = datetime(now_lisbon.year, now_lisbon.month, 1, 0, 0, 0, tzinfo=lisbon_tz)
+        month_start_ts = int(month_start.timestamp())
+        # End window = end of TODAY (so the animation includes anything
+        # settled today). Picks settled tomorrow won't be in here.
+        today_end = datetime(now_lisbon.year, now_lisbon.month, now_lisbon.day,
+                              23, 59, 59, tzinfo=lisbon_tz)
+        month_end_ts = int(today_end.timestamp())
+
+        STAKE = get_setting("stake_per_bet", 100.0)
+
+        # Per-day dedup so we don't re-broadcast the monthly recap if
+        # _send_daily_summary fires more than once on the same day.
+        today_key = now_lisbon.strftime("%Y-%m-%d")
+        if not force_send:
+            try:
+                with _db() as conn:
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS monthly_summary_locks (
+                            day TEXT PRIMARY KEY,
+                            sent_at INTEGER NOT NULL,
+                            month_profit REAL
+                        )
+                    """)
+                    try:
+                        conn.execute(
+                            "INSERT INTO monthly_summary_locks (day, sent_at) VALUES (?, ?)",
+                            (today_key, int(time.time()))
+                        )
+                    except sqlite3.IntegrityError:
+                        log.info(f"_send_monthly_summary: already sent for {today_key}, skipping")
+                        return
+            except Exception as e:
+                log.warning(f"_send_monthly_summary: lock init failed: {e}")
+
+        with _db() as conn:
+            tips = conn.execute(
+                "SELECT t.result, t.odd_entry, t.label, t.market, t.match_id, "
+                "       g.home_team, g.away_team "
+                "FROM tips t "
+                "LEFT JOIN games g ON g.id = t.match_id "
+                "WHERE t.wall_ts >= ? AND t.wall_ts <= ? AND t.result IS NOT NULL "
+                "ORDER BY t.odd_entry DESC",
+                (month_start_ts, month_end_ts)
+            ).fetchall()
+
+        if not tips:
+            log.info(f"_send_monthly_summary: no settled tips for {now_lisbon.strftime('%Y-%m')}")
+            # Roll back the lock so we can retry tomorrow.
+            try:
+                with _db() as conn:
+                    conn.execute("DELETE FROM monthly_summary_locks WHERE day = ?", (today_key,))
+            except Exception:
+                pass
+            return
+
+        lucro = 0.0
+        odds_sum = 0.0
+        wins = losses = 0
+        for tip in tips:
+            r = (tip["result"] or "").lower()
+            oe = tip["odd_entry"] or 0
+            if r in ("green", "win") and oe:
+                lucro += (oe - 1) * STAKE
+                odds_sum += oe; wins += 1
+            elif r in ("red", "loss"):
+                lucro -= STAKE
+                odds_sum += oe; losses += 1
+        settled = wins + losses
+
+        # Gate: only fire when the month is genuinely profitable. €25
+        # mirrors the daily threshold — a month barely positive isn't
+        # newsworthy.
+        if not force_send and lucro <= 25:
+            log.info(f"_send_monthly_summary: month profit €{lucro:.2f} below €25 — skipping")
+            try:
+                with _db() as conn:
+                    conn.execute("DELETE FROM monthly_summary_locks WHERE day = ?", (today_key,))
+            except Exception:
+                pass
+            return
+
+        avg_odds = odds_sum / settled if settled else 0.0
+        roi = (lucro / (settled * STAKE) * 100) if settled else 0.0
+
+        # Biggest win of the month (same logic as daily).
+        def _row_get(row, key, default=""):
+            try:
+                v = row[key]; return v if v is not None else default
+            except (IndexError, KeyError):
+                return default
+
+        winning_tips = [t for t in tips if (t["result"] or "").lower() in ("green", "win")]
+        biggest_win = max(winning_tips, key=lambda t: t["odd_entry"] or 0) if winning_tips else None
+        biggest_win_block = []
+        if biggest_win:
+            bw_odd    = biggest_win["odd_entry"] or 0
+            bw_label  = _row_get(biggest_win, 'label', '?')
+            bw_market = _row_get(biggest_win, 'market', '?')
+            bw_home   = _row_get(biggest_win, 'home_team', '')
+            bw_away   = _row_get(biggest_win, 'away_team', '')
+            bw_match  = f"{bw_home} vs {bw_away}" if bw_home and bw_away else "Match desconhecido"
+            bw_profit = (bw_odd - 1) * STAKE
+            biggest_win_block = [
+                "",
+                f"🎯 <b>Maior Odd do Mês:</b> {bw_odd:.2f}",
+                f"   <i>{_localize_pick_label(bw_label)} ({bw_market})</i>",
+                f"   <i>{bw_match}</i>",
+                f"   💰 Lucro gerado: <b>+€{bw_profit:.2f}</b>",
+            ]
+
+        # Header chip uses month name in Portuguese.
+        pt_months = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+                     "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"]
+        month_label_chip = f"{pt_months[now_lisbon.month-1]} {now_lisbon.year}"
+        msg_lines = [
+            f"<b>Resumo do Mês — {month_label_chip}</b>",
+            "",
+            f"💶 <b>Lucro acumulado:</b> €{lucro:.2f}",
+            f"📊 <b>Odds Médias:</b> {avg_odds:.2f}",
+            f"📈 <b>ROI:</b> {roi:.1f}%",
+            f"✅ <b>Picks:</b> {settled} · {wins}V — {losses}P",
+            *biggest_win_block,
+            "",
+            f"<i>Mês positivo até hoje — o edge continua a entregar. 🚀</i>",
+        ]
+        msg = "\n".join(msg_lines)
+
+        log.info(f"_send_monthly_summary: sending for {month_label_chip}, lucro €{lucro:.2f}")
+
+        # Build the same animated chart used by the daily recap, just
+        # with the wider month window and the 'RESUMO MENSAL' header.
+        anim_bytes = None
+        filename = None
+        try:
+            sys.path.insert(0, os.path.dirname(__file__))
+            from tools.build_daily_recap import build_daily_recap  # type: ignore
+            out_path = f"/tmp/monthly_recap_{now_lisbon.strftime('%Y-%m')}.mp4"
+            result = build_daily_recap(
+                target_start_ts=month_start_ts,
+                target_end_ts=month_end_ts,
+                date_label=month_label_chip,
+                out_path=out_path,
+                db_path=str(DB_PATH),
+                header_label="RESUMO MENSAL",
+            )
+            actual_path = result.split(" (", 1)[0] if isinstance(result, str) else out_path
+            with open(actual_path, "rb") as fh:
+                anim_bytes = fh.read()
+            filename = os.path.basename(actual_path)
+        except Exception as e:
+            log.warning(f"_send_monthly_summary: animation build failed ({e}); falling back to text-only")
+            anim_bytes = None
+
+        subscribers = _tg_subscribers() or []
+        if anim_bytes:
+            chat_ids = [int(c) for c in subscribers if str(c).lstrip("-").isdigit()]
+            stats = _broadcast_telegram_animation(
+                chat_ids, anim_bytes, caption=msg,
+                buttons=_betradar_share_buttons(),
+                filename=filename,
+            )
+            log.info(
+                f"_send_monthly_summary: animation broadcast — "
+                f"upload {stats['sent_with_upload']}, by_id {stats['sent_with_id']}, "
+                f"failed {stats['failed']}"
+            )
+        else:
+            _send_telegram(msg)
+
+    except Exception as e:
+        log.error(f"_send_monthly_summary_if_profitable error: {e}", exc_info=True)
 
 
 def _generate_chart(period: str = "alltime") -> bytes | None:

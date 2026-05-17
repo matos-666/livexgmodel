@@ -76,11 +76,16 @@ def build_daily_recap(target_start_ts: int, target_end_ts: int,
                        out_path: str = "/tmp/daily_recap.mp4",
                        db_path: str = DB_DEFAULT,
                        fps: int = 12,
-                       stake_eur: float = 100.0) -> str:
-    """Build the day's cumulative-P&L animation.
+                       stake_eur: float = 100.0,
+                       header_label: str = "RESUMO DIÁRIO") -> str:
+    """Build the cumulative-P&L animation for the window.
 
-    target_start_ts / target_end_ts : day window in unix seconds (Lisbon).
-    date_label                      : 'dd/mm/YYYY' shown in the header chip.
+    target_start_ts / target_end_ts : window in unix seconds (Lisbon).
+    date_label                      : text shown in the top-right chip.
+    header_label                    : title rendered top-left. Override
+                                       with 'RESUMO MENSAL' (or other) for
+                                       monthly variants — same animation,
+                                       different framing.
     """
     tips = load_day_tips(target_start_ts, target_end_ts, db_path)
     if not tips:
@@ -112,7 +117,7 @@ def build_daily_recap(target_start_ts: int, target_end_ts: int,
     ax_foot  = fig.add_subplot(gs[2]); ax_foot.axis("off"); ax_foot.set_facecolor(BG)
 
     # ── HEADER ────────────────────────────────────────────────────────────
-    ax_head.text(0.02, 0.92, "RESUMO DIÁRIO", transform=ax_head.transAxes,
+    ax_head.text(0.02, 0.92, header_label, transform=ax_head.transAxes,
                   color=MUTED, fontsize=9, fontweight="bold", va="top")
     if date_label:
         chip = FancyBboxPatch((0.79, 0.82), 0.20, 0.16,
