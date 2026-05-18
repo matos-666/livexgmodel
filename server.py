@@ -58,6 +58,8 @@ _session = None
 # top-down: each key is used until its remaining requests drop below
 # ODDS_API_KEY_THRESHOLD, at which point the next key takes over.
 _DEFAULT_ODDS_KEYS = [
+    "aa5ada68df5e9dcd732b3496cc39bb40",  # fresh — added 2026-05-18
+    "a4efb0259b6eb7efb0899cd2ecdc7456",  # fresh — added 2026-05-18
     "c5b879c935c70f05499945763bfa683c",  # fresh — added 2026-05-17
     "79e8cf289ad94878e2dd3290ffd6c246",  # fresh — added 2026-05-17
     "a6f9fe4bcc03446252da3b6b4b8dde42",  # fresh — added 2026-05-17
