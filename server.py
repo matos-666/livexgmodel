@@ -1089,15 +1089,17 @@ def _send_monthly_summary_if_profitable_blocking(now_lisbon=None, force_send: bo
 
         log.info(f"_send_monthly_summary: sending for {month_label_chip}, lucro €{lucro:.2f}")
 
-        # Build the same animated chart used by the daily recap, just
-        # with the wider month window and the 'RESUMO MENSAL' header.
-        anim_bytes = None
-        filename = None
+        # Render a STATIC PNG (not the animated MP4 used by the daily).
+        # The monthly window has ~1000 picks vs ~60 daily, so FuncAnimation
+        # blows past Fly's 1 GB memory cap AND gunicorn's 30s timeout.
+        # The chart shape and stats are identical to the daily's final
+        # frame — informationally equivalent, just not animated.
+        png_bytes = None
         try:
             sys.path.insert(0, os.path.dirname(__file__))
-            from tools.build_daily_recap import build_daily_recap  # type: ignore
-            out_path = f"/tmp/monthly_recap_{now_lisbon.strftime('%Y-%m')}.mp4"
-            result = build_daily_recap(
+            from tools.build_daily_recap import build_static_recap  # type: ignore
+            out_path = f"/tmp/monthly_recap_{now_lisbon.strftime('%Y-%m')}.png"
+            result = build_static_recap(
                 target_start_ts=month_start_ts,
                 target_end_ts=month_end_ts,
                 date_label=month_label_chip,
@@ -1107,27 +1109,35 @@ def _send_monthly_summary_if_profitable_blocking(now_lisbon=None, force_send: bo
             )
             actual_path = result.split(" (", 1)[0] if isinstance(result, str) else out_path
             with open(actual_path, "rb") as fh:
-                anim_bytes = fh.read()
-            filename = os.path.basename(actual_path)
+                png_bytes = fh.read()
         except Exception as e:
-            log.warning(f"_send_monthly_summary: animation build failed ({e}); falling back to text-only")
-            anim_bytes = None
+            log.warning(f"_send_monthly_summary: chart build failed ({e}); falling back to text-only")
+            png_bytes = None
 
         subscribers = _tg_subscribers() or []
-        if anim_bytes:
-            chat_ids = [int(c) for c in subscribers if str(c).lstrip("-").isdigit()]
-            stats = _broadcast_telegram_animation(
-                chat_ids, anim_bytes, caption=msg,
-                buttons=_betradar_share_buttons(),
-                filename=filename,
-            )
-            log.info(
-                f"_send_monthly_summary: animation broadcast — "
-                f"upload {stats['sent_with_upload']}, by_id {stats['sent_with_id']}, "
-                f"failed {stats['failed']}"
-            )
+        chat_ids = [int(c) for c in subscribers if str(c).lstrip("-").isdigit()]
+        if png_bytes and chat_ids:
+            sent = 0
+            failed = 0
+            buttons = _betradar_share_buttons()
+            for cid in chat_ids:
+                try:
+                    _send_telegram_photo(cid, png_bytes, caption=msg, buttons=buttons)
+                    sent += 1
+                except Exception as e:
+                    failed += 1
+                    log.warning(f"_send_monthly_summary: photo to {cid} failed: {e}")
+            log.info(f"_send_monthly_summary: photo broadcast — sent {sent}, failed {failed}")
+        elif chat_ids:
+            # Photo build failed → text-only fallback to every subscriber.
+            for cid in chat_ids:
+                try:
+                    _send_telegram(msg, chat_id=cid)
+                except Exception:
+                    pass
+            log.info(f"_send_monthly_summary: text-only fallback sent to {len(chat_ids)} chat(s)")
         else:
-            _send_telegram(msg)
+            log.warning("_send_monthly_summary: no subscribers configured")
 
     except Exception as e:
         log.error(f"_send_monthly_summary_if_profitable error: {e}", exc_info=True)

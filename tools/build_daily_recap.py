@@ -276,6 +276,122 @@ def build_daily_recap(target_start_ts: int, target_end_ts: int,
     return f"{out_path} ({size_kb}KB · {total_frames} frames · {total_frames/fps:.1f}s)"
 
 
+# ── Static (PNG) recap — for monthly / long windows where animating 1000+
+# picks blows past gunicorn's 30s worker timeout AND the 1 GB Fly memory
+# cap. Same visual language as the animated daily, just frozen on the
+# final state.
+def build_static_recap(target_start_ts: int, target_end_ts: int,
+                        date_label: str = "",
+                        out_path: str = "/tmp/static_recap.png",
+                        db_path: str = DB_DEFAULT,
+                        stake_eur: float = 100.0,
+                        header_label: str = "RESUMO MENSAL") -> str:
+    """Render the final-state P&L chart as a single PNG. Used by the
+    monthly recap path where animating 1000+ picks OOMs the Fly box."""
+    tips = load_day_tips(target_start_ts, target_end_ts, db_path)
+    if not tips:
+        raise ValueError("no settled tips in the requested window")
+
+    n = len(tips)
+    wins   = sum(1 for t in tips if (t["result"] or "").lower() in ("green","win"))
+    losses = n - wins
+    deltas = [tip_profit_eur(t, stake_eur) for t in tips]
+    cum    = [0.0]
+    for d in deltas:
+        cum.append(cum[-1] + d)
+    total_profit = cum[-1]
+    odd_sum = sum(float(t["odd_entry"] or 0) for t in tips)
+    avg_odds = odd_sum / n if n else 0.0
+    roi = (total_profit / (n * stake_eur) * 100) if n else 0.0
+
+    fig = plt.figure(figsize=(7.0, 6.4), dpi=140, facecolor=BG)
+    gs  = fig.add_gridspec(
+        nrows=3, ncols=1,
+        height_ratios=[0.22, 0.62, 0.16],
+        hspace=0.18, left=0.10, right=0.96, top=0.96, bottom=0.06,
+    )
+    ax_head  = fig.add_subplot(gs[0]); ax_head.axis("off"); ax_head.set_facecolor(BG)
+    ax_chart = fig.add_subplot(gs[1]); ax_chart.set_facecolor(SOFT)
+    ax_foot  = fig.add_subplot(gs[2]); ax_foot.axis("off"); ax_foot.set_facecolor(BG)
+
+    # Header
+    ax_head.text(0.02, 0.92, header_label, transform=ax_head.transAxes,
+                  color=MUTED, fontsize=9, fontweight="bold", va="top")
+    if date_label:
+        chip = FancyBboxPatch((0.74, 0.82), 0.25, 0.16,
+                              boxstyle="round,pad=0.01,rounding_size=0.04",
+                              transform=ax_head.transAxes,
+                              facecolor=SOFT, edgecolor=SUBTLE, linewidth=1)
+        ax_head.add_patch(chip)
+        ax_head.text(0.865, 0.90, date_label, transform=ax_head.transAxes,
+                      color=MUTED, fontsize=8, fontweight="bold",
+                      ha="center", va="center")
+
+    sign = "+" if total_profit >= 0 else "−"
+    line_color = GREEN if total_profit >= 0 else RED
+    ax_head.text(0.02, 0.20, f"{sign}€{abs(total_profit):,.2f}",
+                  transform=ax_head.transAxes,
+                  color=line_color, fontsize=34, fontweight="800",
+                  ha="left", va="center")
+    ax_head.text(0.98, 0.20, f"{n} picks · {wins}V – {losses}P",
+                  transform=ax_head.transAxes,
+                  color=MUTED, fontsize=10, fontweight="600",
+                  ha="right", va="center")
+
+    # Chart — full final curve at once.
+    ax_chart.set_xlim(0, max(2, n))
+    y_min = min(cum) * 1.15 if min(cum) < 0 else -max(abs(total_profit) * 0.05, 20)
+    y_max = max(cum) * 1.15 if max(cum) > 0 else 50
+    ax_chart.set_ylim(y_min, y_max)
+    # X-axis: don't enumerate every pick for a month — just show 5 evenly-
+    # spaced ticks so the axis stays readable.
+    n_ticks = 5
+    tick_idxs = [int(round(i * n / (n_ticks - 1))) for i in range(n_ticks)]
+    ax_chart.set_xticks(tick_idxs)
+    ax_chart.set_xticklabels([str(i) for i in tick_idxs], color=MUTED, fontsize=8)
+    ax_chart.tick_params(axis="y", colors=MUTED, labelsize=8, length=0)
+    from matplotlib.ticker import FuncFormatter
+    ax_chart.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"€{int(v)}"))
+    for spine in ax_chart.spines.values():
+        spine.set_color(GRID); spine.set_linewidth(0.8)
+    ax_chart.spines["top"].set_visible(False)
+    ax_chart.spines["right"].set_visible(False)
+    ax_chart.grid(color=GRID, alpha=0.7, linestyle="--", linewidth=0.6, axis="y")
+    ax_chart.set_axisbelow(True)
+    ax_chart.set_title("Lucro acumulado", loc="left", color=INK, fontsize=10,
+                        fontweight="bold", pad=12, x=0.0, y=1.03)
+    ax_chart.text(0.0, 1.01, "Pick a pick, da primeira à última",
+                   transform=ax_chart.transAxes, color=MUTED, fontsize=8,
+                   ha="left", va="bottom", style="italic")
+    ax_chart.axhline(0, color=SUBTLE, linewidth=1, linestyle="-", zorder=1)
+
+    xs = list(range(len(cum)))
+    ax_chart.fill_between(xs, 0, cum, step="post",
+                           where=[y >= 0 for y in cum],
+                           interpolate=False,
+                           color=GREEN_FILL, alpha=0.55, zorder=2)
+    ax_chart.fill_between(xs, 0, cum, step="post",
+                           where=[y < 0 for y in cum],
+                           interpolate=False,
+                           color=RED_FILL, alpha=0.55, zorder=2)
+    ax_chart.step(xs, cum, where="post", color=line_color, linewidth=2.2, zorder=4)
+
+    # Footer
+    ax_foot.text(0.5, 0.6,
+                  f"ROI {roi:+.1f}%    ·    Odds médias {avg_odds:.2f}",
+                  transform=ax_foot.transAxes,
+                  color=INK, fontsize=10, fontweight="600",
+                  ha="center", va="center")
+
+    if out_path.endswith(".mp4"):
+        out_path = out_path[:-4] + ".png"
+    fig.savefig(out_path, format="png", facecolor=BG, dpi=140,
+                 bbox_inches=None)
+    plt.close(fig)
+    size_kb = Path(out_path).stat().st_size // 1024
+    return f"{out_path} ({size_kb}KB · static)"
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     # CLI: build_daily_recap.py YYYY-MM-DD [out_path]
