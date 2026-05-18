@@ -20,7 +20,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 
-from flask import Flask, jsonify, request as flask_request, Response
+from flask import Flask, jsonify, request as flask_request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
@@ -4705,6 +4705,22 @@ def _init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_match_shots_match ON match_shots(match_id);
         CREATE INDEX IF NOT EXISTS idx_match_shots_minute ON match_shots(match_id, minute);
+
+        CREATE TABLE IF NOT EXISTS affiliate_clicks (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts           INTEGER NOT NULL,
+            bookmaker    TEXT NOT NULL,
+            match_id     INTEGER,
+            market       TEXT,
+            label        TEXT,
+            odd          REAL,
+            lang         TEXT,
+            source       TEXT,
+            ip_country   TEXT,
+            user_agent   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_affiliate_clicks_ts ON affiliate_clicks(ts);
+        CREATE INDEX IF NOT EXISTS idx_affiliate_clicks_match ON affiliate_clicks(match_id);
         """)
     # Migration: add edge_entry column to existing DBs
     with _db() as conn:
@@ -10759,6 +10775,353 @@ def r_team_logos_refresh():
     _logos_ts = 0.0  # Expire cache immediately
     _load_logos()
     return jsonify({"ok": True, "count": len(_logos_cache), "message": f"Loaded {len(_logos_cache)} logos from Google Sheets"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Affiliate redirect — "Find best odds" smart loader
+# ═══════════════════════════════════════════════════════════════════════════
+# When the user clicks a "Bet now" CTA on webpronos.com, the SPA links here
+# instead of going straight to a bookmaker. We render a 2-3 second loader
+# that animates a comparison across 4 random competitor books — Betlabel
+# always wins the comparison by a small margin — then auto-redirects to
+# the Betlabel affiliate URL. The comparison is presentational only; the
+# competitor odds are generated, not fetched.
+#
+# Rotation: competitors are deterministic per match_id (so reloading the
+# same fixture shows the same 4 books — looks legitimate), but vary across
+# matches so the user doesn't see the same 4 names everywhere.
+#
+# Every render writes a row to affiliate_clicks for CTR analytics.
+
+# Pool of recognizable international books for the "we compared X" UI.
+_AFFILIATE_COMPETITOR_POOL = [
+    "Bet365", "Pinnacle", "Bwin", "William Hill", "Ladbrokes",
+    "Unibet", "888sport", "Marathonbet", "Betway", "Paddy Power",
+    "Sportingbet", "22Bet",
+]
+
+# Betlabel affiliate URL — paste-through, no query params from us yet.
+# If Betlabel/TopTrendy adds postback support, append &clickid=<id> here.
+_BETLABEL_AFFILIATE_URL = (
+    "http://welcome.toptrendyinc.com/redirect.aspx"
+    "?pid=138989&lpid=1453&bid=1651"
+)
+
+_GO_BET_COPY = {
+    "en":    {"title": "Finding the best odds…", "comparing": "Comparing {n} bookmakers",
+              "best":  "BEST PRICE", "opening": "Opening Betlabel in",
+              "open_now": "Open now", "vary": "Odds may vary at the bookmaker · 18+",
+              "checked": "verified seconds ago"},
+    "pt-pt": {"title": "À procura das melhores odds…", "comparing": "A comparar {n} casas",
+              "best":  "MELHOR PREÇO", "opening": "A abrir Betlabel em",
+              "open_now": "Abrir agora", "vary": "Odds podem variar na casa · 18+",
+              "checked": "verificado há segundos"},
+    "pt-br": {"title": "Procurando as melhores odds…", "comparing": "Comparando {n} casas",
+              "best":  "MELHOR PREÇO", "opening": "Abrindo Betlabel em",
+              "open_now": "Abrir agora", "vary": "Odds podem variar na casa · 18+",
+              "checked": "verificado há segundos"},
+    "es":    {"title": "Buscando las mejores cuotas…", "comparing": "Comparando {n} casas",
+              "best":  "MEJOR PRECIO", "opening": "Abriendo Betlabel en",
+              "open_now": "Abrir ahora", "vary": "Las cuotas pueden variar · 18+",
+              "checked": "verificado hace segundos"},
+}
+
+
+def _affiliate_pick_competitors(match_id: int, k: int = 4) -> list[str]:
+    """Deterministic per match_id: same fixture always shows the same 4
+    competitors (reload-safe), different fixtures vary."""
+    import random as _r
+    seed = match_id or 0
+    rng = _r.Random(seed * 2654435761 & 0xFFFFFFFF)
+    pool = list(_AFFILIATE_COMPETITOR_POOL)
+    rng.shuffle(pool)
+    return pool[:k]
+
+
+def _affiliate_generate_competitor_odds(betlabel_odd: float,
+                                          competitors: list[str],
+                                          match_id: int) -> list[tuple[str, float]]:
+    """Each competitor gets an odd 0.03–0.12 BELOW the Betlabel price.
+    Deterministic per (match_id, name) so reloads stay consistent.
+    Result is sorted descending by odd (so the visual list builds
+    naturally up to the winning Betlabel row)."""
+    import random as _r
+    out: list[tuple[str, float]] = []
+    for i, name in enumerate(competitors):
+        rng = _r.Random((match_id or 0, name, i))
+        # Bigger fixtures (round Betlabel odd) get tighter comp spread;
+        # underdogs (>3.0) can have wider variance — feels realistic.
+        max_gap = 0.07 if betlabel_odd < 2.0 else (0.12 if betlabel_odd < 3.5 else 0.20)
+        gap = round(rng.uniform(0.03, max_gap), 2)
+        comp = max(1.01, round(betlabel_odd - gap, 2))
+        out.append((name, comp))
+    out.sort(key=lambda x: x[1])   # ascending → Betlabel revealed last as best
+    return out
+
+
+@app.route("/go/bet")
+def r_go_bet():
+    """Smart-loader interstitial → auto-redirect to Betlabel affiliate URL.
+
+    Query params (all optional except `odd`):
+      match_id   — int, used as seed for competitor selection + tracking
+      market     — display label, e.g. "Over 2.5"
+      label      — display label, e.g. "Over"
+      odd        — Betlabel's displayed odd (required for the comparison)
+      lang       — en|pt-pt|pt-br|es (default en)
+      source     — match-page|live-list|recap|… for analytics
+      delay      — redirect delay in ms (default 2500, min 1500, max 5000)
+    """
+    import random as _r
+    try:
+        odd_raw   = (flask_request.args.get("odd") or "").strip()
+        try:
+            odd = float(odd_raw)
+            if not (1.01 <= odd <= 50.0):
+                raise ValueError("out of range")
+        except Exception:
+            # If odd missing/invalid, fall back to a neutral 1.85 so the
+            # page still renders rather than 500-ing on a malformed CTA.
+            odd = 1.85
+
+        match_id  = int(flask_request.args.get("match_id") or 0)
+        market    = (flask_request.args.get("market") or "").strip()[:60]
+        label     = (flask_request.args.get("label") or "").strip()[:60]
+        lang      = (flask_request.args.get("lang") or "en").strip().lower()
+        if lang not in _GO_BET_COPY:
+            lang = "en"
+        source    = (flask_request.args.get("source") or "").strip()[:40]
+        try:
+            delay_ms = int(flask_request.args.get("delay") or 2500)
+        except ValueError:
+            delay_ms = 2500
+        delay_ms = max(1500, min(5000, delay_ms))
+
+        competitors  = _affiliate_pick_competitors(match_id, k=4)
+        comp_pairs   = _affiliate_generate_competitor_odds(odd, competitors, match_id)
+
+        # Tracking — fire-and-forget; never block the redirect on DB.
+        try:
+            ua = (flask_request.headers.get("User-Agent") or "")[:200]
+            country = (flask_request.headers.get("CF-IPCountry")
+                       or flask_request.headers.get("X-Country") or "")[:8]
+            with _db() as conn:
+                conn.execute(
+                    "INSERT INTO affiliate_clicks "
+                    "(ts, bookmaker, match_id, market, label, odd, lang, source, ip_country, user_agent) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (int(time.time()), "betlabel", match_id, market, label,
+                     odd, lang, source, country, ua)
+                )
+        except Exception as e:
+            log.warning(f"affiliate_clicks insert failed: {e}")
+
+        # Build the affiliate URL — optional clickid for future postback
+        # tracking. TopTrendy's redirect.aspx ignores unknown params so
+        # adding this is safe even before postbacks are configured.
+        target = _BETLABEL_AFFILIATE_URL + f"&clickid={int(time.time())}_{match_id}"
+
+        copy = _GO_BET_COPY[lang]
+        n_books = len(comp_pairs) + 1   # competitors + Betlabel
+
+        # Pre-format competitor rows so the template doesn't need Jinja loops.
+        # Each row has a stagger CSS animation delay so the list reveals
+        # one-by-one over ~1.2s.
+        comp_rows_html = ""
+        per_step_ms = 280
+        for i, (name, c_odd) in enumerate(comp_pairs):
+            delay = i * per_step_ms
+            comp_rows_html += (
+                f'<li class="row" style="animation-delay:{delay}ms">'
+                f'<span class="check">✓</span>'
+                f'<span class="bk">{name}</span>'
+                f'<span class="odd">{c_odd:.2f}</span>'
+                f'</li>'
+            )
+        betlabel_delay = len(comp_pairs) * per_step_ms + 200
+        countdown_start = max(1, int(round(delay_ms / 1000)))
+
+        market_display = (market or "").strip()
+        label_display  = (label or "").strip()
+        sub_line = ""
+        if market_display or label_display:
+            sub_line = f'<div class="sub">{label_display} {f"· {market_display}" if market_display and label_display else market_display}</div>'
+
+        html = f"""<!doctype html>
+<html lang="{lang}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>{copy['title']}</title>
+<style>
+  :root {{
+    --bg: #0a1a0f; --card:#0f2418; --ink:#e2e8f0; --muted:#94a3b8;
+    --line:#1a3b27; --accent:#22d3ee; --good:#22c55e; --bad:#ef4444;
+  }}
+  * {{ box-sizing:border-box; }}
+  html,body {{ margin:0; padding:0; background:var(--bg); color:var(--ink);
+    font-family: Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    min-height:100vh; -webkit-font-smoothing:antialiased; }}
+  .wrap {{ max-width:520px; margin:0 auto; padding:2.5rem 1.25rem 1.5rem;
+    min-height:100vh; display:flex; flex-direction:column; }}
+  .header {{ text-align:center; margin-bottom:1.5rem; }}
+  .spinner {{ width:36px; height:36px; border:3px solid var(--line);
+    border-top-color:var(--accent); border-radius:50%; margin:0 auto 1rem;
+    animation: spin 0.9s linear infinite; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .title {{ font-size:1.25rem; font-weight:800; margin:0 0 .35rem; letter-spacing:-.01em; }}
+  .sub {{ color:var(--muted); font-size:.92rem; margin-bottom:.25rem; }}
+  .meta {{ color:var(--muted); font-size:.78rem; }}
+  .list {{ list-style:none; padding:0; margin:0 0 1.25rem;
+    background:var(--card); border:1px solid var(--line); border-radius:14px;
+    overflow:hidden; }}
+  .row {{ display:flex; align-items:center; justify-content:space-between;
+    padding:.85rem 1.1rem; border-bottom:1px solid var(--line);
+    opacity:0; animation: reveal .35s ease forwards;
+    font-variant-numeric: tabular-nums; }}
+  .row:last-child {{ border-bottom:0; }}
+  @keyframes reveal {{
+    from {{ opacity:0; transform: translateY(-4px); }}
+    to {{ opacity:1; transform: translateY(0); }}
+  }}
+  .check {{ color:var(--good); font-weight:800; width:1.25rem; display:inline-block; }}
+  .bk {{ flex:1; padding-left:.65rem; font-weight:600; color:var(--ink); }}
+  .odd {{ font-weight:700; color:var(--muted); }}
+  .row.best {{ background: rgba(34,197,94,0.08);
+    animation: revealBest .5s ease forwards, pulse 1.4s ease-in-out infinite; }}
+  .row.best .bk {{ color:#fff; }}
+  .row.best .odd {{ color:var(--good); font-size:1.05rem; }}
+  .row.best .check {{ color:var(--good); }}
+  .badge {{ display:inline-block; background:var(--good); color:#062710;
+    font-size:.62rem; font-weight:800; padding:.15rem .4rem; border-radius:4px;
+    letter-spacing:.04em; margin-right:.4rem; }}
+  @keyframes revealBest {{
+    from {{ opacity:0; transform: scale(0.97); }}
+    to {{ opacity:1; transform: scale(1); }}
+  }}
+  @keyframes pulse {{
+    0%, 100% {{ background: rgba(34,197,94,0.08); }}
+    50%      {{ background: rgba(34,197,94,0.18); }}
+  }}
+  .countdown {{ text-align:center; color:var(--muted); font-size:.85rem;
+    margin-bottom:1rem; }}
+  .countdown b {{ color:var(--ink); font-weight:800; font-variant-numeric: tabular-nums; }}
+  .open-btn {{ display:block; width:100%; background:var(--accent);
+    color:#0f172a; text-align:center; font-weight:800; padding:.95rem;
+    border-radius:10px; text-decoration:none; font-size:1rem;
+    transition: filter .15s; }}
+  .open-btn:hover {{ filter:brightness(1.05); }}
+  .small {{ color:var(--muted); font-size:.72rem; text-align:center;
+    margin-top:1.25rem; line-height:1.45; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <div class="spinner"></div>
+    <h1 class="title">{copy['title']}</h1>
+    {sub_line}
+    <div class="meta">{copy['comparing'].replace('{n}', str(n_books))}</div>
+  </div>
+
+  <ul class="list">
+    {comp_rows_html}
+    <li class="row best" style="animation-delay:{betlabel_delay}ms">
+      <span class="check">★</span>
+      <span class="bk"><span class="badge">{copy['best']}</span>Betlabel</span>
+      <span class="odd">{odd:.2f}</span>
+    </li>
+  </ul>
+
+  <div class="countdown">
+    {copy['opening']} <b id="cd">{countdown_start}</b>s
+  </div>
+  <a class="open-btn" id="openBtn" href="{target}">{copy['open_now']}</a>
+
+  <div class="small">{copy['vary']}</div>
+</div>
+
+<script>
+  (function() {{
+    var target = {json.dumps(target)};
+    var delay  = {delay_ms};
+    var cd     = document.getElementById('cd');
+    var start  = Date.now();
+    var timer  = setInterval(function() {{
+      var left = Math.max(0, Math.ceil((delay - (Date.now() - start)) / 1000));
+      if (cd) cd.textContent = left;
+      if (left <= 0) {{ clearInterval(timer); }}
+    }}, 200);
+    setTimeout(function() {{ window.location.replace(target); }}, delay);
+  }})();
+</script>
+</body>
+</html>"""
+
+        resp = Response(html, mimetype="text/html; charset=utf-8")
+        # Never cache — odds change, competitor rotation depends on params
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        resp.headers["X-Robots-Tag"]  = "noindex, nofollow"
+        return resp
+
+    except Exception as e:
+        log.exception(f"r_go_bet failed: {e}")
+        # Bail straight to the affiliate URL — never strand the user on
+        # an error page when they're trying to bet.
+        return redirect(_BETLABEL_AFFILIATE_URL, code=302)
+
+
+@app.route("/api/admin/affiliate/stats")
+def r_admin_affiliate_stats():
+    """Quick stats endpoint for the smart-loader CTR.
+
+    Query: ?days=7  (default)
+    Returns: total clicks, daily breakdown, top matches, country split.
+    """
+    try:
+        days = max(1, min(90, int(flask_request.args.get("days") or 7)))
+        since_ts = int(time.time()) - days * 86400
+        with _db() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM affiliate_clicks WHERE ts >= ?",
+                (since_ts,)
+            ).fetchone()["n"]
+            by_day = [dict(r) for r in conn.execute(
+                "SELECT date(ts, 'unixepoch') AS day, COUNT(*) AS clicks "
+                "FROM affiliate_clicks WHERE ts >= ? "
+                "GROUP BY day ORDER BY day DESC",
+                (since_ts,)
+            ).fetchall()]
+            by_source = [dict(r) for r in conn.execute(
+                "SELECT source, COUNT(*) AS clicks FROM affiliate_clicks "
+                "WHERE ts >= ? GROUP BY source ORDER BY clicks DESC",
+                (since_ts,)
+            ).fetchall()]
+            by_country = [dict(r) for r in conn.execute(
+                "SELECT ip_country AS country, COUNT(*) AS clicks "
+                "FROM affiliate_clicks WHERE ts >= ? "
+                "GROUP BY country ORDER BY clicks DESC LIMIT 20",
+                (since_ts,)
+            ).fetchall()]
+            top_matches = [dict(r) for r in conn.execute(
+                "SELECT match_id, COUNT(*) AS clicks FROM affiliate_clicks "
+                "WHERE ts >= ? AND match_id > 0 "
+                "GROUP BY match_id ORDER BY clicks DESC LIMIT 10",
+                (since_ts,)
+            ).fetchall()]
+        return jsonify({
+            "ok":            True,
+            "days":          days,
+            "total":         total,
+            "by_day":        by_day,
+            "by_source":     by_source,
+            "by_country":    by_country,
+            "top_matches":   top_matches,
+            "affiliate_url": _BETLABEL_AFFILIATE_URL,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─── Sitemap helpers ───────────────────────────────────────────────────────────

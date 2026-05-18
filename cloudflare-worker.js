@@ -65,6 +65,10 @@ const SEO_ROUTES = [
 const FLASK_ALWAYS_ROUTES = [
   /^\/sitemap.*\.xml$/,
   /^\/robots\.txt$/,
+  // Affiliate redirect interstitial — Flask renders the smart loader and
+  // bounces to the Betlabel affiliate URL. Must NOT go through Lovable
+  // (the SPA would render a 404 for /go/*).
+  /^\/go\/bet$/,
 ];
 
 export default {
@@ -72,7 +76,31 @@ export default {
     const url = new URL(request.url);
     const ua  = (request.headers.get("user-agent") || "").toLowerCase();
 
-    // 1. Sitemaps + robots.txt → always proxy to Flask directly
+    // 1a. /go/* (affiliate interstitial) → ALWAYS pass through to Flask
+    //     with NO caching. Each render writes a tracking row and shows
+    //     fresh competitor odds — caching would break analytics + dedupe.
+    if (/^\/go\//.test(url.pathname)) {
+      try {
+        const target = FLASK_BASE + url.pathname + url.search;
+        const upstream = await fetch(target, {
+          headers: { "User-Agent": ua, "X-Forwarded-Host": url.hostname,
+                     "CF-IPCountry": request.cf?.country || "" },
+          cf: { cacheTtl: 0, cacheEverything: false },
+        });
+        return new Response(upstream.body, {
+          status: upstream.status,
+          headers: {
+            "Content-Type":  upstream.headers.get("Content-Type") || "text/html; charset=utf-8",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+          },
+        });
+      } catch (e) {
+        // Fall through to Lovable on Flask failure (will likely 404 SPA-side
+        // but better than a hard worker error).
+      }
+    }
+
+    // 1b. Sitemaps + robots.txt → always proxy to Flask, edge-cache 1h.
     if (FLASK_ALWAYS_ROUTES.some(re => re.test(url.pathname))) {
       try {
         const target = FLASK_BASE + url.pathname + url.search;
