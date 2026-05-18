@@ -10848,7 +10848,9 @@ def _affiliate_generate_competitor_odds(betlabel_odd: float,
     import random as _r
     out: list[tuple[str, float]] = []
     for i, name in enumerate(competitors):
-        rng = _r.Random((match_id or 0, name, i))
+        # Python 3.12's Random() rejects tuple seeds — use a stable string
+        # so each (match_id, name, i) combo still maps to a unique RNG.
+        rng = _r.Random(f"{match_id or 0}|{name}|{i}")
         # Bigger fixtures (round Betlabel odd) get tighter comp spread;
         # underdogs (>3.0) can have wider variance — feels realistic.
         max_gap = 0.07 if betlabel_odd < 2.0 else (0.12 if betlabel_odd < 3.5 else 0.20)
