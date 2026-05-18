@@ -10464,6 +10464,37 @@ def _betradar_daily_caption(target_start_ts: int, target_end_ts: int,
     )
 
 
+@app.route("/api/admin/betradar/monthly-recap", methods=["POST", "GET"])
+def r_betradar_monthly_recap():
+    """Manually trigger the monthly recap broadcast.
+
+    Use this when:
+      - You want to test the monthly recap outside the 23:55 cron window.
+      - The cron fired but the build/broadcast failed (e.g. ffmpeg blip)
+        and you need to retry the day.
+      - You want to send an interim monthly status mid-month.
+
+    Query params:
+      force=1   (default 1) — bypass the per-day dedup lock and the €25
+                month-profit threshold. Always broadcasts to subscribers
+                as long as there are settled tips for the month so far.
+      force=0   — honour the lock + threshold. Won't re-send if today's
+                slot has already been claimed, and skips if month
+                profit ≤ €25.
+
+    Returns a small JSON status. Errors during build/broadcast are
+    captured in logs (and visible via `flyctl logs`).
+    """
+    force_raw = (flask_request.args.get("force") or "1").strip().lower()
+    force = force_raw not in ("0", "false", "no", "")
+    try:
+        _send_monthly_summary_if_profitable(force_send=force)
+        return jsonify({"ok": True, "force": force, "note": "Check flyctl logs + Telegram for delivery confirmation."})
+    except Exception as e:
+        log.exception("monthly-recap admin trigger failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/admin/betradar/daily-recap", methods=["POST", "GET"])
 def r_betradar_daily_recap():
     """Generate the day's cumulative-P&L animation + send to a chat_id.
