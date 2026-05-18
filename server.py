@@ -10894,10 +10894,10 @@ def r_go_bet():
             lang = "en"
         source    = (flask_request.args.get("source") or "").strip()[:40]
         try:
-            delay_ms = int(flask_request.args.get("delay") or 2500)
+            delay_ms = int(flask_request.args.get("delay") or 4000)
         except ValueError:
-            delay_ms = 2500
-        delay_ms = max(1500, min(5000, delay_ms))
+            delay_ms = 4000
+        delay_ms = max(1500, min(6000, delay_ms))
 
         competitors  = _affiliate_pick_competitors(match_id, k=4)
         comp_pairs   = _affiliate_generate_competitor_odds(odd, competitors, match_id)
@@ -10930,7 +10930,10 @@ def r_go_bet():
         # Each row has a stagger CSS animation delay so the list reveals
         # one-by-one over ~1.2s.
         comp_rows_html = ""
-        per_step_ms = 280
+        # 4 competitors × 500ms ≈ 2.0s of staggered reveal, then Betlabel
+        # pops in at ~2.2s and the user gets to admire the "winner" for
+        # ~1.8s before the redirect fires at 4s total.
+        per_step_ms = 500
         for i, (name, c_odd) in enumerate(comp_pairs):
             delay = i * per_step_ms
             comp_rows_html += (
