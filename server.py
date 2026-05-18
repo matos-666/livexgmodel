@@ -11039,9 +11039,6 @@ def r_go_bet():
     </li>
   </ul>
 
-  <div class="countdown">
-    {copy['opening']} <b id="cd">{countdown_start}</b>s
-  </div>
   <a class="open-btn" id="openBtn" href="{target}">{copy['open_now']}</a>
 
   <div class="small">{copy['vary']}</div>
@@ -11051,13 +11048,6 @@ def r_go_bet():
   (function() {{
     var target = {json.dumps(target)};
     var delay  = {delay_ms};
-    var cd     = document.getElementById('cd');
-    var start  = Date.now();
-    var timer  = setInterval(function() {{
-      var left = Math.max(0, Math.ceil((delay - (Date.now() - start)) / 1000));
-      if (cd) cd.textContent = left;
-      if (left <= 0) {{ clearInterval(timer); }}
-    }}, 200);
     setTimeout(function() {{ window.location.replace(target); }}, delay);
   }})();
 </script>
