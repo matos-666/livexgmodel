@@ -928,6 +928,21 @@ def _send_daily_summary(days_back: int = 0, force_send: bool = False):
 
 
 def _send_monthly_summary_if_profitable(now_lisbon=None, force_send: bool = False):
+    """Public wrapper — kicks off the real work in a daemon thread so the
+    caller (HTTP request / APScheduler tick) returns immediately. The
+    monthly animation build takes ~3 minutes (~1000 picks vs ~60 for the
+    daily) and would otherwise blow past gunicorn's 30s worker timeout.
+    """
+    t = threading.Thread(
+        target=_send_monthly_summary_if_profitable_blocking,
+        kwargs={"now_lisbon": now_lisbon, "force_send": force_send},
+        daemon=True,
+        name="monthly-recap-worker",
+    )
+    t.start()
+
+
+def _send_monthly_summary_if_profitable_blocking(now_lisbon=None, force_send: bool = False):
     """Fallback for flat/losing days: send a month-to-date recap, but ONLY
     when the month is in profit. Same Telegram animation style as the
     daily recap, just with a 'RESUMO MENSAL' header and the window set
