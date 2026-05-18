@@ -193,43 +193,71 @@ TELEGRAM_ADMIN_CHAT_IDS: set[int] = {
 def _is_tg_admin(chat_id: int) -> bool:
     return chat_id in TELEGRAM_ADMIN_CHAT_IDS
 
-# ── Affiliate CTAs — rotated on every pick alert ──────────────────────────
-# Each entry: (display_text, url)
-# Rotating CTAs (5 variations: #4, #9, #5, #2, and custom "Entrar nesta Pick")
-_TG_CTAS = [
-    # #4: Ultra-energetic with dynamic potential gain (parametrized)
-    (None, "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),  # template
-    # #9: Cheeky/playful challenge
-    ("😉 Nem penses 2x, vai!", "https://track.affshares.com/visit/?bta=657658&nci=5653"),
-    # #5: Direct/minimal
-    ("▶️ Próximo Passo: Clicar", "https://dashboard.onetwoaffiliates.com/click?campaign_id=796&ref_id=370"),
-    # #2: Cool/gaming language
-    ("💎 Entrar na Play", "https://dashboard.onetwoaffiliates.com/click?campaign_id=797&ref_id=370"),
-    # Custom: Trust builder
-    ("🎯 Entrar nesta Pick", "https://track.affshares.com/visit/?bta=657658&nci=5653"),
+# ── Telegram CTAs — rotated on every pick alert ───────────────────────────
+# Each CTA links to /go/bet on webpronos, which renders the smart-loader
+# interstitial (PT-friendly bookmaker comparison) and auto-redirects to
+# the rotating LEON/TWIN affiliate. URL is built per-call so we can
+# inject match_id/market/label/odd/aff dynamically.
+#
+# 8 phrasings, all framed around "compare odds → find best price" so the
+# CTA matches what the interstitial actually does (no bait & switch).
+_TG_CTA_PHRASES = [
+    "🔍 Comparar e abrir na melhor casa",
+    "💰 Ver onde a odd está mais alta",
+    "📊 Comparar 5 casas e abrir a melhor",
+    "🏆 Apostar ao melhor preço",
+    "🎯 Encontrar a odd mais alta agora",
+    "💎 Ver melhor cotação para esta pick",
+    "⚡ Comparar odds — abrir a vencedora",
+    "🚀 Abrir na casa com melhor preço",
 ]
+# Affiliate rotation — alternates between LEON and TWIN per pick so both
+# campaigns get coverage. Kept as a list (not a generator) so the lock-
+# based round-robin below stays simple.
+_TG_AFFILIATE_ROTATION = ["leon", "twin"]
+
+# Public base URL for the smart-loader interstitial. Worker on
+# webpronos.com proxies /go/* straight to Flask (no Lovable cache).
+_GO_BET_BASE = "https://webpronos.com/go/bet"
+
 _tg_cta_counter = 0
 _tg_cta_lock = threading.Lock()
 
-def _next_cta(odds: float = None, stake: float = 100.0) -> str:
+
+def _next_cta(odds: float = None, stake: float = 100.0,
+              match_id: int = 0, market: str = "",
+              label: str = "") -> str:
     """
-    Return the next CTA as an HTML hyperlink, cycling through _TG_CTAS.
-    For CTA #4 (index 0), calculate dynamic potential gain:
-      potential_gain = (odds - 1) * stake
+    Return the next Telegram CTA as an HTML hyperlink to the smart-loader
+    interstitial. Rotates BOTH the phrasing (8 variations) and the
+    affiliate destination (LEON ↔ TWIN) so subscribers don't see the
+    same combination twice in a row.
+
+    Args:
+        odds, stake — unused now (kept for backward-compat with callers)
+        match_id, market, label — interpolated into the /go/bet URL so the
+          interstitial knows which pick to display in its sub-line.
     """
+    from urllib.parse import urlencode
     global _tg_cta_counter
     with _tg_cta_lock:
-        idx = _tg_cta_counter % len(_TG_CTAS)
+        n = _tg_cta_counter
         _tg_cta_counter += 1
 
-    text, url = _TG_CTAS[idx]
+    phrase = _TG_CTA_PHRASES[n % len(_TG_CTA_PHRASES)]
+    aff    = _TG_AFFILIATE_ROTATION[n % len(_TG_AFFILIATE_ROTATION)]
 
-    # Special handling for #4 (index 0): dynamic gain calculation
-    if idx == 0 and odds and odds > 0:
-        potential_gain = (odds - 1) * stake
-        text = f"🔥 AGORA! Ganhar +€{potential_gain:.0f} (odds {odds:.2f})!"
-
-    return f'<a href="{url}">{text}</a>'
+    qs = {
+        "aff":      aff,
+        "match_id": int(match_id or 0),
+        "market":   market or "",
+        "label":    label or "",
+        "odd":      f"{(odds or 0):.2f}",
+        "lang":     "pt-pt",
+        "source":   "telegram-betradar",
+    }
+    url = f"{_GO_BET_BASE}?{urlencode(qs)}"
+    return f'<a href="{url}">{phrase}</a>'
 
 _COUNTRY_FLAGS = {
     "england": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "spain": "🇪🇸", "italy": "🇮🇹", "germany": "🇩🇪",
@@ -1583,12 +1611,24 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
     edge        = pick.get("edge") or 0
     model_p     = (pick.get("model") or 0) * 100
     market_p    = (1 / odds * 100) if odds > 0 else 0
+    match_id    = match.get("id") or match.get("matchId") or 0
 
     market_icons = {"1X2": "🎯", "Handicap": "⚖️"}
     mkt_icon = market_icons.get(market, "📊")
 
     stake = get_setting("stake_per_bet", 100.0)
-    cta = _next_cta(odds=odds, stake=stake)
+    cta = _next_cta(odds=odds, stake=stake, match_id=match_id,
+                    market=market, label=label)
+
+    # Layperson-friendly value explanation. Replaces the cryptic
+    # "Modelo X% | Mercado Y% Edge Z%" with one line that spells out
+    # what the numbers mean in plain Portuguese.
+    value_line = (
+        f"💡 <b>Vale a pena:</b> o modelo vê <b>{model_p:.0f}%</b> de hipótese, "
+        f"mas a casa só está a pagar como se fosse <b>{market_p:.0f}%</b> "
+        f"(+<b>{edge:.1f}%</b> de valor)."
+    )
+
     return (
         f"🔔 <b>NOVA PICK</b>\n"
         f"\n"
@@ -1600,8 +1640,7 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
         f"{mkt_icon} Mercado: <b>{market} → {label}</b>\n"
         f"💰 Odds: <b>{odds:.2f}</b>\n"
         f"\n"
-        f"📊 Modelo: <b>{model_p:.0f}%</b> | Mercado: <b>{market_p:.0f}%</b>\n"
-        f"📈 Edge: <b>+{edge:.1f}%</b>\n"
+        f"{value_line}\n"
         f"\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{cta}"
@@ -10793,19 +10832,52 @@ def r_team_logos_refresh():
 #
 # Every render writes a row to affiliate_clicks for CTR analytics.
 
-# Pool of recognizable international books for the "we compared X" UI.
-_AFFILIATE_COMPETITOR_POOL = [
-    "Bet365", "Pinnacle", "Bwin", "William Hill", "Ladbrokes",
-    "Unibet", "888sport", "Marathonbet", "Betway", "Paddy Power",
-    "Sportingbet", "22Bet",
-]
+# Per-affiliate config: which competitors to compare against and where
+# to land the user. Adding a new affiliate = one entry here; the rest of
+# the route is fully driven by this dict.
+#
+# - web:      international books shown on webpronos.com home/match pages
+#             → redirects to Betlabel
+# - leon:     PT-friendly books shown in the BetRadar Telegram bot
+#             → redirects to LEON
+# - twin:     same PT pool, alternating with leon for telegram CTAs
+#             → redirects to TWIN
+_AFFILIATE_CONFIGS = {
+    "betlabel": {
+        "destination_url": (
+            "http://welcome.toptrendyinc.com/redirect.aspx"
+            "?pid=138989&lpid=1453&bid=1651"
+        ),
+        "winner_display": "Betlabel",
+        # Recognizable international names — wide pool so rotation feels fresh.
+        "competitor_pool": [
+            "Bet365", "Pinnacle", "Bwin", "William Hill", "Ladbrokes",
+            "Unibet", "888sport", "Marathonbet", "Betway", "Paddy Power",
+            "Sportingbet", "22Bet",
+        ],
+    },
+    "leon": {
+        "destination_url": (
+            "https://dashboard.onetwoaffiliates.com/click?"
+            "campaign_id=797&ref_id=370&path=https%3A%2F%2Fleon317.casino%2Flive"
+        ),
+        "winner_display": "LEON",
+        # PT-friendly books familiar to BetRadar AI subscribers.
+        "competitor_pool": ["LeBull", "Betclic", "22Bet", "Betano", "Bwin"],
+    },
+    "twin": {
+        "destination_url": (
+            "https://dashboard.onetwoaffiliates.com/click?"
+            "campaign_id=796&ref_id=370&path=https%3A%2F%2Ftwin191.com%2Flive"
+        ),
+        "winner_display": "TWIN",
+        "competitor_pool": ["LeBull", "Betclic", "22Bet", "Betano", "Bwin"],
+    },
+}
 
-# Betlabel affiliate URL — paste-through, no query params from us yet.
-# If Betlabel/TopTrendy adds postback support, append &clickid=<id> here.
-_BETLABEL_AFFILIATE_URL = (
-    "http://welcome.toptrendyinc.com/redirect.aspx"
-    "?pid=138989&lpid=1453&bid=1651"
-)
+# Backwards-compat name used by /api/admin/affiliate/stats — points at
+# the web flow's destination.
+_BETLABEL_AFFILIATE_URL = _AFFILIATE_CONFIGS["betlabel"]["destination_url"]
 
 _GO_BET_COPY = {
     "en":    {"title": "Finding the best odds…", "comparing": "Comparing {n} bookmakers",
@@ -10827,15 +10899,21 @@ _GO_BET_COPY = {
 }
 
 
-def _affiliate_pick_competitors(match_id: int, k: int = 4) -> list[str]:
-    """Deterministic per match_id: same fixture always shows the same 4
-    competitors (reload-safe), different fixtures vary."""
+def _affiliate_pick_competitors(match_id: int, k: int = 4,
+                                  pool: list[str] | None = None) -> list[str]:
+    """Deterministic per match_id: same fixture always shows the same
+    competitors (reload-safe), different fixtures vary. The pool argument
+    lets each affiliate flow (web vs telegram) advertise a different set
+    of competitors."""
     import random as _r
     seed = match_id or 0
     rng = _r.Random(seed * 2654435761 & 0xFFFFFFFF)
-    pool = list(_AFFILIATE_COMPETITOR_POOL)
-    rng.shuffle(pool)
-    return pool[:k]
+    pool_local = list(pool) if pool is not None else list(
+        _AFFILIATE_CONFIGS["betlabel"]["competitor_pool"]
+    )
+    rng.shuffle(pool_local)
+    # Pool may be smaller than k (PT pool only has 5 entries) — clamp.
+    return pool_local[: min(k, len(pool_local))]
 
 
 def _affiliate_generate_competitor_odds(betlabel_odd: float,
@@ -10899,7 +10977,17 @@ def r_go_bet():
             delay_ms = 4000
         delay_ms = max(1500, min(6000, delay_ms))
 
-        competitors  = _affiliate_pick_competitors(match_id, k=4)
+        # Which affiliate flow is the user on. `betlabel` = webpronos.com
+        # (international books), `leon` / `twin` = BetRadar AI Telegram
+        # (PT-friendly books). Unknown values silently fall back to web.
+        aff_key = (flask_request.args.get("aff") or "betlabel").strip().lower()
+        if aff_key not in _AFFILIATE_CONFIGS:
+            aff_key = "betlabel"
+        cfg = _AFFILIATE_CONFIGS[aff_key]
+
+        competitors  = _affiliate_pick_competitors(
+            match_id, k=4, pool=cfg["competitor_pool"]
+        )
         comp_pairs   = _affiliate_generate_competitor_odds(odd, competitors, match_id)
 
         # Tracking — fire-and-forget; never block the redirect on DB.
@@ -10912,16 +11000,18 @@ def r_go_bet():
                     "INSERT INTO affiliate_clicks "
                     "(ts, bookmaker, match_id, market, label, odd, lang, source, ip_country, user_agent) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (int(time.time()), "betlabel", match_id, market, label,
+                    (int(time.time()), aff_key, match_id, market, label,
                      odd, lang, source, country, ua)
                 )
         except Exception as e:
             log.warning(f"affiliate_clicks insert failed: {e}")
 
-        # Build the affiliate URL — optional clickid for future postback
-        # tracking. TopTrendy's redirect.aspx ignores unknown params so
-        # adding this is safe even before postbacks are configured.
-        target = _BETLABEL_AFFILIATE_URL + f"&clickid={int(time.time())}_{match_id}"
+        # Build the affiliate URL — append clickid for future postback
+        # tracking. Affiliate platforms ignore unknown params so this is
+        # safe whether or not postbacks are configured.
+        sep = "&" if "?" in cfg["destination_url"] else "?"
+        target = cfg["destination_url"] + f"{sep}clickid={int(time.time())}_{match_id}"
+        winner_name = cfg["winner_display"]
 
         copy = _GO_BET_COPY[lang]
         n_books = len(comp_pairs) + 1   # competitors + Betlabel
@@ -11034,7 +11124,7 @@ def r_go_bet():
     {comp_rows_html}
     <li class="row best" style="animation-delay:{betlabel_delay}ms">
       <span class="check">★</span>
-      <span class="bk"><span class="badge">{copy['best']}</span>Betlabel</span>
+      <span class="bk"><span class="badge">{copy['best']}</span>{winner_name}</span>
       <span class="odd">{odd:.2f}</span>
     </li>
   </ul>
@@ -11062,9 +11152,15 @@ def r_go_bet():
 
     except Exception as e:
         log.exception(f"r_go_bet failed: {e}")
-        # Bail straight to the affiliate URL — never strand the user on
-        # an error page when they're trying to bet.
-        return redirect(_BETLABEL_AFFILIATE_URL, code=302)
+        # Bail straight to the matching affiliate URL — never strand the
+        # user on an error page when they're trying to bet. Falls back
+        # to betlabel if aff= param wasn't readable.
+        try:
+            fallback_aff = (flask_request.args.get("aff") or "betlabel").strip().lower()
+            fb_url = _AFFILIATE_CONFIGS.get(fallback_aff, _AFFILIATE_CONFIGS["betlabel"])["destination_url"]
+        except Exception:
+            fb_url = _BETLABEL_AFFILIATE_URL
+        return redirect(fb_url, code=302)
 
 
 @app.route("/api/admin/affiliate/stats")
