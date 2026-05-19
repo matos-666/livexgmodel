@@ -76,10 +76,11 @@ export default {
     const url = new URL(request.url);
     const ua  = (request.headers.get("user-agent") || "").toLowerCase();
 
-    // 1a. /go/* (affiliate interstitial) → ALWAYS pass through to Flask
-    //     with NO caching. Each render writes a tracking row and shows
-    //     fresh competitor odds — caching would break analytics + dedupe.
-    if (/^\/go\//.test(url.pathname)) {
+    // 1a. /go/* and /r/* → ALWAYS pass through to Flask with NO caching.
+    //     /go/*  = affiliate interstitial (each render writes tracking)
+    //     /r/*   = short-link redirector for Telegram CTAs (302s after
+    //              bumping click count). Both must hit Flask fresh.
+    if (/^\/go\//.test(url.pathname) || /^\/r\//.test(url.pathname)) {
       try {
         const target = FLASK_BASE + url.pathname + url.search;
         const upstream = await fetch(target, {

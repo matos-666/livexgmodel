@@ -226,14 +226,39 @@ _tg_cta_counter = 0
 _tg_cta_lock = threading.Lock()
 
 
+def _create_short_link(target_url: str, source: str = "") -> str:
+    """Insert a row into short_links and return the public /r/<code> URL.
+    Used by the Telegram pick CTA so the inline-button "Open link?" modal
+    shows a clean wbprns.com URL instead of the full /go/bet query string."""
+    import secrets
+    for _ in range(8):   # retry on collision (cosmically unlikely with 6 chars)
+        code = secrets.token_urlsafe(5)[:6]
+        try:
+            with _db() as conn:
+                conn.execute(
+                    "INSERT INTO short_links (code, target_url, created_at, source) "
+                    "VALUES (?, ?, ?, ?)",
+                    (code, target_url, int(time.time()), source or None)
+                )
+            return f"https://webpronos.com/r/{code}"
+        except sqlite3.IntegrityError:
+            continue
+        except Exception as e:
+            log.warning(f"_create_short_link insert failed: {e}; falling back to long URL")
+            return target_url
+    log.warning("_create_short_link: 8 collisions in a row, returning long URL")
+    return target_url
+
+
 def _next_cta(odds: float = None, stake: float = 100.0,
               match_id: int = 0, market: str = "",
-              label: str = "") -> str:
+              label: str = "") -> tuple[str, str]:
     """
-    Return the next Telegram CTA as an HTML hyperlink to the smart-loader
-    interstitial. Rotates BOTH the phrasing (8 variations) and the
-    affiliate destination (LEON ↔ TWIN) so subscribers don't see the
-    same combination twice in a row.
+    Return (phrase, short_url) for the next Telegram CTA. Rotates both
+    the phrasing (8 variations) and the affiliate destination (LEON ↔
+    TWIN). The short_url points to /r/<code> which 302s to the real
+    /go/bet URL — keeps the Telegram "Open this link?" confirmation
+    modal looking clean.
 
     Args:
         odds, stake — unused now (kept for backward-compat with callers)
@@ -258,8 +283,9 @@ def _next_cta(odds: float = None, stake: float = 100.0,
         "lang":     "pt-pt",
         "source":   "telegram-betradar",
     }
-    url = f"{_GO_BET_BASE}?{urlencode(qs)}"
-    return f'<a href="{url}">{phrase}</a>'
+    full_url  = f"{_GO_BET_BASE}?{urlencode(qs)}"
+    short_url = _create_short_link(full_url, source="telegram-betradar")
+    return (phrase, short_url)
 
 _COUNTRY_FLAGS = {
     "england": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "spain": "🇪🇸", "italy": "🇮🇹", "germany": "🇩🇪",
@@ -494,8 +520,11 @@ def _get_algorithm_results() -> dict:
         log.error(f"Error calculating algorithm results: {e}")
         return {"total": 0, "wins": 0, "losses": 0, "pending": 0, "pnl": 0, "roi": 0}
 
-def _send_telegram(text: str, chat_id=None):
-    """Send a message via Telegram Bot API. If chat_id is None, sends to all subscribers."""
+def _send_telegram(text: str, chat_id=None, buttons=None):
+    """Send a message via Telegram Bot API. If chat_id is None, sends to
+    all subscribers. Optional `buttons` is an inline_keyboard (list of
+    rows of {text, url} or {text, callback_data} dicts) attached as
+    reply_markup."""
     if not TELEGRAM_BOT_TOKEN:
         return
     import urllib.request as _urllib
@@ -503,12 +532,15 @@ def _send_telegram(text: str, chat_id=None):
     for cid in ids:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = json.dumps({
+            body = {
                 "chat_id": cid,
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
-            }).encode()
+            }
+            if buttons:
+                body["reply_markup"] = {"inline_keyboard": buttons}
+            payload = json.dumps(body).encode()
             req = _urllib.Request(url, data=payload,
                                   headers={"Content-Type": "application/json"})
             _urllib.urlopen(req, timeout=10)
@@ -1597,8 +1629,14 @@ def _build_stats_period_menu(active: str = "alltime") -> list:
         [{"text": "↩️ Menu", "callback_data": "cb_menu"}],
     ]
 
-def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> str:
-    """Build the Telegram message for a new pick."""
+def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None):
+    """Build the Telegram message for a new pick.
+
+    Returns (text, inline_keyboard) where inline_keyboard is a list of
+    rows of buttons suitable for the `reply_markup` of sendMessage. The
+    CTA is rendered as a proper Telegram button (not an inline <a>) so
+    it stands out as the call-to-action and the URL is a short link.
+    """
     flag        = _country_flag(match.get("country", ""))
     tournament  = match.get("tournament", "")
     home        = match.get("homeTeam", "Casa")
@@ -1619,8 +1657,8 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
     mkt_icon = market_icons.get(market, "📊")
 
     stake = get_setting("stake_per_bet", 100.0)
-    cta = _next_cta(odds=odds, stake=stake, match_id=match_id,
-                    market=market, label=label)
+    cta_phrase, cta_url = _next_cta(odds=odds, stake=stake, match_id=match_id,
+                                     market=market, label=label)
 
     # Layperson-friendly value explanation. Replaces the cryptic
     # "Modelo X% | Mercado Y% Edge Z%" with one line that spells out
@@ -1631,7 +1669,7 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
         f"(+<b>{edge:.1f}%</b> de valor)."
     )
 
-    return (
+    text = (
         f"🔔 <b>NOVA PICK</b>\n"
         f"\n"
         f"{flag} <b>{tournament}</b>\n"
@@ -1642,11 +1680,12 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None) -> s
         f"{mkt_icon} Mercado: <b>{market} → {label}</b>\n"
         f"💰 Odds: <b>{odds:.2f}</b>\n"
         f"\n"
-        f"{value_line}\n"
-        f"\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{cta}"
+        f"{value_line}"
     )
+    # CTA rendered as a real Telegram inline button. URL is a short link
+    # so the "Open this link?" confirmation modal stays clean.
+    inline_keyboard = [[{"text": cta_phrase, "url": cta_url}]]
+    return (text, inline_keyboard)
 
 def _get_banner_stats() -> dict:
     """
@@ -4868,6 +4907,20 @@ def _init_db():
             UNIQUE(ts_hour, host)
         );
         CREATE INDEX IF NOT EXISTS idx_bandwidth_log_ts ON bandwidth_log(ts_hour);
+
+        -- Short links for Telegram CTAs. The inline button URL on Telegram
+        -- shows up in the "Open this link?" confirmation modal — a full
+        -- /go/bet URL with 7 query params looks spammy, so we proxy it
+        -- through /r/<code> which 302s to the real URL. Codes are 6-char
+        -- base62-ish (URL-safe random). One row per fired pick.
+        CREATE TABLE IF NOT EXISTS short_links (
+            code        TEXT PRIMARY KEY,
+            target_url  TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            clicks      INTEGER NOT NULL DEFAULT 0,
+            source      TEXT  -- 'telegram-betradar', 'web-match-page', etc.
+        );
+        CREATE INDEX IF NOT EXISTS idx_short_links_created ON short_links(created_at);
         """)
     # Migration: add edge_entry column to existing DBs
     with _db() as conn:
@@ -5429,10 +5482,12 @@ def _sync_tips_db(match_id: int, picks: list, minute: int, odds: dict,
                         _broadcast_pick(match, p, minute)
                     except Exception as sse_err:
                         log.error(f"SSE broadcast failed: {sse_err}")
-                # Telegram notification for new tip
+                # Telegram notification for new tip — message body +
+                # CTA as a real inline button (short-link URL inside).
                 if match:
                     try:
-                        _send_telegram(_format_pick_alert(match, p, minute, shots=shots))
+                        text, kb = _format_pick_alert(match, p, minute, shots=shots)
+                        _send_telegram(text, buttons=kb)
                     except Exception as tg_err:
                         log.error(f"Telegram alert failed: {tg_err}")
             except Exception as e:
@@ -11531,6 +11586,40 @@ def r_admin_bandwidth_stats():
     except Exception as e:
         log.exception("bandwidth stats endpoint failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Short-link redirector — pretty URLs for Telegram CTA buttons
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.route("/r/<code>")
+def r_short_redirect(code: str):
+    """302 to the stored target_url for this short code. Bumps click count
+    so we have basic CTR analytics per Telegram pick CTA."""
+    try:
+        # Reject obviously malformed codes early — tokens are 6 chars,
+        # URL-safe base64, so >12 chars or weird chars = not ours.
+        if not code or len(code) > 12 or not all(c.isalnum() or c in "-_" for c in code):
+            return redirect("https://webpronos.com/", code=302)
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT target_url FROM short_links WHERE code = ?", (code,)
+            ).fetchone()
+        if not row:
+            return redirect("https://webpronos.com/", code=302)
+        # Best-effort click bump — never block redirect on the write.
+        try:
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE short_links SET clicks = clicks + 1 WHERE code = ?",
+                    (code,)
+                )
+        except Exception:
+            pass
+        return redirect(row["target_url"], code=302)
+    except Exception as e:
+        log.exception(f"r_short_redirect failed for {code}: {e}")
+        return redirect("https://webpronos.com/", code=302)
 
 
 # ─── Sitemap helpers ───────────────────────────────────────────────────────────
