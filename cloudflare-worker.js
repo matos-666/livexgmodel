@@ -80,6 +80,11 @@ export default {
     //     /go/*  = affiliate interstitial (each render writes tracking)
     //     /r/*   = short-link redirector for Telegram CTAs (302s after
     //              bumping click count). Both must hit Flask fresh.
+    //
+    // redirect:"manual" is CRITICAL — Cloudflare's fetch() auto-follows
+    // 3xx by default, which silently turned our 302-to-affiliate into
+    // a 200 + Lovable HTML. We want the 302 + Location header surfaced
+    // to the browser intact so the browser does the redirect.
     if (/^\/go\//.test(url.pathname) || /^\/r\//.test(url.pathname)) {
       try {
         const target = FLASK_BASE + url.pathname + url.search;
@@ -87,13 +92,16 @@ export default {
           headers: { "User-Agent": ua, "X-Forwarded-Host": url.hostname,
                      "CF-IPCountry": request.cf?.country || "" },
           cf: { cacheTtl: 0, cacheEverything: false },
+          redirect: "manual",
         });
+        // Copy the full set of upstream headers so Location (and any
+        // others Flask set) reach the browser. Just override the
+        // caching directive — everything else is upstream's choice.
+        const headers = new Headers(upstream.headers);
+        headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
         return new Response(upstream.body, {
-          status: upstream.status,
-          headers: {
-            "Content-Type":  upstream.headers.get("Content-Type") || "text/html; charset=utf-8",
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-          },
+          status:  upstream.status,
+          headers: headers,
         });
       } catch (e) {
         // Fall through to Lovable on Flask failure (will likely 404 SPA-side
