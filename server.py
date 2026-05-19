@@ -3285,6 +3285,97 @@ def get_full_odds_analysis(match, shots, api_key=None):
 
 
 # ════════════════════════════════════════════════════════════
+#  BANDWIDTH TRACKING — wraps _session to size proxy plans
+# ════════════════════════════════════════════════════════════
+# Counts response-body bytes per destination host. Periodically flushed
+# to the bandwidth_log table (rolled up per hour) so we can answer
+# "how many GB/month does Sofascore traffic actually consume?" before
+# paying for residential proxy bandwidth.
+
+import threading as _threading_mod
+_bw_counters: dict = {}            # host → {"bytes_in": int, "count": int}
+_bw_lock = _threading_mod.Lock()
+
+
+def _track_response(url, resp):
+    """Record bytes-in for a response. Cheap path, runs synchronously
+    after every _session.get/_session.post. Never raises — bandwidth
+    accounting must never interfere with actual scraping."""
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).netloc or "unknown").lower()
+        # resp.content for curl_cffi / requests / cloudscraper is bytes.
+        # Length 0 means the wrapped library streamed without buffering
+        # — uncommon for our endpoints (all small JSON / HTML / images).
+        body = getattr(resp, "content", None)
+        n = len(body) if body else 0
+        with _bw_lock:
+            d = _bw_counters.setdefault(host, {"bytes_in": 0, "count": 0})
+            d["bytes_in"] += n
+            d["count"]    += 1
+    except Exception:
+        pass
+
+
+def _flush_bw_counters():
+    """Persist in-memory counters into bandwidth_log. Called from the BG
+    loop every cycle so a worker crash loses at most one cycle of data.
+    Uses ON CONFLICT to fold multiple flushes within the same hour into
+    one row per (hour, host)."""
+    with _bw_lock:
+        if not _bw_counters:
+            return
+        snap = {h: dict(d) for h, d in _bw_counters.items()}
+        _bw_counters.clear()
+    ts_hour = (int(time.time()) // 3600) * 3600
+    try:
+        with _db() as conn:
+            for host, d in snap.items():
+                conn.execute(
+                    "INSERT INTO bandwidth_log (ts_hour, host, bytes_in, request_count) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(ts_hour, host) DO UPDATE SET "
+                    "  bytes_in      = bytes_in + excluded.bytes_in, "
+                    "  request_count = request_count + excluded.request_count",
+                    (ts_hour, host, d["bytes_in"], d["count"])
+                )
+    except Exception as e:
+        log.warning(f"_flush_bw_counters failed: {e}")
+
+
+class _TrackedSession:
+    """Drop-in proxy around a curl_cffi / cloudscraper / requests Session
+    that records response bytes per host. Forwards all other attribute
+    access to the underlying session via __getattr__ so existing callers
+    don't need to change (they keep using _session.headers, .cookies,
+    .post, .get etc identically)."""
+    def __init__(self, inner):
+        object.__setattr__(self, "_s", inner)
+    def get(self, url, **kw):
+        r = self._s.get(url, **kw)
+        _track_response(url, r)
+        return r
+    def post(self, url, **kw):
+        r = self._s.post(url, **kw)
+        _track_response(url, r)
+        return r
+    def __getattr__(self, name):
+        # Only fires for attrs not on the proxy itself. Forwards
+        # transparently to the wrapped session.
+        return getattr(self._s, name)
+    def __setattr__(self, name, value):
+        setattr(self._s, name, value)
+
+
+def _wrap_session(s):
+    """Wrap the configured session in the bandwidth tracker. Idempotent —
+    re-wrapping an already-wrapped session is a no-op."""
+    if isinstance(s, _TrackedSession):
+        return s
+    return _TrackedSession(s)
+
+
+# ════════════════════════════════════════════════════════════
 #  SOFASCORE — Client code
 # ════════════════════════════════════════════════════════════
 
@@ -3307,7 +3398,7 @@ def _init_client():
         ]
         for profile in profiles_to_try:
             try:
-                _session = CffiSession(impersonate=profile)
+                _session = _wrap_session(CffiSession(impersonate=profile))
                 resp = _session.get(SOFASCORE_WEB, timeout=15)
                 if resp.status_code == 200:
                     _client_type = f"curl_cffi:{profile}"
@@ -3326,10 +3417,10 @@ def _init_client():
     # 2) cloudscraper
     try:
         import cloudscraper
-        _session = cloudscraper.create_scraper(
+        _session = _wrap_session(cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "desktop": True},
             delay=3,
-        )
+        ))
         resp = _session.get(SOFASCORE_WEB, timeout=15)
         if resp.status_code == 200:
             _client_type = "cloudscraper"
@@ -3343,7 +3434,7 @@ def _init_client():
     # 3) requests
     try:
         import requests as req
-        _session = req.Session()
+        _session = _wrap_session(req.Session())
         _session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -4760,6 +4851,21 @@ def _init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_affiliate_clicks_ts ON affiliate_clicks(ts);
         CREATE INDEX IF NOT EXISTS idx_affiliate_clicks_match ON affiliate_clicks(match_id);
+
+        -- Bandwidth tracking. Every outbound _session.get/_session.post is
+        -- wrapped to record response size against the destination host.
+        -- Rolled up by hour to keep row count manageable (~24 rows/day/host).
+        -- Powers /api/admin/bandwidth/stats so we can size proxy plans
+        -- accurately before paying for residential bandwidth.
+        CREATE TABLE IF NOT EXISTS bandwidth_log (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_hour       INTEGER NOT NULL,
+            host          TEXT NOT NULL,
+            bytes_in      INTEGER NOT NULL DEFAULT 0,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(ts_hour, host)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bandwidth_log_ts ON bandwidth_log(ts_hour);
         """)
     # Migration: add edge_entry column to existing DBs
     with _db() as conn:
@@ -6110,6 +6216,12 @@ def _background_loop():
             _run_background_cycle()
         except Exception as e:
             log.error(f"BG loop unhandled error: {e}")
+        # Persist accumulated bandwidth counters once per cycle. Cheap
+        # — one SQLite INSERT per active host (usually ≤5). Never raises.
+        try:
+            _flush_bw_counters()
+        except Exception:
+            pass
         time.sleep(BG_INTERVAL)
 
 
@@ -11212,6 +11324,112 @@ def r_admin_affiliate_stats():
             "affiliate_url": _BETLABEL_AFFILIATE_URL,
         })
     except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─── Bandwidth stats (powers admin panel Bandwidth page) ─────────────────────
+
+# Reference pricing for the Lovable admin panel to render alongside the
+# actual measured usage. Numbers verified 2026-05; refresh quarterly.
+# All ISP plans assume unlimited bandwidth so cost is constant regardless
+# of measured volume; rotating residential plans cap monthly bandwidth.
+_PROXY_PRICING = [
+    {"name": "Webshare ISP — 20 IPs",      "price_eur": 30,  "limit_gb": None,  "type": "isp"},
+    {"name": "IPRoyal ISP — 10 IPs",        "price_eur": 25,  "limit_gb": None,  "type": "isp"},
+    {"name": "Smartproxy ISP — 20 IPs",     "price_eur": 56,  "limit_gb": None,  "type": "isp"},
+    {"name": "Bright Data ISP — 10 IPs",    "price_eur": 150, "limit_gb": None,  "type": "isp"},
+    {"name": "Webshare Residential — 25 GB",   "price_eur": 150, "limit_gb": 25,  "type": "residential"},
+    {"name": "IPRoyal Residential — 25 GB",    "price_eur": 135, "limit_gb": 25,  "type": "residential"},
+    {"name": "Smartproxy Residential — 25 GB", "price_eur": 200, "limit_gb": 25,  "type": "residential"},
+    {"name": "Bright Data Residential — 25 GB","price_eur": 250, "limit_gb": 25,  "type": "residential"},
+]
+
+
+@app.route("/api/admin/bandwidth/stats")
+def r_admin_bandwidth_stats():
+    """Bandwidth consumption per host + per day, plus cost projections
+    against the proxy plans we'd realistically buy. Powers the Bandwidth
+    page in the Lovable admin panel.
+
+    Query: ?days=7  (default 7, range 1-90)
+    """
+    try:
+        # Flush any in-memory counters so the response reflects the very
+        # latest cycle — otherwise the admin sees data up to the last
+        # BG cycle flush, which can lag by 2 minutes.
+        try: _flush_bw_counters()
+        except Exception: pass
+
+        days = max(1, min(90, int(flask_request.args.get("days") or 7)))
+        since_ts_hour = (int(time.time()) // 3600) * 3600 - days * 86400
+
+        with _db() as conn:
+            by_host = [dict(r) for r in conn.execute(
+                "SELECT host, SUM(bytes_in) AS bytes, SUM(request_count) AS requests "
+                "FROM bandwidth_log WHERE ts_hour >= ? "
+                "GROUP BY host ORDER BY bytes DESC",
+                (since_ts_hour,)
+            ).fetchall()]
+            by_day = [dict(r) for r in conn.execute(
+                "SELECT date(ts_hour, 'unixepoch') AS day, "
+                "       SUM(bytes_in) AS bytes, SUM(request_count) AS requests "
+                "FROM bandwidth_log WHERE ts_hour >= ? "
+                "GROUP BY day ORDER BY day DESC",
+                (since_ts_hour,)
+            ).fetchall()]
+            # Top-host-per-day for the stacked chart
+            by_day_host = [dict(r) for r in conn.execute(
+                "SELECT date(ts_hour, 'unixepoch') AS day, host, "
+                "       SUM(bytes_in) AS bytes "
+                "FROM bandwidth_log WHERE ts_hour >= ? "
+                "GROUP BY day, host ORDER BY day DESC, bytes DESC",
+                (since_ts_hour,)
+            ).fetchall()]
+
+        total_bytes    = sum(r["bytes"] for r in by_host)
+        total_requests = sum(r["requests"] for r in by_host)
+        days_with_data = max(1, len(by_day))
+        avg_daily_gb   = total_bytes / 1e9 / days_with_data
+        proj_month_gb  = round(avg_daily_gb * 30, 2)
+
+        # Cost recommendation: cheapest provider whose plan still covers
+        # our projected monthly volume. ISP plans (no cap) always qualify.
+        recommendations = []
+        for p in _PROXY_PRICING:
+            fits = p["limit_gb"] is None or proj_month_gb <= p["limit_gb"]
+            recommendations.append({
+                **p,
+                "fits_projected_usage": fits,
+                "headroom_gb": (p["limit_gb"] - proj_month_gb) if p["limit_gb"] else None,
+            })
+        recommendations.sort(key=lambda x: (not x["fits_projected_usage"], x["price_eur"]))
+
+        return jsonify({
+            "ok": True,
+            "window_days": days,
+            "totals": {
+                "bytes":      int(total_bytes),
+                "gb":         round(total_bytes / 1e9, 3),
+                "requests":   int(total_requests),
+                "avg_per_request_kb": round((total_bytes / 1024 / total_requests) if total_requests else 0, 2),
+            },
+            "projection": {
+                "avg_daily_gb":     round(avg_daily_gb, 3),
+                "projected_monthly_gb": proj_month_gb,
+                "projected_yearly_gb":  round(avg_daily_gb * 365, 1),
+            },
+            "by_host":     by_host,
+            "by_day":      by_day,
+            "by_day_host": by_day_host,
+            "proxy_recommendations": recommendations,
+            "note": (
+                "Counter started at deploy; first 48h are still warming. "
+                "ISP plans recommended (unlimited bandwidth, predictable cost) "
+                "unless projected_monthly_gb is well under 25."
+            ),
+        })
+    except Exception as e:
+        log.exception("bandwidth stats endpoint failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
