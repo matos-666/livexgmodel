@@ -10954,6 +10954,17 @@ def r_team_logos_refresh():
 #             → redirects to LEON
 # - twin:     same PT pool, alternating with leon for telegram CTAs
 #             → redirects to TWIN
+# Welcome-bonus offers shown under the "Open now" button after the winner
+# row reveals. Rotated per match_id so the same fixture always shows the
+# same offer (reload-safe) but different matches vary. Copy is English for
+# now per the boss; localise later via the same _GO_BET_COPY pattern.
+_AFFILIATE_OFFERS_DEFAULT = [
+    {"icon": "🎁", "title": "Free Bet",
+     "desc": "15% free bet up to €100 on first deposit"},
+    {"icon": "⚽", "title": "Sports Bonus",
+     "desc": "First deposit bonus up to €100"},
+]
+
 _AFFILIATE_CONFIGS = {
     "betlabel": {
         "destination_url": (
@@ -10967,6 +10978,7 @@ _AFFILIATE_CONFIGS = {
             "Unibet", "888sport", "Marathonbet", "Betway", "Paddy Power",
             "Sportingbet", "22Bet",
         ],
+        "welcome_offers": _AFFILIATE_OFFERS_DEFAULT,
     },
     "leon": {
         "destination_url": (
@@ -10976,6 +10988,7 @@ _AFFILIATE_CONFIGS = {
         "winner_display": "LEON",
         # PT-friendly books familiar to BetRadar AI subscribers.
         "competitor_pool": ["LeBull", "Betclic", "22Bet", "Betano", "Bwin"],
+        "welcome_offers": _AFFILIATE_OFFERS_DEFAULT,
     },
     "twin": {
         "destination_url": (
@@ -10984,6 +10997,7 @@ _AFFILIATE_CONFIGS = {
         ),
         "winner_display": "TWIN",
         "competitor_pool": ["LeBull", "Betclic", "22Bet", "Betano", "Bwin"],
+        "welcome_offers": _AFFILIATE_OFFERS_DEFAULT,
     },
 }
 
@@ -11097,10 +11111,25 @@ def r_go_bet():
             aff_key = "betlabel"
         cfg = _AFFILIATE_CONFIGS[aff_key]
 
+        # Embed mode: strip the full-page chrome and emit postMessage to
+        # the parent window instead of doing a same-tab redirect. SPA
+        # wraps this in a modal + opens the bookmaker in window.open()
+        # on receipt of the message.
+        embed = (flask_request.args.get("embed") or "").strip().lower() in ("1", "true", "yes")
+
         competitors  = _affiliate_pick_competitors(
             match_id, k=4, pool=cfg["competitor_pool"]
         )
         comp_pairs   = _affiliate_generate_competitor_odds(odd, competitors, match_id)
+
+        # Pick ONE welcome offer for this render, deterministic per
+        # match_id so reloads stay consistent. Empty list → render nothing.
+        offers = cfg.get("welcome_offers") or []
+        offer = None
+        if offers:
+            import random as _r
+            rng = _r.Random(f"offer|{match_id or 0}")
+            offer = rng.choice(offers)
 
         # Tracking — fire-and-forget; never block the redirect on DB.
         try:
@@ -11154,6 +11183,30 @@ def r_go_bet():
         if market_display or label_display:
             sub_line = f'<div class="sub">{label_display} {f"· {market_display}" if market_display and label_display else market_display}</div>'
 
+        # Welcome offer card — fades in 600 ms AFTER the winner row reveals.
+        offer_html = ""
+        if offer:
+            offer_delay = betlabel_delay + 600
+            offer_html = (
+                f'<div class="offer" style="animation-delay:{offer_delay}ms">'
+                f'  <div class="offer-icon">{offer["icon"]}</div>'
+                f'  <div class="offer-body">'
+                f'    <div class="offer-title">{offer["title"]}</div>'
+                f'    <div class="offer-desc">{offer["desc"]}</div>'
+                f'  </div>'
+                f'</div>'
+            )
+
+        # Embed-mode adjustments: transparent body so SPA's modal backdrop
+        # shows through, no min-height (modal sizes itself), no top padding
+        # (modal provides its own chrome).
+        embed_css = ""
+        if embed:
+            embed_css = (
+                "html,body{background:transparent !important;min-height:auto !important;}"
+                ".wrap{min-height:auto !important;padding:1.5rem 1.25rem .75rem !important;}"
+            )
+
         html = f"""<!doctype html>
 <html lang="{lang}">
 <head>
@@ -11165,11 +11218,13 @@ def r_go_bet():
   :root {{
     --bg: #0a1a0f; --card:#0f2418; --ink:#e2e8f0; --muted:#94a3b8;
     --line:#1a3b27; --accent:#22d3ee; --good:#22c55e; --bad:#ef4444;
+    --warn: #fb923c;
   }}
   * {{ box-sizing:border-box; }}
   html,body {{ margin:0; padding:0; background:var(--bg); color:var(--ink);
     font-family: Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
     min-height:100vh; -webkit-font-smoothing:antialiased; }}
+  {embed_css}
   .wrap {{ max-width:520px; margin:0 auto; padding:2.5rem 1.25rem 1.5rem;
     min-height:100vh; display:flex; flex-direction:column; }}
   .header {{ text-align:center; margin-bottom:1.5rem; }}
@@ -11214,11 +11269,22 @@ def r_go_bet():
   .countdown {{ text-align:center; color:var(--muted); font-size:.85rem;
     margin-bottom:1rem; }}
   .countdown b {{ color:var(--ink); font-weight:800; font-variant-numeric: tabular-nums; }}
-  .open-btn {{ display:block; width:100%; background:var(--accent);
-    color:#0f172a; text-align:center; font-weight:800; padding:.95rem;
+  .open-btn {{ display:block; width:100%; background:var(--warn);
+    color:#1a1300; text-align:center; font-weight:800; padding:.95rem;
     border-radius:10px; text-decoration:none; font-size:1rem;
-    transition: filter .15s; }}
-  .open-btn:hover {{ filter:brightness(1.05); }}
+    transition: filter .15s, transform .12s;
+    box-shadow: 0 6px 18px rgba(251,146,60,.25); }}
+  .open-btn:hover {{ filter:brightness(1.08); transform: translateY(-1px); }}
+  /* Welcome offer card under the "Open now" button */
+  .offer {{ margin-top: .85rem; display:flex; align-items:center;
+    gap: .75rem; padding: .75rem .9rem; background: var(--card);
+    border: 1px solid var(--line); border-radius: 10px;
+    opacity:0; animation: reveal .35s ease forwards; }}
+  .offer-icon {{ font-size: 1.4rem; flex-shrink: 0; line-height: 1; }}
+  .offer-body {{ flex: 1; min-width: 0; }}
+  .offer-title {{ font-weight: 800; font-size: .85rem; color: #fff;
+    margin-bottom: .15rem; }}
+  .offer-desc {{ font-size: .78rem; color: var(--muted); line-height: 1.35; }}
   .small {{ color:var(--muted); font-size:.72rem; text-align:center;
     margin-top:1.25rem; line-height:1.45; }}
 </style>
@@ -11241,7 +11307,9 @@ def r_go_bet():
     </li>
   </ul>
 
-  <a class="open-btn" id="openBtn" href="{target}">{copy['open_now']}</a>
+  <a class="open-btn" id="openBtn" href="{target}" target="{'_blank' if embed else '_self'}" rel="noopener sponsored">{copy['open_now']}</a>
+
+  {offer_html}
 
   <div class="small">{copy['vary']}</div>
 </div>
@@ -11250,7 +11318,37 @@ def r_go_bet():
   (function() {{
     var target = {json.dumps(target)};
     var delay  = {delay_ms};
-    setTimeout(function() {{ window.location.replace(target); }}, delay);
+    var embed  = {json.dumps(embed)};
+    setTimeout(function() {{
+      if (embed) {{
+        // Tell parent window (SPA modal) to open the bookmaker in a new
+        // tab and close/dismiss the modal. SPA listens for this message.
+        try {{
+          window.parent.postMessage({{
+            type: 'webpronos:open-affiliate',
+            url:  target,
+            ts:   Date.now()
+          }}, '*');
+        }} catch(e) {{}}
+      }} else {{
+        window.location.replace(target);
+      }}
+    }}, delay);
+    // Also relay manual clicks on "Open now" so SPA can close the modal
+    // even when the user is impatient and clicks early.
+    var btn = document.getElementById('openBtn');
+    if (btn && embed) {{
+      btn.addEventListener('click', function() {{
+        try {{
+          window.parent.postMessage({{
+            type: 'webpronos:open-affiliate',
+            url:  target,
+            ts:   Date.now(),
+            manual: true
+          }}, '*');
+        }} catch(e) {{}}
+      }});
+    }}
   }})();
 </script>
 </body>
