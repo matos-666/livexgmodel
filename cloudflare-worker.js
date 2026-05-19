@@ -76,16 +76,22 @@ export default {
     const url = new URL(request.url);
     const ua  = (request.headers.get("user-agent") || "").toLowerCase();
 
-    // 1a. /go/* and /r/* → ALWAYS pass through to Flask with NO caching.
-    //     /go/*  = affiliate interstitial (each render writes tracking)
-    //     /r/*   = short-link redirector for Telegram CTAs (302s after
-    //              bumping click count). Both must hit Flask fresh.
+    // 1a. /go/*, /r/* and /betradar/* → ALWAYS pass through to Flask
+    //     with NO caching.
+    //
+    //     /go/*       = affiliate interstitial (each render writes tracking)
+    //     /r/*        = generic short-link redirector
+    //     /betradar/* = branded short-link path for Telegram BetRadar AI
+    //                   CTAs (same lookup as /r/ but the path itself shows
+    //                   "betradar" in the Telegram "Open link?" modal)
     //
     // redirect:"manual" is CRITICAL — Cloudflare's fetch() auto-follows
     // 3xx by default, which silently turned our 302-to-affiliate into
     // a 200 + Lovable HTML. We want the 302 + Location header surfaced
     // to the browser intact so the browser does the redirect.
-    if (/^\/go\//.test(url.pathname) || /^\/r\//.test(url.pathname)) {
+    if (/^\/go\//.test(url.pathname)
+        || /^\/r\//.test(url.pathname)
+        || /^\/betradar\//.test(url.pathname)) {
       try {
         const target = FLASK_BASE + url.pathname + url.search;
         const upstream = await fetch(target, {

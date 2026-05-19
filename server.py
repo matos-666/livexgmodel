@@ -226,10 +226,19 @@ _tg_cta_counter = 0
 _tg_cta_lock = threading.Lock()
 
 
-def _create_short_link(target_url: str, source: str = "") -> str:
-    """Insert a row into short_links and return the public /r/<code> URL.
-    Used by the Telegram pick CTA so the inline-button "Open link?" modal
-    shows a clean wbprns.com URL instead of the full /go/bet query string."""
+def _create_short_link(target_url: str, source: str = "",
+                        path: str = "r") -> str:
+    """Insert a row into short_links and return the public short URL.
+
+    Args:
+        target_url — the long URL we want to wrap
+        source     — free-form tag, stored for analytics
+        path       — URL path component, defaults to "r" (generic).
+                      Pass "betradar" for Telegram BetRadar AI CTAs so the
+                      "Open link?" confirmation modal shows
+                      webpronos.com/betradar/<code> — brand-aligned with
+                      the bot name without buying a new domain.
+    """
     import secrets
     for _ in range(8):   # retry on collision (cosmically unlikely with 6 chars)
         code = secrets.token_urlsafe(5)[:6]
@@ -240,7 +249,7 @@ def _create_short_link(target_url: str, source: str = "") -> str:
                     "VALUES (?, ?, ?, ?)",
                     (code, target_url, int(time.time()), source or None)
                 )
-            return f"https://webpronos.com/r/{code}"
+            return f"https://webpronos.com/{path}/{code}"
         except sqlite3.IntegrityError:
             continue
         except Exception as e:
@@ -284,7 +293,11 @@ def _next_cta(odds: float = None, stake: float = 100.0,
         "source":   "telegram-betradar",
     }
     full_url  = f"{_GO_BET_BASE}?{urlencode(qs)}"
-    short_url = _create_short_link(full_url, source="telegram-betradar")
+    # Use the branded /betradar/<code> path so the Telegram "Open link?"
+    # confirmation modal reads webpronos.com/betradar/... — much more
+    # on-brand for the BetRadar AI bot than a generic /r/<code>.
+    short_url = _create_short_link(full_url, source="telegram-betradar",
+                                     path="betradar")
     return (phrase, short_url)
 
 _COUNTRY_FLAGS = {
@@ -11593,9 +11606,16 @@ def r_admin_bandwidth_stats():
 # ═══════════════════════════════════════════════════════════════════════════
 
 @app.route("/r/<code>")
+@app.route("/betradar/<code>")
 def r_short_redirect(code: str):
     """302 to the stored target_url for this short code. Bumps click count
-    so we have basic CTR analytics per Telegram pick CTA."""
+    so we have basic CTR analytics per Telegram pick CTA.
+
+    Two aliases serve the same table:
+      /r/<code>         — generic short links
+      /betradar/<code>  — Telegram BetRadar AI bot CTAs (branded path)
+    Same lookup behaviour either way.
+    """
     try:
         # Reject obviously malformed codes early — tokens are 6 chars,
         # URL-safe base64, so >12 chars or weird chars = not ours.
