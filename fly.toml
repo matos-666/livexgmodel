@@ -9,7 +9,7 @@ primary_region = "sjc"
   DB_PATH = "/data/tips.db"
 
 [[mounts]]
-  source = "tips_data"
+  source = "tips_data_lhr"
   destination = "/data"
 
 [http_service]

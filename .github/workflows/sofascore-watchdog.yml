@@ -1,16 +1,20 @@
-name: Sofascore Watchdog
+name: Sofascore Watchdog (fallback)
 
-# Runs every 30 minutes (was hourly). Each run does an INTRA-RUN double-check
-# (3 health probes spaced 60 s apart) before declaring this run unhealthy —
-# this guarantees a strike is only logged when Sofascore is genuinely
-# blocked, not on a 30-second hiccup.
+# FALLBACK ROLE since 2026-05-22:
+# The PRIMARY watchdog now runs in-app via APScheduler every 5 min and
+# triggers _failover_execute() in server.py. That path is reliable (no
+# GH Actions cron throttling) and fires within ~15 min of a block.
 #
-# Failover trigger:
-#   - This run fails AND the previous run also failed → migrate.
-#   - Single-run "fast lane": if all 3 intra-run probes fail, this is
-#     treated as 2 strikes worth of confidence and triggers IMMEDIATE
-#     migration (skips the cross-run cooldown). Cuts max downtime from
-#     ~1 h → ~3 min when the block is severe.
+# This workflow is kept as a backstop for the rare case where the app
+# itself is completely dead (not just Sofascore-blocked) — e.g. a Flask
+# crash loop or OOM kill that prevents the internal scheduler from
+# running. In that scenario nothing inside the app fires; only an
+# external probe can detect the outage and migrate.
+#
+# Cron bumped from */30 to every 2h so we don't race the in-app job:
+# if the app is alive but Sofascore-blocked, the in-app job fires first
+# (within ~15 min vs up to 2h here) and resolves it before this workflow
+# even runs its first probe.
 #
 # Required GitHub Secrets:
 #   FLY_API_TOKEN              — fly.io token (get with `flyctl auth token`)
@@ -18,8 +22,16 @@ name: Sofascore Watchdog
 #   TELEGRAM_ADMIN_CHAT_ID     — optional, your personal Telegram chat ID
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"   # every 30 min — at :00 and :30 UTC
+  # DISABLED 2026-05-31: this cron is the ROOT CAUSE of the runaway
+  # machine cascades (15 probe machines spawned every 2h × failed cleanup
+  # when all regions blocked = up to 45 ghost machines accumulating).
+  # The in-app watchdog (server.py:_failover_probe_job) is the primary
+  # path now and respects the WATCHDOG_DISABLED kill switch. This
+  # external workflow ignored that kill switch and kept spawning probes.
+  # Manual workflow_dispatch is kept for true emergencies (e.g. when the
+  # app itself is unresponsive and only an external probe can detect it).
+  # schedule:
+  #   - cron: "0 */2 * * *"   # every 2 hours, on the hour (UTC)
   workflow_dispatch:        # manual trigger button (for debugging)
     inputs:
       force_failover:

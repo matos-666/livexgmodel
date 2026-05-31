@@ -58,6 +58,14 @@ _session = None
 # top-down: each key is used until its remaining requests drop below
 # ODDS_API_KEY_THRESHOLD, at which point the next key takes over.
 _DEFAULT_ODDS_KEYS = [
+    "fb426ae753559bf14d44cdc4f8cb68f7",  # fresh — added 2026-05-22
+    "1bfe41fcc930a851627b2ac9ab19656a",  # fresh — added 2026-05-22
+    "33b4d68e6b059cf32c1d8e661330e23f",  # fresh — added 2026-05-21
+    "23b0d9f3cc94088301a62a55c7f51294",  # fresh — added 2026-05-21
+    "e4b971151c23a4af2cf685fc2e22834a",  # fresh — added 2026-05-21
+    "1c35b43e758d4646338141dc0205ce6d",  # fresh — added 2026-05-21
+    "549fadd572fc1d53a57555a020fba953",  # fresh — added 2026-05-20
+    "173199657160c9c0823710ddc47529e7",  # fresh — added 2026-05-20
     "1347b523a46f1acc1d06841cd5124f06",  # fresh — added 2026-05-19
     "c7587f4db8b8429c106dc400df29d314",  # fresh — added 2026-05-19
     "aa5ada68df5e9dcd732b3496cc39bb40",  # fresh — added 2026-05-18
@@ -221,6 +229,108 @@ _TG_AFFILIATE_ROTATION = ["leon", "twin"]
 # Public base URL for the smart-loader interstitial. Worker on
 # webpronos.com proxies /go/* straight to Flask (no Lovable cache).
 _GO_BET_BASE = "https://webpronos.com/go/bet"
+
+
+# ════════════════════════════════════════════════════════════
+#  X (Twitter) AUTO-POSTING BOT
+# ════════════════════════════════════════════════════════════
+#
+# Posts to @WebPronosAI when our algorithm fires a value pick.
+# Goals:
+#   - Build a public, auditable track record on X (every pick visible,
+#     every result replied in-thread within 24h of settlement).
+#   - Drive qualified traffic to webpronos.com via the link in each tweet.
+#   - Volume: ~5-15 tweets/day at edge ≥ 8% threshold.
+#
+# Disabled gracefully if X_API_KEY is not set (lets dev/staging deploys
+# run without the secret). All errors are caught and logged — Twitter
+# downtime never blocks pick generation, SSE fan-out, or Telegram.
+#
+# Secrets (all 5 required for posting; the 5th is the bearer token used
+# only for read endpoints we don't currently use):
+#   X_API_KEY              — Consumer Key (OAuth 1.0a)
+#   X_API_SECRET           — Consumer Secret
+#   X_ACCESS_TOKEN         — Access Token for @WebPronosAI account
+#   X_ACCESS_TOKEN_SECRET  — Access Token Secret
+#   X_BEARER_TOKEN         — App-only auth (unused in v1)
+#
+# Tuning knobs:
+#   X_EDGE_THRESHOLD       — float, default 8.0 (only tweet picks ≥ this %)
+#   X_BOT_ENABLED          — "1" to enable, anything else disables (default "1")
+#   X_DRY_RUN              — "1" logs the tweet instead of posting (test mode)
+X_API_KEY              = os.environ.get("X_API_KEY", "")
+X_API_SECRET           = os.environ.get("X_API_SECRET", "")
+X_ACCESS_TOKEN         = os.environ.get("X_ACCESS_TOKEN", "")
+X_ACCESS_TOKEN_SECRET  = os.environ.get("X_ACCESS_TOKEN_SECRET", "")
+X_BEARER_TOKEN         = os.environ.get("X_BEARER_TOKEN", "")
+X_EDGE_THRESHOLD       = float(os.environ.get("X_EDGE_THRESHOLD", "8.0"))
+X_BOT_ENABLED          = os.environ.get("X_BOT_ENABLED", "1") == "1"
+X_DRY_RUN              = os.environ.get("X_DRY_RUN", "0") == "1"
+
+# Rate-limit guards — hard caps to prevent runaway tweeting on bad days
+# (model glitches, mass-pick events) and to keep cost predictable
+# (each tweet ~$0.015 plain / $0.20 with URL — we keep tweets URL-free).
+# All reads count rows from x_tweets DB inside a process-wide lock so the
+# atomic slot reservation can't be raced.
+#
+# Tier-of-defense:
+#   1. EDGE_THRESHOLD     — only highest-conviction picks make it through (45%)
+#   2. MAX_PER_MATCH      — avoid spamming one game (2)
+#   3. MAX_PER_MARKET_PM  — same market on same match never tweets twice (1)
+#   4. MAX_PER_HOUR       — rate-spreading: 1 tweet per hour max so the
+#                            timeline reads as steady drumbeat, not bursts
+#   5. MAX_PER_DAY        — absolute daily ceiling: 5 tweets/24h
+#                            ⇒ cost ceiling = 5 picks × 2 (reply) × $0.015 = ~$0.15/day = $4.50/month
+X_MAX_PER_HOUR             = int(os.environ.get("X_MAX_PER_HOUR", "1"))
+X_MAX_PER_DAY              = int(os.environ.get("X_MAX_PER_DAY", "5"))
+X_MAX_PER_MATCH            = int(os.environ.get("X_MAX_PER_MATCH", "2"))
+X_MAX_PER_MARKET_PER_MATCH = int(os.environ.get("X_MAX_PER_MARKET_PER_MATCH", "1"))
+X_DEDUP_WINDOW_SEC         = int(os.environ.get("X_DEDUP_WINDOW_SEC", "60"))
+
+
+def _x_configured() -> bool:
+    """True iff all 4 OAuth 1.0a secrets are set. Bearer token is optional."""
+    return bool(X_API_KEY and X_API_SECRET and X_ACCESS_TOKEN and X_ACCESS_TOKEN_SECRET)
+
+
+_x_client_singleton = None
+_x_client_lock = threading.Lock()
+
+
+def _x_client():
+    """Lazy-init the Tweepy v2 client for the @WebPronosAI account.
+
+    Returns None if secrets are missing or tweepy fails to import — the
+    caller treats that as 'X disabled' and skips silently.
+    """
+    global _x_client_singleton
+    if _x_client_singleton is not None:
+        return _x_client_singleton
+    if not (_x_configured() and X_BOT_ENABLED):
+        return None
+    try:
+        import tweepy  # type: ignore
+    except ImportError:
+        log.warning("tweepy not installed — X bot disabled")
+        return None
+    with _x_client_lock:
+        if _x_client_singleton is not None:
+            return _x_client_singleton
+        try:
+            client = tweepy.Client(
+                consumer_key        = X_API_KEY,
+                consumer_secret     = X_API_SECRET,
+                access_token        = X_ACCESS_TOKEN,
+                access_token_secret = X_ACCESS_TOKEN_SECRET,
+                bearer_token        = X_BEARER_TOKEN or None,
+                wait_on_rate_limit  = False,  # we handle our own limits via DB
+            )
+            _x_client_singleton = client
+            log.info("X bot client initialised for @WebPronosAI")
+            return client
+        except Exception as e:
+            log.error(f"X bot init failed: {e}")
+            return None
 
 _tg_cta_counter = 0
 _tg_cta_lock = threading.Lock()
@@ -1642,6 +1752,452 @@ def _build_stats_period_menu(active: str = "alltime") -> list:
         [{"text": "↩️ Menu", "callback_data": "cb_menu"}],
     ]
 
+def _pick_narrative(market, label, home, away, hg, ag,
+                    home_xg, away_xg, minute, model_p, market_p, edge):
+    """Context-aware "value explanation" line for a pick.
+
+    Rewritten 2026-05-21 after boss feedback that:
+      1. "domina em xG" appeared when xG was tied or inferior (logic bug)
+      2. "Falta(m) 1 golo(s)" — ugly placeholder pluralisation
+      3. "Cobertura com colchão" used in every handicap regardless of fit
+      4. Same exact phrasing every pick → readers get blind to the copy
+    Fix: compute the actual scoreline + xG state, pick the scenario that
+    matches it, then sample one variant from a pool of ≥3 phrasings (hash-
+    seeded so the same pick is stable across re-fires but different picks
+    vary). Falls back to the generic phrasing for unknown market types.
+    """
+    import re as _re_pick
+
+    try:
+        minute_int = int(str(minute).split('+')[0])
+    except Exception:
+        minute_int = 45
+    remaining = max(1, 90 - minute_int)
+    home_xg = float(home_xg or 0)
+    away_xg = float(away_xg or 0)
+    hg = int(hg or 0); ag = int(ag or 0)
+    total_xg = home_xg + away_xg
+    total_g  = hg + ag
+
+    mk = (market or "").strip()
+    lb = (label or "").strip()
+    lb_low = lb.lower()
+    edge_tag = f" (+<b>{edge:.1f}%</b> de valor)"
+
+    # Deterministic-but-varied variant selection: hash combines the pick
+    # identity (teams, market, label) and a *coarse* minute bucket. Same
+    # pick re-emitted within ~5 min keeps the same phrasing (no flicker
+    # in the same Telegram alert) but a new pick on a new game gets a
+    # different one. Different scenarios (e.g. dominant vs tied xG) have
+    # their own pools so the choice is always semantically correct.
+    _variant_seed = abs(hash(f"{home}|{away}|{mk}|{lb}|{minute_int // 5}"))
+    def _pick_variant(pool: list[str]) -> str:
+        return pool[_variant_seed % len(pool)]
+
+    # Smart PT-BR pluralisation. n=1 → singular, otherwise plural.
+    def _plur_pt(n: int, sing: str, plur: str) -> str:
+        return sing if abs(n) == 1 else plur
+
+    # xG-difference state machine. Thresholds chosen empirically so
+    # "tied" feels intuitive (≤ 0.2 swing) and "dominant" is a clear
+    # gap (≥ 0.5). Used by every market branch below.
+    def _xg_state(t_xg: float, o_xg: float) -> str:
+        diff = t_xg - o_xg
+        if diff >  0.5:  return "dominant"
+        if diff >  0.2:  return "edging"
+        if diff > -0.2:  return "tied"
+        if diff > -0.5:  return "edged_against"
+        return "outclassed"
+
+    # ───────── Totals: Over X.5 / Under X.5 ─────────
+    if mk in ("Totals", "Over/Under") or mk.startswith("O/U"):
+        m = _re_pick.search(r"(\d+\.?\d*)", lb)
+        line = float(m.group(1)) if m else 2.5
+        is_over = lb_low.startswith("over") or lb_low.startswith("mais")
+        projected = total_xg * (90 / minute_int) if minute_int > 0 else total_xg
+
+        if is_over:
+            need = line - total_g
+            if need <= 0:
+                pool = [
+                    f"💡 <b>Linha já partida:</b> {total_g} golos no marcador, só falta "
+                    f"chegar ao apito final ({remaining}' por jogar).{edge_tag}",
+                    f"💡 <b>Over já cumprido:</b> jogo com {total_g} golos antes do {minute_int}', "
+                    f"o resto é só esperar pelo árbitro.{edge_tag}",
+                    f"💡 <b>Conta arrumada:</b> {total_g} golos já metidos com {remaining}' "
+                    f"ainda no relógio — Over {line:g} está fechado.{edge_tag}",
+                ]
+                return _pick_variant(pool)
+
+            need_int = int(need) if need == int(need) else int(need) + 1
+            golo_pt   = _plur_pt(need_int, "golo",   "golos")
+            falta_pt  = _plur_pt(need_int, "Falta",  "Faltam")
+            pool = [
+                f"💡 <b>Ritmo de Over:</b> {total_xg:.1f} xG combinado em {minute_int}' "
+                f"projeta {projected:.1f} no final da partida. {falta_pt} apenas "
+                f"{need_int} {golo_pt} em {remaining}' para bater a linha de {line:g} "
+                f"da casa.{edge_tag}",
+                f"💡 <b>Jogo aberto:</b> {home} e {away} já produziram {total_xg:.1f} xG "
+                f"aos {minute_int}' — passo médio para terminarem em ~{projected:.1f}. "
+                f"{falta_pt} {need_int} {golo_pt} para a linha {line:g} cair.{edge_tag}",
+                f"💡 <b>Projeção acima da linha:</b> {total_xg:.1f} xG em {minute_int}' "
+                f"sugerem {projected:.1f} ao apito final — bem acima dos {line:g} pedidos "
+                f"pela casa. {falta_pt} {need_int} {golo_pt} em {remaining}'.{edge_tag}",
+            ]
+            return _pick_variant(pool)
+
+        # ── Under: pick scenario by game state ──────────────────────
+        # Variables that distinguish scenarios:
+        #   - goals_to_break = line - total_g  (golos que ainda partem o Under)
+        #   - projected vs line gap
+        #   - minute (late vs mid)
+        #   - xG asymmetry (one side dominating but unable to convert)
+        goals_to_break = line - total_g
+        gtb_int = int(goals_to_break) if goals_to_break == int(goals_to_break) else int(goals_to_break) + 1
+        xg_diff_abs = abs(home_xg - away_xg)
+        dominant_side = home if home_xg > away_xg else away
+        dom_xg, weak_xg = max(home_xg, away_xg), min(home_xg, away_xg)
+
+        # CENÁRIO A — "Tempo a esgotar" (minuto alto, golos no marcador
+        # próximos da linha mas com ritmo a abrandar). Foca-se no relógio.
+        if minute_int >= 70:
+            golo_pt  = _plur_pt(gtb_int, "golo",  "golos")
+            falta_pt = _plur_pt(gtb_int, "falta", "faltam")
+            pool = [
+                f"💡 <b>Cronómetro a fechar Under:</b> {hg}-{ag} aos {minute_int}', "
+                f"{falta_pt} mais {gtb_int} {golo_pt} para Under {line:g} cair. "
+                f"xG total {total_xg:.1f} mostra que o ritmo já não dá em {remaining}'."
+                f"{edge_tag}",
+                f"💡 <b>Tempo a favor:</b> restam {remaining}' e a linha {line:g} ainda "
+                f"precisa de {gtb_int} {golo_pt} para partir. Com apenas {total_xg:.1f} xG "
+                f"em {minute_int}', dificilmente acontece.{edge_tag}",
+                f"💡 <b>Jogo a esmorecer:</b> {hg}-{ag} aos {minute_int}', {falta_pt} "
+                f"{gtb_int} {golo_pt} em {remaining}' para Under {line:g} cair — projeção "
+                f"final ~{projected:.1f}, abaixo da linha da casa.{edge_tag}",
+            ]
+            return _pick_variant(pool)
+
+        # CENÁRIO B — "Domínio estéril" (uma equipa cria xG significativo
+        # mas sem rasgar). Score baixo apesar de uma equipa pressionar.
+        # Sinaliza defesa sólida vs ataque ineficaz.
+        if xg_diff_abs >= 0.8 and total_g <= line - 1:
+            pool = [
+                f"💡 <b>Pressão estéril:</b> {dominant_side} cria muito ({dom_xg:.1f} xG) "
+                f"mas a defesa adversária aguenta — só {total_g} golos aos {minute_int}'. "
+                f"Linha {line:g} parece longe para o ritmo real do jogo.{edge_tag}",
+                f"💡 <b>Domínio sem rasgar:</b> {dominant_side} já produziu {dom_xg:.1f} xG "
+                f"vs {weak_xg:.1f} do adversário e mesmo assim o marcador está em {hg}-{ag}. "
+                f"Defesa montada para segurar Under {line:g}.{edge_tag}",
+                f"💡 <b>Asfixia mas sem prémio:</b> jogo unilateral ({dom_xg:.1f}–"
+                f"{weak_xg:.1f} xG) mas finalização inexistente. Projeção {projected:.1f} "
+                f"insuficiente para passar {line:g}.{edge_tag}",
+            ]
+            return _pick_variant(pool)
+
+        # CENÁRIO C — "Jogo travado / defensivo" (xG total baixo, sem
+        # ritmo de nenhum lado). Cenário clássico de jogos pesados.
+        pool = [
+            f"💡 <b>Jogo travado:</b> apenas {total_xg:.1f} xG combinado em {minute_int}' "
+            f"(projeção {projected:.1f}). {home} e {away} sem ritmo para passar a linha "
+            f"{line:g} da casa nos {remaining}' restantes.{edge_tag}",
+            f"💡 <b>Defesas no controlo:</b> {total_xg:.1f} xG total aos {minute_int}' — "
+            f"poucos remates de qualidade, projeção {projected:.1f} fica abaixo de {line:g}."
+            f"{edge_tag}",
+            f"💡 <b>Ritmo lento:</b> {total_xg:.1f} xG até ao {minute_int}' aponta para "
+            f"~{projected:.1f} no final. Linha {line:g} da casa parece exagerada para "
+            f"o que se vê em campo.{edge_tag}",
+        ]
+        return _pick_variant(pool)
+
+    # ───────── 1X2 ─────────
+    if mk == "1X2":
+        if lb_low in ("draw", "empate", "x"):
+            xg_diff = abs(home_xg - away_xg)
+            tied_score = (hg == ag)
+            # Identify trailing team for "reaction expected" scenarios
+            if hg < ag:
+                trail, lead = home, away
+                trail_xg, lead_xg = home_xg, away_xg
+                trail_g, lead_g   = hg, ag
+            elif ag < hg:
+                trail, lead = away, home
+                trail_xg, lead_xg = away_xg, home_xg
+                trail_g, lead_g   = ag, hg
+            else:
+                trail = lead = ""
+                trail_xg = lead_xg = 0.0
+                trail_g  = lead_g  = 0
+
+            # CENÁRIO A — "Cronómetro fecha empate" (score empatado +
+            # minuto alto). Quanto menos tempo resta, mais provável o
+            # empate ficar como está. Foca-se no relógio.
+            if tied_score and minute_int >= 70:
+                pool = [
+                    f"💡 <b>Cronómetro a fechar o empate:</b> {hg}-{ag} aos {minute_int}' "
+                    f"e nem {home} nem {away} estão a empurrar com força. {remaining}' "
+                    f"não chegam para virar o jogo.{edge_tag}",
+                    f"💡 <b>Cada um para o seu lado:</b> aos {minute_int}', {home} e "
+                    f"{away} aceitam o empate ({hg}-{ag}). xG dos últimos minutos não "
+                    f"justifica subida de risco no final.{edge_tag}",
+                    f"💡 <b>Empate a desenhar-se:</b> {remaining}' por jogar e ambas as "
+                    f"equipas a controlar — {total_xg:.1f} xG combinado em {minute_int}' "
+                    f"diz que ninguém quer arriscar mais.{edge_tag}",
+                ]
+                return _pick_variant(pool)
+
+            # CENÁRIO B — "Reação esperada" (score NÃO empatado, mas
+            # equipa atrás está a criar mais → modelo aposta no golo
+            # que iguala o jogo).
+            if (not tied_score) and trail and trail_xg > lead_xg + 0.3:
+                pool = [
+                    f"💡 <b>Resposta no horizonte:</b> {trail} a perder ({trail_g}-{lead_g}) "
+                    f"mas com {trail_xg:.1f} xG vs {lead_xg:.1f} de {lead}. Golo do empate "
+                    f"é o desfecho mais provável nos {remaining}'.{edge_tag}",
+                    f"💡 <b>Pressão para igualar:</b> {trail} produz ({trail_xg:.1f} xG vs "
+                    f"{lead_xg:.1f}) mas continua atrás no marcador. Modelo a {model_p:.0f}% "
+                    f"que o jogo acaba empatado.{edge_tag}",
+                    f"💡 <b>Modelo vê viragem-mas-só-até-empate:</b> {trail} domina "
+                    f"({trail_xg:.1f} xG) mas {lead} segura — golo da equipa atrás vem, "
+                    f"o segundo dificilmente.{edge_tag}",
+                ]
+                return _pick_variant(pool)
+
+            # CENÁRIO C — "Equilíbrio total" (score empatado + xG
+            # equilibrado). Cenário clássico: jogo controlado, nenhuma
+            # equipa cria distância. Empate pago acima do valor.
+            pool = [
+                f"💡 <b>Sem dono do jogo:</b> {home} {home_xg:.1f} xG vs {away} "
+                f"{away_xg:.1f} xG aos {minute_int}' — equilíbrio que as casas estão "
+                f"a subvalorizar.{edge_tag}",
+                f"💡 <b>Equilíbrio confirmado:</b> aos {minute_int}' nenhuma equipa se "
+                f"impõe ({home_xg:.1f}–{away_xg:.1f} em xG). Empate pago acima do "
+                f"valor justo.{edge_tag}",
+                f"💡 <b>Ninguém quer arriscar:</b> {home} e {away} aos {minute_int}' "
+                f"com {total_xg:.1f} xG combinado, sem nenhum lado a empurrar — empate "
+                f"é o desfecho mais provável.{edge_tag}",
+            ]
+            return _pick_variant(pool)
+
+        if lb == home or lb_low in ("home", "1"):
+            team, opp, t_xg, o_xg, t_g, o_g = home, away, home_xg, away_xg, hg, ag
+        elif lb == away or lb_low in ("away", "2"):
+            team, opp, t_xg, o_xg, t_g, o_g = away, home, away_xg, home_xg, ag, hg
+        else:
+            team, opp = lb, ""
+            t_xg = o_xg = 0.0; t_g = o_g = 0
+
+        state = _xg_state(t_xg, o_xg)
+
+        # Team is LOSING the scoreline
+        if t_g < o_g:
+            if state in ("dominant", "edging"):
+                pool = [
+                    f"💡 <b>Reviravolta no horizonte:</b> {team} a perder ({t_g}-{o_g}) "
+                    f"mas com {t_xg:.1f} xG vs {o_xg:.1f} de {opp} — a pressão está "
+                    f"a montar nos {remaining}' que faltam.{edge_tag}",
+                    f"💡 <b>Domínio sem prémio:</b> {team} já produziu mais "
+                    f"({t_xg:.1f} xG a {o_xg:.1f}) mas continua atrás no marcador "
+                    f"({t_g}-{o_g}). Tendência para corrigir no resto do jogo.{edge_tag}",
+                    f"💡 <b>Pressão por prémio:</b> apesar do {t_g}-{o_g} contra, "
+                    f"{team} é quem cria ({t_xg:.1f} vs {o_xg:.1f} xG) — modelo "
+                    f"confia na resposta antes do 90'.{edge_tag}",
+                ]
+            else:  # tied or behind on xG — model still picks them, likely momentum/odds value
+                pool = [
+                    f"💡 <b>Ainda no jogo:</b> {team} atrás ({t_g}-{o_g}) e em xG "
+                    f"({t_xg:.1f} vs {o_xg:.1f}), mas as odds caíram demais. "
+                    f"Modelo vê valor mesmo sem domínio claro.{edge_tag}",
+                    f"💡 <b>Odds esticadas:</b> mercado descartou {team} ao {minute_int}' "
+                    f"({t_g}-{o_g}), mas faltam {remaining}' e o preço já não respeita "
+                    f"a possibilidade de viragem.{edge_tag}",
+                ]
+            return _pick_variant(pool)
+
+        # Team is LEADING the scoreline
+        if t_g > o_g:
+            if state in ("dominant", "edging"):
+                pool = [
+                    f"💡 <b>Vantagem merecida:</b> {team} à frente ({t_g}-{o_g}) e por "
+                    f"cima em xG ({t_xg:.1f} a {o_xg:.1f}) — modelo dá {model_p:.0f}% "
+                    f"de segurar até ao final.{edge_tag}",
+                    f"💡 <b>Resultado a refletir o jogo:</b> {team} {t_g}-{o_g} com "
+                    f"{t_xg:.1f} xG vs {o_xg:.1f} de {opp}. Pressão controlada, "
+                    f"vantagem a confirmar nos {remaining}'.{edge_tag}",
+                    f"💡 <b>No comando:</b> {team} lidera por {t_g}-{o_g} e domina "
+                    f"o relatório de remates ({t_xg:.1f}–{o_xg:.1f} xG). Casas a "
+                    f"subestimar a estabilidade.{edge_tag}",
+                ]
+            elif state == "tied":
+                pool = [
+                    f"💡 <b>Vantagem a defender:</b> {team} à frente ({t_g}-{o_g}) "
+                    f"mas xG equilibrado ({t_xg:.1f}–{o_xg:.1f}) — modelo confia "
+                    f"que o resultado aguenta os últimos {remaining}'.{edge_tag}",
+                    f"💡 <b>Pequena janela ainda aberta:</b> {team} segura o {t_g}-{o_g} "
+                    f"sem domínio claro, mas {opp} também não está a empurrar — "
+                    f"casas pagam acima do risco real.{edge_tag}",
+                    f"💡 <b>Resultado vulnerável que se mantém:</b> aos {minute_int}', "
+                    f"{team} à frente sem distância em xG ({t_xg:.1f}–{o_xg:.1f}). "
+                    f"Modelo vê valor em segurar.{edge_tag}",
+                ]
+            else:  # edged_against / outclassed but still leading
+                pool = [
+                    f"💡 <b>À frente sem merecer:</b> {team} segura o {t_g}-{o_g} apesar "
+                    f"de {opp} produzir mais ({o_xg:.1f} vs {t_xg:.1f} xG). Modelo "
+                    f"acredita que a defesa aguenta os {remaining}' restantes.{edge_tag}",
+                    f"💡 <b>Vantagem por defender:</b> {team} ganha por {t_g}-{o_g} "
+                    f"mas em xG está atrás ({t_xg:.1f}–{o_xg:.1f}). Casas pagam "
+                    f"como se a queda fosse certa — modelo discorda.{edge_tag}",
+                ]
+            return _pick_variant(pool)
+
+        # Tied score
+        if state == "dominant":
+            pool = [
+                f"💡 <b>Empate enganador:</b> {team} já com {t_xg:.1f} xG vs "
+                f"{o_xg:.1f} de {opp} sem premiar o domínio — o golo está perto."
+                f"{edge_tag}",
+                f"💡 <b>Pressão sem prémio:</b> aos {minute_int}', {team} produz "
+                f"({t_xg:.1f} xG) bem mais que {opp} ({o_xg:.1f}) mas o marcador "
+                f"continua igual. Tendência clara para o golo.{edge_tag}",
+                f"💡 <b>Manda quem ainda não marcou:</b> {team} a empurrar com "
+                f"{t_xg:.1f} xG (vs {o_xg:.1f}) — falta finalizar mas as casas já "
+                f"deviam ter ajustado.{edge_tag}",
+            ]
+        elif state == "edging":
+            pool = [
+                f"💡 <b>Ligeira ascendência:</b> {team} aos {minute_int}' já com "
+                f"{t_xg:.1f} xG, um pouco acima de {opp} ({o_xg:.1f}) — modelo "
+                f"vê valor antes do mercado ajustar.{edge_tag}",
+                f"💡 <b>Ritmo a favor:</b> {team} a tomar conta do jogo ({t_xg:.1f}–"
+                f"{o_xg:.1f} xG) mesmo empatado no marcador. Casas ainda não ajustaram."
+                f"{edge_tag}",
+            ]
+        else:  # tied xG and tied score
+            pool = [
+                f"💡 <b>Modelo aposta no impulso:</b> aos {minute_int}' o ritmo "
+                f"favorece {team} e as casas não ajustaram o preço.{edge_tag}",
+                f"💡 <b>Valor escondido em {team}:</b> jogo equilibrado, mas as odds "
+                f"sobrevalorizam {opp} — modelo prefere o lado contrário.{edge_tag}",
+            ]
+        return _pick_variant(pool)
+
+    # ───────── Handicap (Asian / European) ─────────
+    if "handicap" in mk.lower():
+        if home and home in lb:
+            team, opp, t_xg, o_xg, t_g, o_g = home, away, home_xg, away_xg, hg, ag
+        elif away and away in lb:
+            team, opp, t_xg, o_xg, t_g, o_g = away, home, away_xg, home_xg, ag, hg
+        else:
+            team, opp = lb, ""
+            t_xg = o_xg = 0.0; t_g = o_g = 0
+
+        # Parse handicap value (e.g. "Team +1.5" or "Team -2")
+        m = _re_pick.search(r"([+-]?\d+\.?\d*)", lb)
+        hcp = float(m.group(1)) if m else 0.0
+        is_defensive = hcp > 0  # +X protects the team
+        state = _xg_state(t_xg, o_xg)
+
+        if is_defensive:
+            # Team has +X handicap — covering against losing by too much
+            margin = (o_g - t_g) - hcp  # negative = currently covered
+            if margin < 0 and state in ("dominant", "edging"):
+                pool = [
+                    f"💡 <b>Pressão para reduzir distância:</b> {team} com "
+                    f"{t_xg:.1f} xG vs {o_xg:.1f} aos {minute_int}' — está a "
+                    f"criar para fechar a diferença e cobrir {lb}.{edge_tag}",
+                    f"💡 <b>Reação no radar:</b> {team} produz ({t_xg:.1f} xG, "
+                    f"{o_xg:.1f} de {opp}) e o handicap {lb} dá margem confortável."
+                    f"{edge_tag}",
+                ]
+            elif margin < 0:
+                pool = [
+                    f"💡 <b>Cobertura intacta:</b> {team} aguenta o resultado e tem "
+                    f"folga no handicap {lb}. {t_xg:.1f}–{o_xg:.1f} xG sem sinais "
+                    f"de cedência nos {remaining}'.{edge_tag}",
+                    f"💡 <b>Distância sob controlo:</b> aos {minute_int}', "
+                    f"{team} mantém o jogo perto ({t_g}-{o_g}) e o +{hcp:g} cobre "
+                    f"sem stress.{edge_tag}",
+                ]
+            else:
+                pool = [
+                    f"💡 <b>Muralha defensiva:</b> {team} com {t_xg:.1f} xG sofrido "
+                    f"vs {o_xg:.1f} de {opp} — defesa sólida, handicap {lb} parece "
+                    f"abaixo do valor real.{edge_tag}",
+                    f"💡 <b>Resistência montada:</b> aos {minute_int}', {team} "
+                    f"limita {opp} a {o_xg:.1f} xG e protege o spread {lb}.{edge_tag}",
+                ]
+        else:
+            # Team has -X handicap — needs to win by more
+            needed = abs(hcp) - (t_g - o_g)  # positive = goals still needed
+            if needed > 0 and state in ("dominant", "edging"):
+                falta_n = int(needed) if needed == int(needed) else int(needed) + 1
+                pool = [
+                    f"💡 <b>Ritmo para alargar:</b> {team} domina ({t_xg:.1f}–"
+                    f"{o_xg:.1f} xG) e precisa de mais {_plur_pt(falta_n, 'golo','golos')} "
+                    f"em {remaining}' para fechar o handicap {lb}.{edge_tag}",
+                    f"💡 <b>Domínio para concretizar:</b> {team} com {t_xg:.1f} xG "
+                    f"vs {o_xg:.1f}, falta finalizar para cobrir {lb}. Modelo a "
+                    f"{model_p:.0f}%.{edge_tag}",
+                ]
+            elif needed > 0:
+                pool = [
+                    f"💡 <b>Diferença ainda por fazer:</b> {team} {t_g}-{o_g} em "
+                    f"{opp} mas precisa de alargar para cobrir {lb}. xG aos "
+                    f"{minute_int}': {t_xg:.1f}–{o_xg:.1f}.{edge_tag}",
+                ]
+            else:
+                # Already covering -X
+                pool = [
+                    f"💡 <b>Avanço suficiente:</b> {team} já cobre {lb} no marcador. "
+                    f"xG aos {minute_int}': {t_xg:.1f}–{o_xg:.1f} — só tem de "
+                    f"manter o controlo nos {remaining}'.{edge_tag}",
+                    f"💡 <b>Spread garantido em xG:</b> {team} produziu {t_xg:.1f} "
+                    f"vs {o_xg:.1f} de {opp} e segura o handicap {lb} confortavelmente."
+                    f"{edge_tag}",
+                ]
+        return _pick_variant(pool)
+
+    # ───────── BTTS ─────────
+    if "btts" in mk.lower() or "both teams" in mk.lower():
+        yes = "yes" in lb_low or "sim" in lb_low
+        if yes:
+            need = []
+            if hg == 0: need.append(f"{home} ({home_xg:.1f} xG ainda sem marcar)")
+            if ag == 0: need.append(f"{away} ({away_xg:.1f} xG ainda sem marcar)")
+            if not need:
+                pool = [
+                    f"💡 <b>Garantido:</b> ambas equipas já marcaram.{edge_tag}",
+                    f"💡 <b>Conta fechada:</b> {hg}-{ag} já tem ambas no marcador."
+                    f"{edge_tag}",
+                ]
+                return _pick_variant(pool)
+            pool = [
+                f"💡 <b>Falta finalizar:</b> {' e '.join(need)} — pressão sem prémio, "
+                f"modelo a {model_p:.0f}% que cai antes do 90'.{edge_tag}",
+                f"💡 <b>Pressão por marcar:</b> {' e '.join(need)}. xG acumulado "
+                f"sugere golo nos {remaining}'.{edge_tag}",
+            ]
+            return _pick_variant(pool)
+
+        pool = [
+            f"💡 <b>Defesas a controlar:</b> apenas {total_xg:.1f} xG total em "
+            f"{minute_int}' — sem ritmo para ambas marcarem nos {remaining}'.{edge_tag}",
+            f"💡 <b>Marcador travado:</b> {total_xg:.1f} xG combinado aos {minute_int}' "
+            f"não convence — modelo a {model_p:.0f}% que pelo menos uma fica em branco."
+            f"{edge_tag}",
+        ]
+        return _pick_variant(pool)
+
+    # ───────── Fallback (mercado desconhecido) ─────────
+    pool = [
+        f"💡 <b>Vale a pena:</b> modelo vê <b>{model_p:.0f}%</b> de hipótese, "
+        f"casa paga como se fossem <b>{market_p:.0f}%</b>{edge_tag}.",
+        f"💡 <b>Desalinhamento de preço:</b> probabilidade real ~{model_p:.0f}%, "
+        f"mas mercado a {market_p:.0f}%{edge_tag}.",
+    ]
+    return _pick_variant(pool)
+
+
 def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None):
     """Build the Telegram message for a new pick.
 
@@ -1673,13 +2229,13 @@ def _format_pick_alert(match: dict, pick: dict, minute, shots: dict = None):
     cta_phrase, cta_url = _next_cta(odds=odds, stake=stake, match_id=match_id,
                                      market=market, label=label)
 
-    # Layperson-friendly value explanation. Replaces the cryptic
-    # "Modelo X% | Mercado Y% Edge Z%" with one line that spells out
-    # what the numbers mean in plain Portuguese.
-    value_line = (
-        f"💡 <b>Vale a pena:</b> o modelo vê <b>{model_p:.0f}%</b> de hipótese, "
-        f"mas a casa só está a pagar como se fosse <b>{market_p:.0f}%</b> "
-        f"(+<b>{edge:.1f}%</b> de valor)."
+    # Context-aware narrative: references teams, live xG, market dynamic.
+    # Falls back to the generic "modelo X% vs casa Y%" only for unknown
+    # market types.
+    value_line = _pick_narrative(
+        market=market, label=label, home=home, away=away,
+        hg=hg, ag=ag, home_xg=home_xg, away_xg=away_xg,
+        minute=minute, model_p=model_p, market_p=market_p, edge=edge,
     )
 
     text = (
@@ -2043,6 +2599,453 @@ import threading as _threading
 _sse_clients: set[Queue] = set()
 _sse_lock = _threading.Lock()
 
+
+# ════════════════════════════════════════════════════════════
+#  X (Twitter) — formatting, posting, resolution helpers
+# ════════════════════════════════════════════════════════════
+# Lives in this module (not split) because everything it touches is
+# already here: _broadcast_pick, the DB connection helper, _country_flag,
+# the tip-result resolution polling loop.
+
+# Country code 2-letter ISO → flag emoji (lightweight subset; falls back
+# to no flag if missing). Mirrors the larger _country_flag map elsewhere
+# in the file but keyed by ISO instead of free-text country name.
+_X_FLAG_BY_COUNTRY = {
+    "England":"🏴󠁧󠁢󠁥󠁮󠁧󠁿", "Spain":"🇪🇸", "Italy":"🇮🇹", "Germany":"🇩🇪", "France":"🇫🇷",
+    "Portugal":"🇵🇹", "Netherlands":"🇳🇱", "Belgium":"🇧🇪", "Scotland":"🏴󠁧󠁢󠁳󠁣󠁴󠁿",
+    "Brazil":"🇧🇷", "Argentina":"🇦🇷", "Mexico":"🇲🇽", "USA":"🇺🇸",
+    "Norway":"🇳🇴", "Sweden":"🇸🇪", "Denmark":"🇩🇰", "Greece":"🇬🇷",
+    "Turkey":"🇹🇷", "Switzerland":"🇨🇭", "Austria":"🇦🇹",
+}
+
+
+def _x_tweet_link(match_id, tip_id=None) -> str:
+    """Build the tracking link for a tweet. Includes utm_source=twitter
+    so GA4 attributes the visit. `tip_id` is included for finer attribution
+    once we wire it on the landing page."""
+    base = f"https://webpronos.com/match/{match_id}?utm_source=twitter&ref=auto"
+    if tip_id:
+        base += f"&tip_id={tip_id}"
+    return base
+
+
+# League name → 2-3 X hashtags that real fans actually search/follow.
+# Keep them short and trending. Generic #BettingTips appended to all so
+# the bot reaches the broader sports-betting audience too.
+_X_LEAGUE_HASHTAGS = {
+    "Premier League":            ["#PremierLeague"],
+    "EPL":                       ["#PremierLeague"],
+    "La Liga":                   ["#LaLiga"],
+    "LaLiga":                    ["#LaLiga"],
+    "Serie A":                   ["#SerieA"],
+    "Bundesliga":                ["#Bundesliga"],
+    "Ligue 1":                   ["#Ligue1"],
+    "Primeira Liga":             ["#LigaPortugal"],
+    "Liga Portugal":             ["#LigaPortugal"],
+    "Liga Portugal Betclic":     ["#LigaPortugal"],
+    "Eredivisie":                ["#Eredivisie"],
+    "Jupiler Pro League":        ["#JPL"],
+    "Pro League":                ["#JPL"],
+    "UEFA Champions League":     ["#UCL"],
+    "Champions League":          ["#UCL"],
+    "UEFA Europa League":        ["#UEL"],
+    "Europa League":             ["#UEL"],
+    "UEFA Europa Conference League": ["#UECL"],
+    "Conference League":         ["#UECL"],
+    "Copa Libertadores":         ["#Libertadores"],
+    "CONMEBOL Libertadores":     ["#Libertadores"],
+    "Copa Sudamericana":         ["#Sudamericana"],
+    "CONMEBOL Sudamericana":     ["#Sudamericana"],
+    "Brasileirão":               ["#Brasileirao"],
+    "Brasileirao":               ["#Brasileirao"],
+    "Brasileirão Série A":       ["#Brasileirao"],
+    "Campeonato Brasileiro Série A": ["#Brasileirao"],
+    "MLS":                       ["#MLS"],
+    "FIFA World Cup":            ["#WorldCup"],
+    "World Cup":                 ["#WorldCup"],
+    "FIFA World Cup 2026":       ["#WorldCup2026"],
+}
+
+
+# Pool of "generic" hashtag variants. We rotate through these RANDOMLY
+# per tweet so we can A/B test which one drives the most engagement
+# (impressions, profile clicks, follows). The variant chosen is persisted
+# in `x_tweets.hashtag_variant` so we can later correlate with X's
+# engagement metrics. Cap at 2 hashtags total per tweet — more triggers
+# X's spam signal.
+_X_HASHTAG_VARIANTS = [
+    "#FootballTips",
+    "#BettingTips",
+    "#InPlayBetting",
+    "#LiveBetting",
+    "#FootballBetting",
+    "#AIfootball",
+    "#ValueBet",
+    "#SoccerTips",
+]
+
+
+def _x_pick_hashtag_variant() -> str:
+    """Pick one generic hashtag from the rotation. Uses random.choice
+    (uniform distribution) so over 100+ tweets each variant gets ~equal
+    exposure for statistical comparison."""
+    import random as _r
+    return _r.choice(_X_HASHTAG_VARIANTS)
+
+
+def _x_hashtags_for(tournament: str, variant_override: str | None = None) -> tuple[str, str]:
+    """Build a hashtag suffix for a tweet body. Returns (display_string,
+    variant_used) so the caller can persist which variant was rolled.
+
+    Format rules:
+      - Always include the league hashtag if the tournament is recognised
+        (relevance to the audience that follows that league).
+      - Append ONE random generic hashtag from `_X_HASHTAG_VARIANTS` for
+        A/B testing reach. Cap total at 2 (X penalises tweets with 3+).
+      - If the league isn't in the map, the tweet still gets the generic
+        variant so the A/B test data flows.
+
+    `variant_override` lets the test endpoint pin a specific variant for
+    deterministic previews without touching the random pool."""
+    variant = variant_override or _x_pick_hashtag_variant()
+    league_tags: list[str] = []
+    if tournament:
+        key = tournament.strip()
+        league_tags = _X_LEAGUE_HASHTAGS.get(key) or []
+        if not league_tags and "," in key:
+            league_tags = _X_LEAGUE_HASHTAGS.get(key.split(",")[0].strip()) or []
+    # Cap at 2: league tag (if any) + 1 variant. Drop duplicates.
+    tags: list[str] = []
+    if league_tags and league_tags[0].lower() != variant.lower():
+        tags.append(league_tags[0])
+    tags.append(variant)
+    return " ".join(tags), variant
+
+
+def _x_format_pick_tweet(match: dict, pick: dict, minute,
+                          variant_override: str | None = None) -> tuple[str, str]:
+    """Compose the tweet body for a new pick. Returns (body, variant_used).
+
+    COST OPTIMISATION (2026-05-21): X API charges $0.20 per post that
+    contains a URL vs $0.015 for plain text — a 13× difference. We
+    therefore embed ZERO links in the tweet body. The @WebPronosAI
+    profile bio carries the webpronos.com link, and X auto-renders the
+    handle as a clickable interest link in every tweet, so users one
+    click away from the site. The result reply (thread continuation)
+    also stays URL-free.
+
+    Format:
+        🔔 LIVE PICK
+        ⚽ {home} {hs}-{as} {away} · {min}'
+        📊 {market}: {label} @ {odds}
+        📈 Edge: +{edge}% (model {m}% vs market {mk}%)
+        {league_tag} {variant_tag}
+    """
+    home  = match.get("homeTeam", "?")
+    away  = match.get("awayTeam", "?")
+    hs    = match.get("homeGoals", match.get("home_goals", 0)) or 0
+    a_s   = match.get("awayGoals", match.get("away_goals", 0)) or 0
+    flag  = _X_FLAG_BY_COUNTRY.get(match.get("country") or "", "")
+    market = pick.get("market", "")
+    label  = pick.get("label",  "")
+    odds   = pick.get("odds")  or 0
+    edge   = pick.get("edge")  or 0
+    mp     = (pick.get("model") or 0) * 100
+    kp     = (100.0 / odds) if odds > 0 else 0
+    minute_str = f"{minute}'" if minute else "live"
+    hashtags, variant = _x_hashtags_for(match.get("tournament", ""), variant_override)
+
+    lines = [
+        "🔔 LIVE PICK",
+        f"{flag} ⚽ {home} {hs}-{a_s} {away} · {minute_str}",
+        f"📊 {market}: {label} @ {odds:.2f}",
+        f"📈 Edge: +{edge:.1f}% (model {mp:.0f}% vs market {kp:.0f}%)",
+    ]
+    if hashtags:
+        lines.append(hashtags)
+    return "\n".join(lines), variant
+
+
+def _x_format_resolution_reply(market: str, label: str, odds, result: str) -> str:
+    """Compose the reply-tweet body for a settled pick. Short on purpose —
+    the original tweet context is right above the reply in the thread."""
+    if result in ("win", "green"):
+        return f"✅ WON — {market}: {label} @ {odds:.2f}\n+{(odds-1):.2f}u 💰"
+    if result in ("loss", "red"):
+        return f"❌ LOST — {market}: {label} @ {odds:.2f}\n-1.00u"
+    # Push / void / cancelled — refunded stake
+    return f"↔️ PUSH — {market}: {label}\nStake refunded"
+
+
+def _x_recent_dup_exists(match_id, market: str, label: str) -> bool:
+    """Anti-spam: was the same (match, market, label) tweeted in the last
+    X_DEDUP_WINDOW_SEC seconds? Prevents accidental double-fire if the
+    model re-emits the same pick after a brief glitch."""
+    try:
+        cutoff = int(time.time()) - X_DEDUP_WINDOW_SEC
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM x_tweets "
+                "WHERE match_id = ? AND market = ? AND label = ? AND posted_at >= ? "
+                "LIMIT 1",
+                (match_id, market or "", label or "", cutoff),
+            ).fetchone()
+        return row is not None
+    except Exception as e:
+        log.debug(f"X dedup check failed: {e}")
+        return False
+
+
+# Counter helpers — the "still in flight" PENDING rows count too so
+# the cap is enforced atomically at slot reservation time (see the
+# atomic block in _x_tweet_new_pick). Real errors (anything other than
+# PENDING) drop the row from the count so a fail-fast retry can use the
+# slot again.
+_X_COUNTABLE_STATES = "(error IS NULL OR error = 'PENDING')"
+
+
+def _x_hourly_count() -> int:
+    """Tweets (incl. in-flight) in the last 60 minutes — feeds X_MAX_PER_HOUR."""
+    try:
+        cutoff = int(time.time()) - 3600
+        with _db() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM x_tweets "
+                f"WHERE posted_at >= ? AND {_X_COUNTABLE_STATES} AND dry_run = 0",
+                (cutoff,),
+            ).fetchone()
+        return int(row["n"] if row else 0)
+    except Exception:
+        return 0
+
+
+def _x_daily_count() -> int:
+    """Tweets (incl. in-flight) in the last 24h — feeds X_MAX_PER_DAY."""
+    try:
+        cutoff = int(time.time()) - 86400
+        with _db() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM x_tweets "
+                f"WHERE posted_at >= ? AND {_X_COUNTABLE_STATES} AND dry_run = 0",
+                (cutoff,),
+            ).fetchone()
+        return int(row["n"] if row else 0)
+    except Exception:
+        return 0
+
+
+def _x_match_count(match_id) -> int:
+    """Tweets we've posted (incl. in-flight) for this match (any market)."""
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM x_tweets "
+                f"WHERE match_id = ? AND {_X_COUNTABLE_STATES} AND dry_run = 0",
+                (match_id,),
+            ).fetchone()
+        return int(row["n"] if row else 0)
+    except Exception:
+        return 0
+
+
+def _x_match_market_count(match_id, market: str) -> int:
+    """Tweets we've posted (incl. in-flight) for this match + market combo.
+    Default cap = 1 means the same market never tweets twice per match."""
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM x_tweets "
+                f"WHERE match_id = ? AND market = ? AND {_X_COUNTABLE_STATES} AND dry_run = 0",
+                (match_id, market or ""),
+            ).fetchone()
+        return int(row["n"] if row else 0)
+    except Exception:
+        return 0
+
+
+# Process-wide lock for the cap-check + intent-record critical section.
+# Without this, multiple picks firing in the same ~100ms window all see
+# count=0 in their cap checks (no row written yet by the still-pending
+# tweet threads) and burst-tweet despite the limits. Holding the lock
+# while we both query AND INSERT the intent row makes the slot reservation
+# atomic w.r.t. other concurrent callers.
+_x_post_lock = _threading.Lock()
+
+
+def _x_tweet_new_pick(match: dict, pick: dict, minute) -> None:
+    """Post a tweet for a new pick. No-op if X is not configured,
+    threshold not met, or rate limit hit. Always non-blocking from the
+    caller's POV — the Twitter API call itself runs in a background
+    thread; the cap check + DB intent row happen synchronously under
+    a lock so the limits cannot be raced.
+
+    Failure modes are logged but never raised (X downtime must not break
+    pick generation or other fan-outs).
+    """
+    if not (_x_configured() and X_BOT_ENABLED):
+        return
+    edge = pick.get("edge") or 0
+    if edge < X_EDGE_THRESHOLD:
+        return
+    match_id = match.get("id") or match.get("match_id")
+    market   = pick.get("market", "")
+    label    = pick.get("label",  "")
+    if not match_id:
+        return
+
+    # ── ATOMIC SLOT RESERVATION ────────────────────────────────────────
+    # Cap stack runs under the lock to prevent two concurrent calls from
+    # both seeing count=0 and racing past the limits. The intent row is
+    # INSERTed inside the same critical section so the next caller's cap
+    # query immediately sees this slot as taken.
+    intent_row_id = None
+    with _x_post_lock:
+        if _x_recent_dup_exists(match_id, market, label):
+            log.debug(f"X dedup skip: {market}/{label} on {match_id}")
+            return
+        if _x_match_market_count(match_id, market) >= X_MAX_PER_MARKET_PER_MATCH:
+            log.info(f"X market cap ({X_MAX_PER_MARKET_PER_MATCH}) hit on "
+                      f"match={match_id} market={market} — skipping")
+            return
+        if _x_match_count(match_id) >= X_MAX_PER_MATCH:
+            log.info(f"X per-match cap ({X_MAX_PER_MATCH}) hit on "
+                      f"match={match_id} — skipping")
+            return
+        if _x_hourly_count() >= X_MAX_PER_HOUR:
+            log.warning(f"X hourly cap ({X_MAX_PER_HOUR}) hit — skipping pick")
+            return
+        if _x_daily_count() >= X_MAX_PER_DAY:
+            log.warning(f"X daily cap ({X_MAX_PER_DAY}) hit — skipping pick")
+            return
+
+        # Reserve the slot in the DB before releasing the lock. tweet_id
+        # stays NULL until the Twitter call returns; error='PENDING' so
+        # cap counters CAN count this row (cap queries treat dry_run + posted_at
+        # but not error filtering — see _x_*_count helpers). Resolver
+        # endpoints filter PENDING rows out separately.
+        try:
+            with _db() as conn:
+                cur = conn.execute(
+                    "INSERT INTO x_tweets "
+                    "  (tip_id, match_id, market, label, tweet_id, posted_at, error, dry_run) "
+                    "VALUES (?, ?, ?, ?, NULL, ?, 'PENDING', ?)",
+                    (
+                        pick.get("tip_id"),
+                        match_id,
+                        market,
+                        label,
+                        int(time.time()),
+                        1 if X_DRY_RUN else 0,
+                    ),
+                )
+                intent_row_id = cur.lastrowid
+        except Exception as db_err:
+            log.error(f"X intent INSERT failed (skipping post): {db_err}")
+            return
+
+    # ── ACTUAL TWITTER CALL (async, outside lock) ──────────────────────
+    def _do_post():
+        body, variant = _x_format_pick_tweet(match, pick, minute)
+        tweet_id = None
+        err = None
+        if X_DRY_RUN:
+            log.info(f"[X DRY_RUN] Would tweet (variant={variant}):\n{body}")
+        else:
+            client = _x_client()
+            if client is None:
+                err = "client_unavailable"
+            else:
+                try:
+                    resp = client.create_tweet(text=body)
+                    tweet_id = str(resp.data.get("id")) if getattr(resp, "data", None) else None
+                    log.info(f"X tweeted pick {match_id} {market}/{label} variant={variant} → id={tweet_id}")
+                except Exception as e:
+                    err = str(e)[:300]
+                    log.error(f"X tweet failed: {err}")
+
+        # Update the reserved row with the final outcome + which hashtag
+        # variant we used. err stays 'PENDING' only if both branches above
+        # failed to set it; we explicitly set to NULL on success so cap
+        # counters keep the slot as a real send (not a freed slot).
+        try:
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE x_tweets SET tweet_id = ?, error = ?, hashtag_variant = ? WHERE id = ?",
+                    (tweet_id, err, variant, intent_row_id),
+                )
+        except Exception as db_err:
+            log.error(f"X intent UPDATE failed: {db_err}")
+
+    _threading.Thread(target=_do_post, daemon=True,
+                       name=f"x-tweet-{intent_row_id}").start()
+
+
+def _x_resolve_settled_tips() -> int:
+    """Find x_tweets rows that have not been resolved yet and whose
+    underlying tip has settled in the `tips` table. Post a reply-tweet
+    to the original for each. Returns the number of resolutions posted.
+
+    Called periodically (every 5 min) by the existing background loop.
+    Idempotent — only resolves rows where resolution_tweet_id IS NULL.
+    """
+    if not (_x_configured() and X_BOT_ENABLED):
+        return 0
+    posted = 0
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT x.id, x.tweet_id, x.tip_id, x.match_id, "
+                "       t.result, t.market, t.label, t.odd_entry "
+                "FROM x_tweets x "
+                "JOIN tips t ON t.id = x.tip_id "
+                "WHERE x.resolution_tweet_id IS NULL "
+                "  AND x.tweet_id IS NOT NULL "
+                "  AND x.error IS NULL "
+                "  AND t.result IS NOT NULL "
+                "  AND x.posted_at >= ? "
+                "LIMIT 20",
+                (int(time.time()) - 86400 * 3,)  # only look back 3 days
+            ).fetchall()
+        for r in rows:
+            body = _x_format_resolution_reply(
+                r["market"] or "", r["label"] or "",
+                r["odd_entry"] or 0, r["result"]
+            )
+            resolved_id = None
+            err = None
+            if X_DRY_RUN:
+                log.info(f"[X DRY_RUN] Would reply to {r['tweet_id']}:\n{body}")
+            else:
+                client = _x_client()
+                if client is None:
+                    continue
+                try:
+                    resp = client.create_tweet(
+                        text=body,
+                        in_reply_to_tweet_id=int(r["tweet_id"]),
+                    )
+                    resolved_id = str(resp.data.get("id")) if getattr(resp, "data", None) else None
+                except Exception as e:
+                    err = str(e)[:300]
+                    log.error(f"X resolution reply failed for tweet {r['tweet_id']}: {err}")
+
+            try:
+                with _db() as conn:
+                    conn.execute(
+                        "UPDATE x_tweets "
+                        "SET resolved_at = ?, resolution_tweet_id = ? "
+                        "WHERE id = ?",
+                        (int(time.time()), resolved_id, r["id"]),
+                    )
+                if resolved_id:
+                    posted += 1
+            except Exception as db_err:
+                log.error(f"X resolution DB update failed: {db_err}")
+    except Exception as e:
+        log.warning(f"_x_resolve_settled_tips: {e}")
+    return posted
+
+
 def _broadcast_pick(match: dict, pick: dict, minute: int | None):
     """Broadcast a new pick to all SSE clients."""
     try:
@@ -2092,6 +3095,23 @@ def _broadcast_pick(match: dict, pick: dict, minute: int | None):
             _broadcast_inbet_pick(match, pick, minute)
         except Exception as sub_err:
             log.error(f"inbet fan-out failed: {sub_err}")
+
+        # Fan-out to PWA Web Push subscribers (browser/iOS standalone PWA).
+        # No-op if VAPID isn't configured. Sends are tagged per-match so
+        # back-to-back picks on the same game collapse on the lockscreen.
+        try:
+            _broadcast_push_pick(match, pick, minute)
+        except Exception as sub_err:
+            log.error(f"push fan-out failed: {sub_err}")
+
+        # Fan-out to X (@WebPronosAI) for picks above the edge threshold.
+        # _x_tweet_new_pick itself runs the actual API call in a background
+        # thread so this is non-blocking even on Twitter latency / errors.
+        # Disabled gracefully if X_API_KEY is not configured.
+        try:
+            _x_tweet_new_pick(match, pick, minute)
+        except Exception as sub_err:
+            log.error(f"X fan-out failed: {sub_err}")
     except Exception as e:
         log.error(f"_broadcast_pick error: {e}")
 
@@ -4781,6 +5801,210 @@ def _db():
     conn.row_factory = sqlite3.Row
     return conn
 
+# ════════════════════════════════════════════════════════════
+#  TIPS ARCHIVE — Supabase Postgres backup of historical picks
+# ════════════════════════════════════════════════════════════
+# Why this exists: the bom volume incident of 2026-05-20 silently wiped
+# 30 days of historical tips when the underlying Fly volume was lost.
+# Our /history, /league/<slug>, /team/<slug> pages went blank — broken
+# the "auditable public track record" pitch which is core to the brand.
+#
+# This module:
+#   1. Periodically dumps the local `tips` table (with cached game
+#      context for self-contained reads) to a Supabase Postgres table
+#      `tips_archive`. Cadence: every hour via APScheduler.
+#   2. On boot, if the local SQLite is empty (volume just reset), pulls
+#      every row from tips_archive back into the local DB. Automatic.
+#   3. Exposes admin endpoints to trigger archive / restore manually.
+#
+# Cost: $0 — fits in Supabase Free tier (500MB Postgres). At ~150 bytes
+# per archived tip and ~100 tips/day, 30 days = 450KB. Pad 10× for
+# growth = 4.5MB. Still 1% of the free tier.
+#
+# RPO: 1 hour worst case (if disaster strikes 59 min after last archive).
+# This is acceptable for historical track record — settled tips are
+# immutable once recorded so we never overwrite good data with stale.
+#
+# RTO: ~5 seconds (Supabase REST returns ~1000 rows in 1-2s; we just
+# bulk-insert into local SQLite).
+
+def _supabase_archive_url(table: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{table}"
+
+
+def _supabase_archive_headers(write: bool = False) -> dict:
+    """Headers for Supabase REST.
+
+    Use SERVICE_ROLE_KEY for writes (bypasses RLS — anon would silently
+    insert into a 0-row view). Anon key fine for reads since RLS on
+    `tips_archive` should allow public read for the /history use case.
+    """
+    key = SUPABASE_SERVICE_ROLE_KEY if write else SUPABASE_ANON
+    h = {
+        "apikey":        key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type":  "application/json",
+    }
+    if write:
+        # Upsert semantics: on PK conflict (match_id, tip_key), update
+        # the row in place. Keeps results/odd_now fresh as picks settle.
+        h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    return h
+
+
+def _archive_tips_to_supabase(limit: int = 5000) -> dict:
+    """Dump up to `limit` most-recent settled tips from local SQLite to
+    Supabase tips_archive. Upsert by (match_id, tip_key) — re-runs are
+    idempotent. Returns a small summary dict.
+
+    Cheap & safe to call on every cron tick: typical hourly delta is
+    ~10-100 rows, full re-archive happens only on first run after a
+    schema migration. ~1-2s per 1000 rows over Supabase REST.
+    """
+    if not SUPABASE_ANON or not SUPABASE_URL:
+        return {"ok": False, "reason": "supabase_not_configured"}
+    try:
+        with _db() as conn:
+            rows = conn.execute("""
+                SELECT t.tip_key, t.match_id, t.market, t.label,
+                       t.odd_entry, t.odd_now, t.edge_entry, t.minute_entry,
+                       t.wall_ts, t.result,
+                       g.home_team, g.away_team, g.home_goals, g.away_goals,
+                       g.tournament, g.country
+                FROM tips t
+                LEFT JOIN games g ON g.id = t.match_id
+                ORDER BY t.wall_ts DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+    except Exception as e:
+        return {"ok": False, "reason": "local_db_read_failed", "error": str(e)[:200]}
+
+    if not rows:
+        return {"ok": True, "archived": 0, "note": "no_tips_in_local_db"}
+
+    payload = [dict(r) for r in rows]
+    try:
+        import urllib.request as _ur
+        req = _ur.Request(
+            _supabase_archive_url("tips_archive"),
+            data=json.dumps(payload).encode("utf-8"),
+            headers=_supabase_archive_headers(write=True),
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=30) as r:
+            status = r.status
+        return {"ok": True, "archived": len(payload), "status": status}
+    except Exception as e:
+        log.error(f"_archive_tips_to_supabase failed: {e}")
+        return {"ok": False, "reason": "supabase_write_failed", "error": str(e)[:200]}
+
+
+def _restore_tips_from_supabase(force: bool = False) -> dict:
+    """Pull every row from Supabase tips_archive into local SQLite. Only
+    runs if the local `tips` table is empty (or force=True).
+
+    Triggered automatically by `_init_db()` after schema creation if the
+    local volume just came up empty. Bulk INSERT OR IGNORE so any tips
+    that ARE in local (e.g. just created by the bg loop while restore
+    runs) win — the archive is the floor, local is the ceiling.
+    """
+    if not SUPABASE_ANON or not SUPABASE_URL:
+        return {"ok": False, "reason": "supabase_not_configured"}
+
+    # Cheap check: don't pull if local already has data
+    try:
+        with _db() as conn:
+            local_count = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+    except Exception:
+        local_count = 0
+    if local_count > 0 and not force:
+        return {"ok": True, "skipped": True, "local_count": local_count}
+
+    try:
+        import urllib.request as _ur
+        # Supabase caps page size at 1000 — paginate via Range header
+        all_rows: list = []
+        page = 0
+        while True:
+            req = _ur.Request(
+                _supabase_archive_url("tips_archive") + "?select=*&order=wall_ts.desc",
+                headers={
+                    **_supabase_archive_headers(write=False),
+                    "Range-Unit": "items",
+                    "Range":      f"{page*1000}-{(page+1)*1000-1}",
+                },
+            )
+            with _ur.urlopen(req, timeout=30) as r:
+                batch = json.loads(r.read())
+            if not batch:
+                break
+            all_rows.extend(batch)
+            if len(batch) < 1000:
+                break
+            page += 1
+            if page > 100:  # safety: cap at 100k rows
+                break
+    except Exception as e:
+        log.error(f"_restore_tips_from_supabase fetch failed: {e}")
+        return {"ok": False, "reason": "supabase_read_failed", "error": str(e)[:200]}
+
+    if not all_rows:
+        return {"ok": True, "restored": 0, "note": "archive_empty"}
+
+    # Hydrate local games (so JOINs in renderers still work) + tips.
+    inserted_tips = 0
+    inserted_games = 0
+    try:
+        with _db() as conn:
+            # Reconstruct minimal `games` rows from cached fields. Use
+            # INSERT OR IGNORE so we never overwrite richer rows the
+            # live scraper added since restore started.
+            seen_games = set()
+            for r in all_rows:
+                mid = r.get("match_id")
+                if mid and mid not in seen_games:
+                    seen_games.add(mid)
+                    try:
+                        cur = conn.execute(
+                            "INSERT OR IGNORE INTO games "
+                            "(id, home_team, away_team, home_goals, away_goals, "
+                            " tournament, country, is_finished) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
+                            (mid, r.get("home_team") or "?", r.get("away_team") or "?",
+                             r.get("home_goals") or 0, r.get("away_goals") or 0,
+                             r.get("tournament"), r.get("country"),
+                             1 if r.get("result") is not None else 0),
+                        )
+                        if cur.rowcount > 0:
+                            inserted_games += 1
+                    except Exception:
+                        pass
+                try:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO tips "
+                        "(tip_key, match_id, market, label, odd_entry, odd_now, "
+                        " edge_entry, minute_entry, wall_ts, result) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (r.get("tip_key"), r.get("match_id"),
+                         r.get("market"), r.get("label"),
+                         r.get("odd_entry"), r.get("odd_now"),
+                         r.get("edge_entry"), r.get("minute_entry"),
+                         r.get("wall_ts"), r.get("result")),
+                    )
+                    if cur.rowcount > 0:
+                        inserted_tips += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        log.error(f"_restore_tips_from_supabase write failed: {e}")
+        return {"ok": False, "reason": "local_write_failed", "error": str(e)[:200]}
+
+    log.info(f"_restore_tips_from_supabase: tips={inserted_tips} games={inserted_games}")
+    return {"ok": True, "restored": inserted_tips,
+            "games_restored": inserted_games,
+            "fetched": len(all_rows)}
+
+
 def _init_db():
     with _db() as conn:
         conn.executescript("""
@@ -4871,6 +6095,40 @@ def _init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_inbet_audit_member ON inbet_status_audit(member_uuid);
         CREATE INDEX IF NOT EXISTS idx_inbet_audit_ts ON inbet_status_audit(changed_at);
+        -- X (Twitter) auto-publishing audit trail. Every tweet our bot
+        -- fires is logged here so we can:
+        --   1. Reply to the original tweet when the pick settles (resolution
+        --      tweet) — needs the original tweet_id.
+        --   2. Dedup picks across short windows (avoid double-tweeting if a
+        --      pick fires twice within 60s).
+        --   3. Rate-limit at the source (count rows in last hour for the
+        --      max-8/hour guard).
+        --   4. Audit any tweet from the admin UI.
+        --
+        -- `tip_id` is our internal id from the `tips` table (NULL during
+        -- the very brief window before the tip row is committed — most
+        -- inserts have it). `tweet_id` is the X-side numeric tweet id.
+        -- `resolved_at` / `resolution_tweet_id` are filled by the resolver
+        -- cron when the underlying pick settles.
+        CREATE TABLE IF NOT EXISTS x_tweets (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            tip_id                INTEGER,
+            match_id              INTEGER,
+            market                TEXT,
+            label                 TEXT,
+            tweet_id              TEXT,
+            posted_at             INTEGER NOT NULL,
+            resolved_at           INTEGER,
+            resolution_tweet_id   TEXT,
+            error                 TEXT,
+            dry_run               INTEGER DEFAULT 0,
+            hashtag_variant       TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_x_tweets_tip       ON x_tweets(tip_id);
+        CREATE INDEX IF NOT EXISTS idx_x_tweets_match     ON x_tweets(match_id);
+        CREATE INDEX IF NOT EXISTS idx_x_tweets_posted    ON x_tweets(posted_at);
+        CREATE INDEX IF NOT EXISTS idx_x_tweets_unresolved
+            ON x_tweets(resolved_at) WHERE resolved_at IS NULL;
         CREATE TABLE IF NOT EXISTS match_shots (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             match_id    INTEGER NOT NULL,
@@ -4934,6 +6192,41 @@ def _init_db():
             source      TEXT  -- 'telegram-betradar', 'web-match-page', etc.
         );
         CREATE INDEX IF NOT EXISTS idx_short_links_created ON short_links(created_at);
+        -- Web Push (PWA) subscribers. One row per (endpoint), endpoint is the
+        -- unique browser/FCM/APNs push URL. p256dh+auth = the public encryption
+        -- keys the browser hands us, used to encrypt the push payload. We mark
+        -- rows inactive (active=0) on 410 Gone / 404 from the push service
+        -- instead of deleting — keeps stats honest and allows re-subscribe.
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            endpoint      TEXT UNIQUE NOT NULL,
+            p256dh        TEXT NOT NULL,
+            auth          TEXT NOT NULL,
+            locale        TEXT DEFAULT 'en',
+            user_agent    TEXT,
+            created_at    INTEGER NOT NULL,
+            last_seen_at  INTEGER,
+            last_sent_at  INTEGER,
+            send_count    INTEGER DEFAULT 0,
+            fail_count    INTEGER DEFAULT 0,
+            active        INTEGER DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_push_subs_active ON push_subscriptions(active);
+        -- Auto-failover audit trail. One row per attempt (success or fail).
+        -- Used by /api/admin/failover/status and for post-mortems.
+        CREATE TABLE IF NOT EXISTS failover_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at      INTEGER NOT NULL,
+            finished_at     INTEGER,
+            from_region     TEXT,
+            to_region       TEXT,
+            reason          TEXT,
+            status          TEXT,    -- 'success' | 'failed'
+            new_machine_id  TEXT,
+            new_volume_id   TEXT,
+            error_message   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_failover_audit_ts ON failover_audit(started_at);
         """)
     # Migration: add edge_entry column to existing DBs
     with _db() as conn:
@@ -4982,6 +6275,19 @@ def _init_db():
                 CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id);
             """)
             log.info("DB migration: tips table rebuilt with composite PK")
+
+    # Migration: add hashtag_variant column to x_tweets if missing.
+    # SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we
+    # check via pragma + add only if absent. Safe to call on every boot.
+    try:
+        with _db() as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(x_tweets)").fetchall()]
+            if "hashtag_variant" not in cols:
+                conn.execute("ALTER TABLE x_tweets ADD COLUMN hashtag_variant TEXT")
+                log.info("DB migration: added x_tweets.hashtag_variant")
+    except Exception as mig_err:
+        log.warning(f"x_tweets.hashtag_variant migration skipped: {mig_err}")
+
     log.info(f"DB ready: {DB_PATH}")
 
 
@@ -7373,7 +8679,8 @@ def _team_performance(name: str, recent_n: int = 5) -> dict:
     return out
 
 
-def _league_performance(variants: list[str], recent_days: int = 30) -> dict:
+def _league_performance(variants: list[str], recent_days: int = 30,
+                         locale: str = "en") -> dict:
     """
     Aggregate league-wide stats from our local DB. Mirrors the shape of
     `_team_performance` but at competition level. Drives the SEO copy on
@@ -7480,16 +8787,37 @@ def _league_performance(variants: list[str], recent_days: int = 30) -> dict:
                 for t, n, g in ranked[:3]
             ]
 
-            # 5. Recent activity in last N days
+            # 5. Recent activity in last N days — locale-aware phrasing.
             now_ts = int(time.time())
             cutoff = now_ts - recent_days * 86400
             recent = [g for g in games if (g["start_ts"] or 0) >= cutoff]
             if recent:
                 rg = sum((g["home_goals"] or 0) + (g["away_goals"] or 0) for g in recent) / len(recent)
-                out["recent_form_text"] = (
-                    f"{len(recent)} matches in the last {recent_days} days "
-                    f"averaging {rg:.2f} goals per game"
-                )
+                n = len(recent)
+                # PT-BR uses comma as decimal separator; EN/ES use dot.
+                if locale == "pt-br":
+                    rg_str = f"{rg:.2f}".replace(".", ",")
+                    out["recent_form_text"] = (
+                        f"{n} jogos nos últimos {recent_days} dias "
+                        f"com média de {rg_str} gols por partida"
+                    )
+                elif locale == "pt-pt":
+                    rg_str = f"{rg:.2f}".replace(".", ",")
+                    out["recent_form_text"] = (
+                        f"{n} jogos nos últimos {recent_days} dias "
+                        f"com uma média de {rg_str} golos por jogo"
+                    )
+                elif locale == "es":
+                    rg_str = f"{rg:.2f}".replace(".", ",")
+                    out["recent_form_text"] = (
+                        f"{n} partidos en los últimos {recent_days} días "
+                        f"con un promedio de {rg_str} goles por partido"
+                    )
+                else:
+                    out["recent_form_text"] = (
+                        f"{n} matches in the last {recent_days} days "
+                        f"averaging {rg:.2f} goals per game"
+                    )
     except Exception as e:
         log.warning(f"_league_performance failed: {e}")
     return out
@@ -8594,6 +9922,232 @@ _MOCK_STATE_ALIASES = {
 }
 
 
+# In-memory cache for the full WC2026 fixture list. Sofascore's
+# tournament endpoint paginates 30 events per request — we'd otherwise
+# fan out 3-4 HTTP calls per partner hit. With this cache, partners can
+# poll as often as they like and Sofascore sees ~4-8 calls/day from us.
+#
+# TTL = 6h. Tight enough that knockout bracket updates (e.g. group
+# stage results filling in the W99/L101 placeholders with real team
+# names) become visible to partners within a few hours of happening.
+# Loose enough that we're not hammering Sofascore.
+#
+# Partners that need a fresh pull NOW (e.g. immediately after a key
+# group match settles) can hit the endpoint with `?refresh=1` to
+# bypass the cache for that single request.
+_WC2026_FIXTURES_CACHE = {"data": None, "ts": 0.0}
+_WC2026_FIXTURES_TTL   = 6 * 3600   # 6h
+
+
+def _fetch_wc2026_all_fixtures(force: bool = False) -> list:
+    """Hit Sofascore's tournament endpoint for FIFA World Cup 2026
+    (unique-tournament=16, season=58210) and paginate through `next/N`
+    and `last/N` pages until empty. Returns the raw list of events
+    (Sofascore-shaped dicts). Cached 6h in memory. `force=True` skips
+    the cache and re-fetches immediately."""
+    now = time.time()
+    if (not force
+            and _WC2026_FIXTURES_CACHE["data"] is not None
+            and (now - _WC2026_FIXTURES_CACHE["ts"]) < _WC2026_FIXTURES_TTL):
+        return _WC2026_FIXTURES_CACHE["data"]
+
+    all_events: list = []
+    # `last` pages = matches already played (becomes relevant during tournament).
+    # `next` pages = upcoming fixtures (relevant pre-tournament).
+    for direction in ("next", "last"):
+        for page in range(10):   # safety: max 300 events per direction
+            try:
+                data = _get(f"{SOFASCORE_API}/unique-tournament/16/season/58210/events/{direction}/{page}")
+            except Exception as e:
+                log.warning(f"_fetch_wc2026_all_fixtures {direction}/{page}: {e}")
+                break
+            evs = (data or {}).get("events") or []
+            if not evs:
+                break
+            all_events.extend(evs)
+            if len(evs) < 30:
+                break   # last page, no need to keep paginating
+
+    # Dedup by event ID (in case last + next overlap on edge matches)
+    seen = set()
+    deduped: list = []
+    for e in all_events:
+        eid = e.get("id")
+        if eid and eid not in seen:
+            seen.add(eid)
+            deduped.append(e)
+
+    _WC2026_FIXTURES_CACHE["data"] = deduped
+    _WC2026_FIXTURES_CACHE["ts"]   = now
+    log.info(f"_fetch_wc2026_all_fixtures: cached {len(deduped)} WC events")
+    return deduped
+
+
+def _shape_wc_fixture(e: dict, now_ts: int) -> dict:
+    """Convert a Sofascore-shaped event to the partner-friendly dict
+    returned by /api/wc2026/fixtures. Same shape regardless of source
+    (Sofascore-API direct vs local DB) so partners see one schema."""
+    from datetime import datetime, timezone
+    import re as _re_grp
+    ts = e.get("startTimestamp") or 0
+    iso = (datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+           if ts else None)
+    # Tournament name from Sofascore arrives as "FIFA World Cup, Group A",
+    # "FIFA World Cup, Round of 32", etc. Parse stage + group from it.
+    tourn = (e.get("tournament") or {}).get("name") or ""
+    tourn_l = tourn.lower()
+    stage = "Group Stage"
+    group = None
+    if   "round of 32" in tourn_l: stage = "Round of 32"
+    elif "round of 16" in tourn_l: stage = "Round of 16"
+    elif "quarter"     in tourn_l: stage = "Quarterfinals"
+    elif "semi"        in tourn_l: stage = "Semifinals"
+    elif "3rd" in tourn_l or "third" in tourn_l: stage = "3rd Place"
+    elif "final"       in tourn_l: stage = "Final"
+    elif "group"       in tourn_l:
+        m = _re_grp.search(r"group\s+([a-l])", tourn_l)
+        if m:
+            group = m.group(1).upper()
+    status_type = (e.get("status") or {}).get("type", "")
+    if   status_type == "finished":   status = "finished"
+    elif status_type == "inprogress": status = "live"
+    else:                             status = "scheduled"
+    return {
+        "event_id":   str(e.get("id")),
+        "home_team":  (e.get("homeTeam") or {}).get("name"),
+        "away_team":  (e.get("awayTeam") or {}).get("name"),
+        "kickoff_ts": ts or None,
+        "kickoff_iso": iso,
+        "stage":      stage,
+        "group":      group,
+        "home_goals": (e.get("homeScore") or {}).get("current", 0),
+        "away_goals": (e.get("awayScore") or {}).get("current", 0),
+        "status":     status,
+    }
+
+
+@app.route("/api/fixtures/today")
+def r_fixtures_today():
+    """Test endpoint for integration partners: returns every monitored
+    fixture happening today (or whichever date is passed via ?date=YYYY-MM-DD).
+    Same shape as /api/wc2026/fixtures so partners can wire one mapping
+    function for both. Use this before the World Cup starts to verify
+    your Sofascore event_id → internal-match mapping works correctly.
+
+    Pulls from the in-memory _upcoming_cache that the bg loop refreshes
+    every cycle. CORS open, no auth.
+    """
+    from datetime import datetime, timezone
+    requested_date = (flask_request.args.get("date") or "").strip()
+    if not requested_date:
+        requested_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    cached = _upcoming_cache.get(requested_date)
+    raw = cached["matches"] if cached else []
+    out = []
+    now_ts = int(time.time())
+    for m in raw:
+        ts = m.get("startTimestamp") or 0
+        iso = (datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+               if ts else None)
+        # Status — m may not have a 'status' shape since it's from the
+        # upcoming cache; infer from timestamp + isFinished if present.
+        if m.get("isFinished"):
+            status = "finished"
+        elif m.get("isLive") or (ts and 0 < (now_ts - ts) < 3 * 3600):
+            status = "live"
+        else:
+            status = "scheduled"
+        out.append({
+            "event_id":   str(m.get("id")),
+            "home_team":  m.get("homeTeam"),
+            "away_team":  m.get("awayTeam"),
+            "kickoff_ts": ts or None,
+            "kickoff_iso": iso,
+            "tournament": m.get("tournament"),
+            "country":    m.get("country"),
+            "home_goals": m.get("homeGoals", 0),
+            "away_goals": m.get("awayGoals", 0),
+            "status":     status,
+        })
+    return jsonify({
+        "date":     requested_date,
+        "count":    len(out),
+        "fixtures": out,
+    }), 200, {
+        "Cache-Control":              "public, max-age=60, s-maxage=60",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+
+@app.route("/api/wc2026/fixtures")
+def r_wc2026_fixtures():
+    """Public fixture list for the entire FIFA World Cup 2026 tournament.
+
+    Designed for integration partners (inbet etc.) who run their own
+    match registry but need to know our Sofascore `event_id` to embed
+    the Match Detail widget (`?match_id=<event_id>`). Partners hit this
+    endpoint once (daily refresh is plenty — fixtures rarely change) and
+    build a local mapping table keyed by (home_team, away_team,
+    kickoff_date) → event_id.
+
+    Returns a JSON object with `fixtures` array. Each fixture has:
+
+      event_id      — Sofascore numeric ID (string).  PASS THIS to the iframe.
+      home_team     — canonical English name from Sofascore.
+      away_team     — canonical English name from Sofascore.
+      kickoff_ts    — UTC epoch seconds (int).
+      kickoff_iso   — ISO-8601 UTC string ("2026-06-11T17:00:00Z").
+      stage         — "Group Stage" / "Round of 32" / "Round of 16" /
+                       "Quarterfinals" / "Semifinals" / "Final" / "3rd Place".
+      group         — Group letter ("A".."L") for group stage, null otherwise.
+      home_goals    — int, 0 until match starts. Final score once finished.
+      away_goals    — int, idem.
+      status        — "scheduled" | "live" | "finished".
+
+    Mapping example (partner pseudocode):
+
+        partner_match = {"home": "Brazil", "away": "Argentina",
+                         "kickoff": "2026-06-25"}
+        fixtures = GET https://embed.webpronos.com/api/wc2026/fixtures
+        match = next(
+            f for f in fixtures["fixtures"]
+            if normalise(f["home_team"]) == normalise(partner_match["home"])
+            and normalise(f["away_team"]) == normalise(partner_match["away"])
+            and f["kickoff_iso"][:10] == partner_match["kickoff"]
+        )
+        iframe_src = f"https://embed.webpronos.com/widget/wc2026/current?match_id={match['event_id']}&lang=pt-pt"
+
+    Cache: 1h browser, 5min CDN — fixtures are stable, refresh cadence
+    is fine for daily partner sync jobs.
+    """
+    out = []
+    now_ts = int(time.time())
+    force_refresh = (flask_request.args.get("refresh") or "").strip() in ("1", "true", "yes")
+    try:
+        # Primary source: Sofascore tournament endpoint (returns all 64+
+        # fixtures published, including those >3 days away that our
+        # normal scraper doesn't fetch). Cached 6h in memory; `?refresh=1`
+        # bypasses for a fresh pull (knockout bracket changes etc.).
+        events = _fetch_wc2026_all_fixtures(force=force_refresh)
+        for e in events:
+            out.append(_shape_wc_fixture(e, now_ts))
+        out.sort(key=lambda x: x.get("kickoff_ts") or 0)
+    except Exception as e:
+        log.exception(f"r_wc2026_fixtures: {e}")
+        return jsonify({"error": "internal", "detail": str(e)[:200]}), 500
+
+    return jsonify({
+        "tournament": "FIFA World Cup 2026",
+        "window":     {"start": "2026-06-11", "end": "2026-07-19"},
+        "count":      len(out),
+        "fixtures":   out,
+    }), 200, {
+        "Cache-Control":              "public, max-age=300, s-maxage=300",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+
 @app.route("/api/wc2026/current.json")
 def r_wc2026_current_json():
     """JSON the per-match widget polls every 30 s (live) / 60-300 s otherwise.
@@ -9578,23 +11132,124 @@ def r_state():
     Returns the full pre-computed live state for all monitored games.
     This is what the dashboard polls — zero Odds API requests from the browser.
 
+    i18n: pass `?lang=en|pt-br|pt-pt|es` and every `livePicks[]` / `tips[]`
+    entry gains `market_localized` + `label_localized` siblings to the
+    canonical EN `market` / `label` fields. The SPA renders the localised
+    versions directly. Default = en (back-compat).
+
     Short Cache-Control header (5s) so back-to-back navigations don't
-    re-hit Flask for the same payload. The state itself refreshes from
-    the BG cycle every 30-120s; 5s of browser cache is invisible to
-    users but eliminates redundant fetches during SPA route transitions.
+    re-hit Flask for the same payload. Cache key varies by lang via Vary
+    header so each locale has its own edge cache slot.
     """
+    lang_q = (flask_request.args.get("lang") or "en").strip().lower()
+    locale = lang_q if lang_q in ("en", "pt-br", "pt-pt", "es") else "en"
+
     with _state_lock:
         state_copy = dict(_live_state)
+
+    # Augment each game's livePicks + tips with localised labels (when
+    # the request asks for a non-EN locale). Cheap (string ops on small
+    # lists — typically <5 picks per game).
+    games_out = []
+    for g in state_copy.values():
+        if locale != "en":
+            gd = dict(g)
+            for key in ("livePicks", "tips"):
+                rows = gd.get(key) or []
+                gd[key] = [
+                    {**r,
+                     "market_localized": _xlate_market(r.get("market") or "", locale),
+                     "label_localized":  _xlate_pick_label(r.get("label") or "", locale)}
+                    for r in rows
+                ]
+            games_out.append(gd)
+        else:
+            games_out.append(g)
+
     resp = jsonify({
-        "games":    list(state_copy.values()),
-        "count":    len(state_copy),
+        "games":    games_out,
+        "count":    len(games_out),
         "cycleTsIso": datetime.fromtimestamp(_last_cycle_ts, tz=timezone.utc).isoformat() if _last_cycle_ts else None,
         "cycleReq": _last_cycle_req,
         "quotaRemaining": _api_requests_remaining,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
     resp.headers["Cache-Control"] = "public, max-age=5, s-maxage=5"
+    resp.headers["Vary"] = "Accept-Language"
     return resp
+
+
+def _current_edge_for_tip(market: str, label: str, odds: dict, match: dict):
+    """Live edge% for a historical tip given the current full odds analysis.
+
+    Returns None when the tip's market/outcome can't be matched (e.g. the
+    line has moved since the pick was issued, or the bookmaker no longer
+    quotes that outcome). Otherwise returns a float in percent units
+    (same scale as `edge_entry`, e.g. +13.6 or -4.2).
+    """
+    if not odds or not odds.get("available"):
+        return None
+    benter = odds.get("benter") or {}
+    home = match.get("homeTeam") or ""
+    away = match.get("awayTeam") or ""
+    market = (market or "").strip()
+    label = (label or "").strip()
+    lb_low = label.lower()
+    import re as _re_edge
+
+    # 1X2
+    if market == "1X2":
+        outs = (benter.get("h2h") or {}).get("outcomes") or {}
+        if lb_low in ("draw", "empate"):
+            side = "draw"
+        elif label == home or lb_low == "home":
+            side = "home"
+        elif label == away or lb_low == "away":
+            side = "away"
+        else:
+            return None
+        o = outs.get(side) or {}
+        return o.get("edge") if o.get("bookieOdds") else None
+
+    # Totals — market is like "O/U 2.5"; line must still match.
+    if market.startswith("O/U") or market in ("Totals", "Over/Under"):
+        bt = benter.get("totals") or {}
+        outs = bt.get("outcomes") or {}
+        m_lbl = _re_edge.search(r"(\d+\.?\d*)", label)
+        m_mkt = _re_edge.search(r"(\d+\.?\d*)", market)
+        tip_line = float(m_lbl.group(1)) if m_lbl else (float(m_mkt.group(1)) if m_mkt else None)
+        cur_line = bt.get("line")
+        if tip_line is not None and cur_line is not None and abs(tip_line - cur_line) > 0.05:
+            return None
+        if lb_low.startswith("over"):
+            side = "over"
+        elif lb_low.startswith("under"):
+            side = "under"
+        else:
+            return None
+        o = outs.get(side) or {}
+        return o.get("edge") if o.get("bookieOdds") else None
+
+    # Handicap — label is "{team} {±N}"; both team AND line must still match.
+    if market.lower() == "handicap":
+        bs = benter.get("spreads") or {}
+        outs = bs.get("outcomes") or {}
+        m_pt = _re_edge.search(r"([+-]?\d+\.?\d*)\s*$", label)
+        tip_point = float(m_pt.group(1)) if m_pt else None
+        if home and label.startswith(home):
+            cur_point = bs.get("homePoint")
+            side = "home"
+        elif away and label.startswith(away):
+            cur_point = bs.get("awayPoint")
+            side = "away"
+        else:
+            return None
+        if tip_point is not None and cur_point is not None and abs(tip_point - cur_point) > 0.05:
+            return None
+        o = outs.get(side) or {}
+        return o.get("edge") if o.get("bookieOdds") else None
+
+    return None
 
 
 @app.route("/api/match/<int:mid>/timeline")
@@ -9606,8 +11261,18 @@ def r_match_timeline(mid: int):
         "match": { id, home_team, away_team, home_goals, away_goals, tournament, start_ts },
         "shots": [ { minute, added_time, is_home, xg, is_goal, is_penalty, player, shot_type } ],
         "tips":  [ { minute_entry, market, label, odd_entry, result,
-                     xg_home_at_entry, xg_away_at_entry, wall_ts } ]
+                     xg_home_at_entry, xg_away_at_entry, wall_ts, edge_entry,
+                     current_edge, current_status } ]
       }
+    `current_edge` and `current_status` are only computed while the match
+    is live. Possible `current_status` values:
+      - "valid"            → live and edge ≥ threshold (default 10%)
+      - "no_value"         → live but edge has dropped below threshold
+      - "resolved_green"   → tip already won
+      - "resolved_red"     → tip already lost
+      - "resolved_void"    → tip pushed
+      - "pending"          → match not live (pre/finished) and unresolved
+      - "unknown"          → match live but line moved / odds unavailable
     """
     try:
         with _db() as conn:
@@ -9633,10 +11298,47 @@ def r_match_timeline(mid: int):
                 ORDER BY wall_ts
             """, (mid,)).fetchall()
 
+        # Compute per-tip current edge + status. Only meaningful while
+        # the match is live — finished matches are status='pending' or
+        # 'resolved_*' based on the stored result.
+        match_obj = {}
+        live_odds = None
+        try:
+            with _state_lock:
+                entry = _live_state.get(mid)
+            if entry:
+                match_obj = entry.get("match", {}) or {}
+                live_odds = entry.get("odds")
+        except Exception:
+            pass
+        is_live = bool(match_obj.get("isLive")) and not bool(match_obj.get("isFinished"))
+        edge_threshold = float(get_setting("min_edge_pct", 10.0))
+
+        tips_out = []
+        for t in tips:
+            td = dict(t)
+            result = td.get("result")
+            if result in ("green", "red", "void"):
+                td["current_status"] = f"resolved_{result}"
+                td["current_edge"] = None
+            elif not is_live:
+                td["current_status"] = "pending"
+                td["current_edge"] = None
+            else:
+                ce = _current_edge_for_tip(td["market"], td["label"], live_odds or {}, match_obj)
+                if ce is None:
+                    td["current_status"] = "unknown"
+                    td["current_edge"] = None
+                else:
+                    td["current_edge"] = round(float(ce), 1)
+                    td["current_status"] = "valid" if ce >= edge_threshold else "no_value"
+            tips_out.append(td)
+
         return jsonify({
             "match": dict(game),
             "shots": [dict(s) for s in shots],
-            "tips":  [dict(t) for t in tips],
+            "tips":  tips_out,
+            "edge_threshold": edge_threshold,
         })
     except Exception as e:
         log.exception(f"r_match_timeline failed for {mid}")
@@ -9846,10 +11548,20 @@ def r_match_timeline_export(mid: int):
 
 @app.route("/api/state/tips")
 def r_state_tips():
-    """Returns tip history (all games with tips) from the DB, optionally filtered by date range."""
+    """Returns tip history (all games with tips) from the DB, optionally filtered by date range.
+
+    i18n: pass `?lang=en|pt-br|pt-pt|es` and each tip in the response
+    gains `market_localized` + `label_localized` siblings to the
+    canonical `market` / `label` fields. The SPA can then use the
+    localized versions directly without maintaining its own translation
+    map. Defaults to EN if omitted (back-compat — old clients keep working).
+    """
     from_ts = flask_request.args.get("from_ts", type=int)   # unix seconds
     to_ts   = flask_request.args.get("to_ts",   type=int)
     limit   = flask_request.args.get("limit", 500, type=int)
+    lang_q  = (flask_request.args.get("lang") or "en").strip().lower()
+    # Normalize to one of the 4 supported locale codes we localize for.
+    locale  = lang_q if lang_q in ("en", "pt-br", "pt-pt", "es") else "en"
 
     date_where = ""
     params = []
@@ -9878,7 +11590,17 @@ def r_state_tips():
                 "SELECT * FROM tips WHERE match_id = ? AND (minute_entry IS NULL OR minute_entry <= ?) ORDER BY wall_ts",
                 (g["id"], get_setting("max_minute_for_tips", 85))
             ).fetchall()
-            gd["tips"] = [dict(t) for t in tips_rows]
+            # Augment each tip with localised variants so the SPA can render
+            # directly. Canonical `market`/`label` stay in EN for analytics
+            # / cross-locale consistency; `market_localized`/`label_localized`
+            # are the strings to display.
+            tips_list = []
+            for t in tips_rows:
+                td = dict(t)
+                td["market_localized"] = _xlate_market(td.get("market") or "", locale)
+                td["label_localized"]  = _xlate_pick_label(td.get("label") or "", locale)
+                tips_list.append(td)
+            gd["tips"] = tips_list
             # Inject logos directly so the frontend makes zero extra requests.
             # Pass country to disambiguate homonyms (Athletic Club, etc).
             _country = g["country"] if "country" in g.keys() else None
@@ -10508,6 +12230,320 @@ def r_refresh_logos():
         "team":          name or None,
         "team_url":      team_url,
     })
+
+
+# ════════════════════════════════════════════════════════════
+#  X bot admin endpoints
+# ════════════════════════════════════════════════════════════
+# Useful during the launch phase to (a) verify credentials work,
+# (b) preview tweet body for a real candidate pick without posting,
+# (c) inspect recent posts and rate-limit state, and (d) force the
+# resolver to run NOW instead of waiting for the next 5-min tick.
+
+@app.route("/api/admin/x/status", methods=["GET"])
+def r_admin_x_status():
+    """Health check for the X bot: are secrets present, can we init the
+    client, what's the recent posting volume, any failed tweets."""
+    try:
+        client = _x_client()
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT "
+                "  COUNT(*) AS total, "
+                "  SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS errored, "
+                "  SUM(CASE WHEN resolution_tweet_id IS NOT NULL THEN 1 ELSE 0 END) AS resolved, "
+                "  SUM(CASE WHEN posted_at >= ? THEN 1 ELSE 0 END) AS last_hour "
+                "FROM x_tweets",
+                (int(time.time()) - 3600,)
+            ).fetchone()
+            last5 = conn.execute(
+                "SELECT id, match_id, market, label, tweet_id, posted_at, "
+                "       resolution_tweet_id, error "
+                "FROM x_tweets ORDER BY posted_at DESC LIMIT 5"
+            ).fetchall()
+        return jsonify({
+            "configured":     _x_configured(),
+            "enabled":        X_BOT_ENABLED,
+            "dry_run":        X_DRY_RUN,
+            "client_ok":      client is not None,
+            "edge_threshold": X_EDGE_THRESHOLD,
+            "caps": {
+                "per_hour":              X_MAX_PER_HOUR,
+                "per_day":               X_MAX_PER_DAY,
+                "per_match":             X_MAX_PER_MATCH,
+                "per_market_per_match":  X_MAX_PER_MARKET_PER_MATCH,
+                "dedup_window_sec":      X_DEDUP_WINDOW_SEC,
+            },
+            "usage": {
+                "hourly":  _x_hourly_count(),
+                "daily":   _x_daily_count(),
+            },
+            "stats": {
+                "total":     row["total"] if row else 0,
+                "errored":   row["errored"] if row else 0,
+                "resolved":  row["resolved"] if row else 0,
+                "last_hour": row["last_hour"] if row else 0,
+            },
+            "last_5": [dict(r) for r in last5],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/admin/x/preview", methods=["GET"])
+def r_admin_x_preview():
+    """Preview the tweet body for each hashtag variant on a hypothetical
+    pick. No tweet is sent — pure rendering. Query params:
+      home, away, tournament, country, market, label, odds, edge, minute
+    All optional with sensible defaults so plain GET works."""
+    qa = flask_request.args.get
+    fake_match = {
+        "homeTeam":   qa("home", "Real Madrid"),
+        "awayTeam":   qa("away", "Barcelona"),
+        "homeGoals":  int(qa("hg", "1")),
+        "awayGoals":  int(qa("ag", "0")),
+        "tournament": qa("tournament", "La Liga"),
+        "country":    qa("country", "Spain"),
+        "id":         12345678,
+    }
+    fake_pick = {
+        "market": qa("market", "1X2"),
+        "label":  qa("label",  "Barcelona"),
+        "odds":   float(qa("odds", "3.40")),
+        "edge":   float(qa("edge", "52.5")),
+        "model":  float(qa("model", "0.38")),
+    }
+    minute = int(qa("minute", "37"))
+    out = []
+    for variant in _X_HASHTAG_VARIANTS:
+        body, used = _x_format_pick_tweet(fake_match, fake_pick, minute,
+                                           variant_override=variant)
+        out.append({
+            "variant":        used,
+            "body":           body,
+            "char_count":     len(body),
+            "remaining_280":  280 - len(body),
+        })
+    return jsonify({
+        "variants": out,
+        "pool_size": len(_X_HASHTAG_VARIANTS),
+        "note": "Each new tweet picks one variant uniformly at random and "
+                "the choice is persisted in x_tweets.hashtag_variant for "
+                "later attribution analysis.",
+    })
+
+
+@app.route("/api/admin/x/test-tweet", methods=["POST"])
+def r_admin_x_test_tweet():
+    """Post a hardcoded smoke-test tweet to verify credentials end-to-end.
+    POST body: {"text": "..."} optional, defaults to a brand-safe ping.
+    Returns the tweet id on success."""
+    text = (flask_request.get_json(silent=True) or {}).get(
+        "text",
+        # No URL on purpose — X charges 13× per post with a link ($0.20 vs $0.015).
+        # The profile bio carries the webpronos.com link.
+        "🤖 WebPronos AI ping — bot live, scope checks in progress."
+    )
+    client = _x_client()
+    if client is None:
+        return jsonify({"error": "x_not_configured_or_disabled",
+                         "configured": _x_configured(),
+                         "enabled":    X_BOT_ENABLED}), 503
+    if X_DRY_RUN:
+        return jsonify({"dry_run": True, "would_tweet": text})
+    try:
+        resp = client.create_tweet(text=text)
+        tweet_id = str(resp.data.get("id")) if getattr(resp, "data", None) else None
+        return jsonify({"ok": True, "tweet_id": tweet_id, "text": text})
+    except Exception as e:
+        return jsonify({"error": str(e)[:500]}), 500
+
+
+@app.route("/api/admin/x/resolve-now", methods=["POST", "GET"])
+def r_admin_x_resolve_now():
+    """Force the resolution worker to run immediately (instead of waiting
+    for the next 5-min APScheduler tick). Returns how many replies it posted."""
+    posted = _x_resolve_settled_tips()
+    return jsonify({"ok": True, "resolutions_posted": posted})
+
+
+@app.route("/api/admin/tips/archive-now", methods=["POST", "GET"])
+def r_admin_tips_archive_now():
+    """Force the hourly tips→Supabase archive to run immediately.
+    Returns row count + status. Idempotent — safe to call repeatedly."""
+    out = _archive_tips_to_supabase()
+    return jsonify(out)
+
+
+@app.route("/api/admin/tips/restore-now", methods=["POST"])
+def r_admin_tips_restore_now():
+    """Emergency: pull tips_archive from Supabase into local SQLite.
+    Body: {"force": true} to restore even if local has data.
+    Only POST (not GET) since this mutates state."""
+    body = flask_request.get_json(silent=True) or {}
+    force = bool(body.get("force", False))
+    out = _restore_tips_from_supabase(force=force)
+    return jsonify(out)
+
+
+@app.route("/api/admin/tips/archive-status", methods=["GET"])
+def r_admin_tips_archive_status():
+    """Quick health check: how many tips in local vs in Supabase archive."""
+    out = {}
+    try:
+        with _db() as conn:
+            out["local"] = {
+                "tips":  conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0],
+                "games": conn.execute("SELECT COUNT(*) FROM games").fetchone()[0],
+            }
+    except Exception as e:
+        out["local"] = {"error": str(e)[:200]}
+    try:
+        import urllib.request as _ur
+        req = _ur.Request(
+            _supabase_archive_url("tips_archive") + "?select=count",
+            headers={**_supabase_archive_headers(), "Prefer": "count=exact"},
+        )
+        with _ur.urlopen(req, timeout=10) as r:
+            arr = json.loads(r.read())
+            out["supabase"] = {"tips": arr[0]["count"] if arr else 0}
+    except Exception as e:
+        out["supabase"] = {"error": str(e)[:200]}
+    return jsonify(out)
+
+
+@app.route("/api/admin/x/analyze-thresholds", methods=["GET"])
+def r_admin_x_analyze_thresholds():
+    """Historical analysis of how many picks/day would pass at each edge
+    threshold. Used to calibrate X_EDGE_THRESHOLD for a target volume.
+
+    Query params:
+      days   — lookback window (default 30)
+      target — desired picks/day (default 6)
+
+    Returns: per-threshold avg/max/min picks/day, plus a recommended
+    threshold that hits the target window.
+    """
+    from datetime import datetime, timezone
+    days = int(flask_request.args.get("days", "30"))
+    target = float(flask_request.args.get("target", "6"))
+    cutoff_ts = int(time.time()) - days * 86400
+    thresholds = [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 15.0, 18.0, 20.0]
+
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT match_id, market, label, edge_entry AS edge, wall_ts FROM tips "
+                "WHERE wall_ts >= ? AND edge_entry IS NOT NULL "
+                "ORDER BY wall_ts ASC",
+                (cutoff_ts,),
+            ).fetchall()
+
+        # Bucket per day (YYYY-MM-DD UTC)
+        days_with_data = {}
+        for r in rows:
+            day = datetime.fromtimestamp(r["wall_ts"], tz=timezone.utc).strftime("%Y-%m-%d")
+            days_with_data.setdefault(day, []).append(r)
+        total_days = max(len(days_with_data), 1)
+
+        results = []
+        for thr in thresholds:
+            counts_per_day = []
+            picks_per_match_per_day = []
+            picks_per_market_per_match = []
+            for day, day_rows in days_with_data.items():
+                passing = [r for r in day_rows if (r["edge"] or 0) >= thr]
+                counts_per_day.append(len(passing))
+                # per match
+                by_match = {}
+                for r in passing:
+                    by_match.setdefault(r["match_id"], []).append(r)
+                if by_match:
+                    picks_per_match_per_day.append(max(len(v) for v in by_match.values()))
+                # per market per match
+                for m, m_rows in by_match.items():
+                    by_market = {}
+                    for r in m_rows:
+                        by_market.setdefault(r["market"] or "", []).append(r)
+                    if by_market:
+                        picks_per_market_per_match.append(max(len(v) for v in by_market.values()))
+            avg = sum(counts_per_day) / len(counts_per_day) if counts_per_day else 0
+            results.append({
+                "threshold":            thr,
+                "avg_picks_per_day":    round(avg, 1),
+                "max_picks_per_day":    max(counts_per_day) if counts_per_day else 0,
+                "min_picks_per_day":    min(counts_per_day) if counts_per_day else 0,
+                "max_picks_per_match":  max(picks_per_match_per_day) if picks_per_match_per_day else 0,
+                "max_picks_per_market_per_match": max(picks_per_market_per_match) if picks_per_market_per_match else 0,
+                "total_picks_in_window": sum(counts_per_day),
+            })
+
+        # Pick recommended threshold: closest avg to target without exceeding
+        recommended = None
+        for r in results:
+            if r["avg_picks_per_day"] <= target + 1:  # small wiggle
+                recommended = r["threshold"]
+                break
+        return jsonify({
+            "window_days":   days,
+            "total_days":    total_days,
+            "total_tips":    len(rows),
+            "target_per_day": target,
+            "recommended_threshold": recommended,
+            "by_threshold":  results,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)[:500]}), 500
+
+
+@app.route("/api/admin/x/debug-auth", methods=["GET"])
+def r_admin_x_debug_auth():
+    """Diagnostic endpoint — tries raw OAuth1 against X API and returns the
+    full Twitter error response (tweepy hides details).
+    Useful to debug Read-only vs Read+Write permission issues."""
+    out = {
+        "key_prefixes": {
+            "api_key":             (X_API_KEY[:6] + "...") if X_API_KEY else None,
+            "access_token_userid": X_ACCESS_TOKEN.split("-")[0] if "-" in X_ACCESS_TOKEN else None,
+            "access_token_tail":   X_ACCESS_TOKEN[-8:] if X_ACCESS_TOKEN else None,
+        },
+    }
+    try:
+        from requests_oauthlib import OAuth1
+        import requests as _req
+        auth = OAuth1(
+            X_API_KEY, X_API_SECRET,
+            X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET,
+        )
+        # 1. Try GET /2/users/me — pure read endpoint
+        r1 = _req.get("https://api.x.com/2/users/me", auth=auth, timeout=10)
+        out["users_me"] = {
+            "status": r1.status_code,
+            "body":   (r1.text or "")[:500],
+        }
+        # 2. Try POST /2/tweets — write endpoint (we'll catch 401 cleanly)
+        r2 = _req.post(
+            "https://api.x.com/2/tweets",
+            auth=auth,
+            json={"text": "diagnostic_ping_will_be_deleted"},
+            timeout=10,
+        )
+        out["create_tweet"] = {
+            "status": r2.status_code,
+            "body":   (r2.text or "")[:500],
+        }
+        # If the tweet went through, immediately delete it
+        if r2.status_code == 201:
+            tweet_id = r2.json().get("data", {}).get("id")
+            if tweet_id:
+                rdel = _req.delete(
+                    f"https://api.x.com/2/tweets/{tweet_id}",
+                    auth=auth, timeout=10,
+                )
+                out["cleanup_delete"] = {"status": rdel.status_code, "tweet_id": tweet_id}
+    except Exception as e:
+        out["error"] = str(e)[:500]
+    return jsonify(out)
 
 
 @app.route("/api/admin/logos/missing-teams", methods=["GET"])
@@ -11163,9 +13199,25 @@ def r_go_bet():
         match_id  = int(flask_request.args.get("match_id") or 0)
         market    = (flask_request.args.get("market") or "").strip()[:60]
         label     = (flask_request.args.get("label") or "").strip()[:60]
-        lang      = (flask_request.args.get("lang") or "en").strip().lower()
-        if lang not in _GO_BET_COPY:
-            lang = "en"
+
+        # Locale resolution — defence in depth: explicit `lang` query wins;
+        # if missing, infer from Referer URL path (eg /br/jogo/X → pt-br).
+        # This way the popup ALWAYS matches the surrounding page even if
+        # the SPA forgets to append &lang=...
+        lang_raw  = (flask_request.args.get("lang") or "").strip().lower()
+        if not lang_raw:
+            try:
+                from urllib.parse import urlparse as _up
+                ref_path = _up(flask_request.headers.get("Referer") or "").path or ""
+                if ref_path.startswith("/br/") or ref_path == "/br":
+                    lang_raw = "pt-br"
+                elif ref_path.startswith("/pt/") or ref_path == "/pt":
+                    lang_raw = "pt-pt"
+                elif ref_path.startswith("/es/") or ref_path == "/es":
+                    lang_raw = "es"
+            except Exception:
+                pass
+        lang = lang_raw if lang_raw in _GO_BET_COPY else "en"
         source    = (flask_request.args.get("source") or "").strip()[:40]
         try:
             delay_ms = int(flask_request.args.get("delay") or 4000)
@@ -11267,14 +13319,16 @@ def r_go_bet():
                 f'</div>'
             )
 
-        # Embed-mode adjustments: transparent body so SPA's modal backdrop
-        # shows through, no min-height (modal sizes itself), no top padding
-        # (modal provides its own chrome).
+        # Embed-mode adjustments: KEEP the dark background (otherwise the
+        # light-on-white text in the SPA's modal is unreadable — see
+        # screenshot from boss 2026-05). Just shrink the chrome and round
+        # the corners so it sits nicely inside the SPA modal frame.
         embed_css = ""
         if embed:
             embed_css = (
-                "html,body{background:transparent !important;min-height:auto !important;}"
-                ".wrap{min-height:auto !important;padding:1.5rem 1.25rem .75rem !important;}"
+                "html,body{min-height:auto !important;}"
+                ".wrap{min-height:auto !important;padding:1.5rem 1.25rem 1rem !important;"
+                "border-radius:14px;background:var(--bg);}"
             )
 
         html = f"""<!doctype html>
@@ -11389,10 +13443,16 @@ def r_go_bet():
     var target = {json.dumps(target)};
     var delay  = {delay_ms};
     var embed  = {json.dumps(embed)};
-    setTimeout(function() {{
+
+    // Auto-redirect (no user gesture available). On mobile, asking the
+    // SPA parent to window.open() is blocked by Safari/Chrome iOS popup
+    // blockers — so we navigate the top window directly. Same-origin
+    // (webpronos.com everywhere) so this is allowed; modal dismisses
+    // naturally as the page navigates away.
+    setTimeout(function autoRedirect() {{
       if (embed) {{
-        // Tell parent window (SPA modal) to open the bookmaker in a new
-        // tab and close/dismiss the modal. SPA listens for this message.
+        // Best-effort: tell SPA the redirect is happening so it can
+        // log / track / dismiss its modal in advance.
         try {{
           window.parent.postMessage({{
             type: 'webpronos:open-affiliate',
@@ -11400,12 +13460,15 @@ def r_go_bet():
             ts:   Date.now()
           }}, '*');
         }} catch(e) {{}}
-      }} else {{
-        window.location.replace(target);
+        try {{ window.top.location.href = target; return; }} catch(e) {{}}
       }}
+      window.location.replace(target);
     }}, delay);
-    // Also relay manual clicks on "Open now" so SPA can close the modal
-    // even when the user is impatient and clicks early.
+
+    // Manual click on "Open now": the <a target="_blank"|"_self"> link
+    // navigates natively under the user gesture — DO NOT preventDefault,
+    // it kills the click on iOS. Just fire-and-forget postMessage so
+    // the SPA can dismiss its modal in parallel.
     var btn = document.getElementById('openBtn');
     if (btn && embed) {{
       btn.addEventListener('click', function() {{
@@ -11691,8 +13754,12 @@ def r_robots():
         "Disallow: /proxy/\n"
         "Allow: /\n"
         "\n"
+        # Single canonical entry point — the index references every sub-sitemap.
+        # Legacy /sitemap.xml is still served at the URL for backwards-compat
+        # with any externally cached references, but is NOT advertised here
+        # (boss feedback: avoid confusing crawlers with multiple top-level
+        # sitemaps to submit).
         f"Sitemap: {SITE_URL}/sitemap_index.xml\n"
-        f"Sitemap: {SITE_URL}/sitemap.xml\n"
     )
     return Response(body, mimetype="text/plain", headers={"Cache-Control": "public, max-age=86400"})
 
@@ -11786,6 +13853,92 @@ def _sm_urls_leagues() -> list[str]:
     return urls
 
 
+def _sm_urls_matches_for_locale(locale: str) -> list[str]:
+    """Locale-aware variant of _sm_urls_matches. Same selection rules
+    (live + scheduled next-30d + finished-with-picks last-7d) but each
+    URL is prefixed with the locale (/br, /pt, /es) and declares hreflang
+    alternates to its EN/BR/PT/ES siblings (same match id, different
+    locale prefix). Match slugs don't translate — only the URL prefix
+    differs across locales."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    now_ts = int(now.timestamp())
+    next_30d = now_ts + 30 * 86400
+    last_7d  = now_ts - 7 * 86400
+    prefix = _LOCALE_TO_PREFIX.get(locale, "")
+    urls: list[str] = []
+    seen: set[int] = set()
+
+    def _emit(mid: int, home: str, away: str, lastmod: str, cf: str, pri: str):
+        slug_part = f"{_slug(home)}-{_slug(away)}"
+        en_path  = f"/match/{mid}/{slug_part}"
+        # The current locale's URL uses its dynamic prefix
+        # (/jogo, /partido). Same for hreflang siblings: each locale's
+        # alternate uses its own translated prefix so Google indexes
+        # the same content under the right canonical per language.
+        loc_path = _localized_dynamic_path(en_path, locale)
+        urls.append(_xml_url_i18n(
+            loc        = f"{SITE_URL}{prefix}{loc_path}",
+            lastmod    = lastmod,
+            changefreq = cf,
+            priority   = pri,
+            alternates = {
+                "en":        f"{SITE_URL}{en_path}",
+                "pt-br":     f"{SITE_URL}/br{_localized_dynamic_path(en_path, 'pt-br')}",
+                "pt-pt":     f"{SITE_URL}/pt{_localized_dynamic_path(en_path, 'pt-pt')}",
+                "es":        f"{SITE_URL}/es{_localized_dynamic_path(en_path, 'es')}",
+                "x-default": f"{SITE_URL}{en_path}",
+            },
+        ))
+
+    try:
+        with _state_lock:
+            for entry in _live_state.values():
+                m = entry.get("match", {})
+                mid = m.get("id")
+                if mid and m.get("statusType") == "inprogress":
+                    _emit(mid, m.get("homeTeam", "home"), m.get("awayTeam", "away"),
+                          now.strftime("%Y-%m-%d"), "always", "0.95")
+                    seen.add(mid)
+    except Exception:
+        pass
+
+    try:
+        with _db() as conn:
+            scheduled = conn.execute("""
+                SELECT id, home_team, away_team, start_ts
+                FROM games
+                WHERE is_finished = 0 AND start_ts > ? AND start_ts <= ?
+                ORDER BY start_ts ASC
+                LIMIT 5000
+            """, (now_ts, next_30d)).fetchall()
+            for r in scheduled:
+                if r["id"] in seen:
+                    continue
+                _emit(r["id"], r["home_team"], r["away_team"],
+                      now.strftime("%Y-%m-%d"), "daily", "0.8")
+                seen.add(r["id"])
+
+            finished = conn.execute("""
+                SELECT g.id, g.home_team, g.away_team, MAX(t.wall_ts) AS last_ts
+                FROM games g JOIN tips t ON t.match_id = g.id
+                WHERE g.is_finished = 1 AND g.start_ts >= ?
+                GROUP BY g.id
+                ORDER BY last_ts DESC
+                LIMIT 10000
+            """, (last_7d,)).fetchall()
+            for r in finished:
+                if r["id"] in seen:
+                    continue
+                lastmod = (datetime.fromtimestamp(r["last_ts"], tz=timezone.utc).strftime("%Y-%m-%d")
+                           if r["last_ts"] else now.strftime("%Y-%m-%d"))
+                _emit(r["id"], r["home_team"], r["away_team"], lastmod, "monthly", "0.5")
+                seen.add(r["id"])
+    except Exception as e:
+        log.warning(f"sitemap-matches[{locale}]: {e}")
+    return urls
+
+
 def _sm_urls_matches() -> list[str]:
     """
     Includes:
@@ -11862,7 +14015,11 @@ def _sm_urls_matches() -> list[str]:
     return urls
 
 
-def _sm_urls_blog() -> list[str]:
+def _sm_urls_blog(lang: str = "en", url_prefix: str = "") -> list[str]:
+    """Emit blog post URLs for the given lang. The URLs are constructed
+    with `url_prefix` (eg "/br") so callers can build sitemap-br.xml etc.
+    Default behaviour (lang='en', url_prefix='') preserves the original
+    output exactly — backward compatible for sitemap.xml + index."""
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     urls: list[str] = []
@@ -11870,7 +14027,9 @@ def _sm_urls_blog() -> list[str]:
         import urllib.request as _ur
         supa_url = (
             f"{SUPABASE_URL}/rest/v1/blog_posts"
-            f"?select=slug,published_at&order=published_at.desc&limit=500"
+            f"?select=slug,published_at"
+            f"&lang=eq.{lang}"
+            f"&order=published_at.desc&limit=500"
         )
         req = _ur.Request(supa_url, headers={
             "apikey":        SUPABASE_ANON,
@@ -11882,7 +14041,7 @@ def _sm_urls_blog() -> list[str]:
             slug = post.get("slug", "")
             pub  = (post.get("published_at") or now.isoformat())[:10]
             if slug:
-                urls.append(_xml_url(f"{SITE_URL}/blog/{slug}", pub, "monthly", "0.6"))
+                urls.append(_xml_url(f"{SITE_URL}{url_prefix}/blog/{slug}", pub, "monthly", "0.6"))
     except Exception as e:
         log.debug(f"sitemap-blog Supabase fetch failed: {e}")
     return urls
@@ -11895,6 +14054,189 @@ def _sm_envelope(urls: list[str]) -> str:
         + "\n".join(urls) + "\n"
         '</urlset>'
     )
+
+
+def _sm_envelope_i18n(urls: list[str]) -> str:
+    """Sitemap envelope with the xhtml namespace declared so `<xhtml:link
+    rel="alternate" hreflang="...">` annotations are valid. Used for the
+    per-language sitemaps (sitemap-br.xml, future sitemap-pt.xml, etc.)
+    where each URL declares its locale siblings."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"\n'
+        '        xmlns:xhtml="http://www.w3.org/1999/xhtml">\n'
+        + "\n".join(urls) + "\n"
+        '</urlset>'
+    )
+
+
+def _xml_url_i18n(loc: str, lastmod: str, changefreq: str, priority: str,
+                   alternates: dict[str, str]) -> str:
+    """Render a <url> entry that declares hreflang alternates inline.
+
+    `alternates` maps hreflang code → absolute URL. Include the current
+    URL too (Google requires self-reference in the alternate set) plus
+    an "x-default" entry for the EN canonical.
+    """
+    alt_lines = [
+        f'    <xhtml:link rel="alternate" hreflang="{lang}" href="{url}"/>'
+        for lang, url in alternates.items()
+    ]
+    return (
+        f"  <url>\n"
+        f"    <loc>{loc}</loc>\n"
+        f"    <lastmod>{lastmod}</lastmod>\n"
+        f"    <changefreq>{changefreq}</changefreq>\n"
+        f"    <priority>{priority}</priority>\n"
+        + "\n".join(alt_lines) + "\n"
+        f"  </url>"
+    )
+
+
+def _sm_br_alt_set(en_path: str) -> dict[str, str]:
+    """Hreflang alternate set for a static BR sitemap entry.
+    EN keeps the canonical path; each non-EN locale uses its slug
+    translation (passthrough if no translation registered)."""
+    return {
+        "en":        f"{SITE_URL}{en_path}",
+        "pt-br":     f"{SITE_URL}/br{_localized_slug(en_path, 'pt-br')}",
+        "pt-pt":     f"{SITE_URL}/pt{_localized_slug(en_path, 'pt-pt')}",
+        "es":        f"{SITE_URL}/es{_localized_slug(en_path, 'es')}",
+        "x-default": f"{SITE_URL}{en_path}",
+    }
+
+
+# Locale prefix used in URLs (no slash on either side).
+# pt-br → "br", pt-pt → "pt", es → "es"
+_LOCALE_URL_KEY = {"pt-br": "br", "pt-pt": "pt", "es": "es"}
+
+
+def _sm_urls_locale_static_pages(locale: str) -> list[str]:
+    """Locale-generic sitemap entries for STATIC pages (homepage +
+    legal/info + blog index). Each URL uses the locale's localized slug
+    and declares hreflang alternates to its EN/BR/PT/ES siblings.
+
+    Pass locale ∈ {pt-br, pt-pt, es}. The prefix in the URL is derived
+    from `_LOCALE_URL_KEY` (/br, /pt, /es).
+    """
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prefix_key = _LOCALE_URL_KEY[locale]
+    pages = [
+        ("/",                     today, "daily",   "1.0"),
+        ("/about",                today, "monthly", "0.5"),
+        ("/responsible-gambling", today, "yearly",  "0.3"),
+        ("/terms",                today, "yearly",  "0.3"),
+        ("/privacy",              today, "yearly",  "0.3"),
+        ("/blog",                 today, "weekly",  "0.7"),
+    ]
+    urls = []
+    for en_stripped, lastmod, cf, pri in pages:
+        local_slug = _localized_slug(en_stripped, locale)
+        loc = (f"{SITE_URL}/{prefix_key}/" if en_stripped == "/"
+               else f"{SITE_URL}/{prefix_key}{local_slug}")
+        urls.append(_xml_url_i18n(
+            loc        = loc,
+            lastmod    = lastmod,
+            changefreq = cf,
+            priority   = pri,
+            alternates = _sm_br_alt_set(en_stripped),
+        ))
+    return urls
+
+
+def _sm_urls_locale_blog(locale: str) -> list[str]:
+    """Locale-generic sitemap entries for BLOG POSTS. Walks _BLOG_SLUG_I18N,
+    looks up each row's published_at from Supabase (filtered to `lang=locale`),
+    and emits the locale-specific slug as canonical with EN/BR/PT/ES alts.
+
+    A post is included only if it has a translation registered for the
+    requested locale. Posts without a translation are skipped (the locale's
+    sitemap should never list URLs that don't exist).
+    """
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prefix_key = _LOCALE_URL_KEY[locale]
+    urls: list[str] = []
+    try:
+        import urllib.request as _ur, urllib.parse as _up
+        for en_slug, langs in _BLOG_SLUG_I18N.items():
+            local_slug = langs.get(locale)
+            if not local_slug:
+                continue
+            try:
+                supa_url = (
+                    f"{SUPABASE_URL}/rest/v1/blog_posts"
+                    f"?slug=eq.{_up.quote(local_slug)}"
+                    f"&lang=eq.{locale}"
+                    f"&select=published_at&limit=1"
+                )
+                req = _ur.Request(supa_url, headers={
+                    "apikey":        SUPABASE_ANON,
+                    "Authorization": f"Bearer {SUPABASE_ANON}",
+                })
+                with _ur.urlopen(req, timeout=4) as r:
+                    rows = json.loads(r.read())
+                pub = (rows[0].get("published_at") if rows else today)[:10]
+            except Exception:
+                pub = today
+            blog_alts = {
+                "en":        f"{SITE_URL}/blog/{en_slug}",
+                "pt-br":     f"{SITE_URL}/br/blog/{_localized_blog_slug(en_slug, 'pt-br')}",
+                "pt-pt":     f"{SITE_URL}/pt/blog/{_localized_blog_slug(en_slug, 'pt-pt')}",
+                "es":        f"{SITE_URL}/es/blog/{_localized_blog_slug(en_slug, 'es')}",
+                "x-default": f"{SITE_URL}/blog/{en_slug}",
+            }
+            urls.append(_xml_url_i18n(
+                loc        = f"{SITE_URL}/{prefix_key}/blog/{local_slug}",
+                lastmod    = pub,
+                changefreq = "monthly",
+                priority   = "0.6",
+                alternates = blog_alts,
+            ))
+    except Exception as e:
+        log.debug(f"sitemap-{prefix_key} blog fetch failed: {e}")
+    return urls
+
+
+def _sm_lastmod_locale_blog(locale: str) -> str:
+    """Freshest published_at across blog posts translated to `locale`.
+    Used by the sitemap index to drive conditional crawls."""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        import urllib.request as _ur
+        url = (
+            f"{SUPABASE_URL}/rest/v1/blog_posts"
+            f"?select=published_at"
+            f"&lang=eq.{locale}"
+            f"&order=published_at.desc&limit=1"
+        )
+        req = _ur.Request(url, headers={
+            "apikey":        SUPABASE_ANON,
+            "Authorization": f"Bearer {SUPABASE_ANON}",
+        })
+        with _ur.urlopen(req, timeout=3) as r:
+            arr = json.loads(r.read())
+        if arr:
+            return (arr[0].get("published_at") or "")[:10] or today
+    except Exception as e:
+        log.debug(f"_sm_lastmod_locale_blog({locale}): {e}")
+    return today
+
+
+# Backward-compatible thin wrappers — older callers in this file still
+# reference the BR-named helpers. Same behaviour, locale fixed to pt-br.
+def _sm_urls_br_static_pages() -> list[str]:
+    return _sm_urls_locale_static_pages("pt-br")
+
+
+def _sm_urls_br_blog() -> list[str]:
+    return _sm_urls_locale_blog("pt-br")
+
+
+def _sm_lastmod_br_blog() -> str:
+    return _sm_lastmod_locale_blog("pt-br")
 
 
 # ─── Per-category lastmod helpers ────────────────────────────────────────────
@@ -12021,13 +14363,28 @@ def r_sitemap_index():
     tips_lastmod     = _sm_lastmod_max_tip_ts()
     matches_lastmod  = _sm_lastmod_matches()
     blog_lastmod     = _sm_lastmod_blog()
+    br_blog_lastmod  = _sm_lastmod_locale_blog("pt-br")
+    pt_blog_lastmod  = _sm_lastmod_locale_blog("pt-pt")
+    es_blog_lastmod  = _sm_lastmod_locale_blog("es")
 
     entries = [
-        _sm_index_entry(f"{SITE_URL}/sitemap-pages.xml",    pages_lastmod),
-        _sm_index_entry(f"{SITE_URL}/sitemap-leagues.xml",  tips_lastmod),
-        _sm_index_entry(f"{SITE_URL}/sitemap-teams.xml",    tips_lastmod),
-        _sm_index_entry(f"{SITE_URL}/sitemap-matches.xml",  matches_lastmod),
-        _sm_index_entry(f"{SITE_URL}/sitemap-blog.xml",     blog_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-pages.xml",       pages_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-leagues.xml",     tips_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-teams.xml",       tips_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-matches.xml",     matches_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-blog.xml",        blog_lastmod),
+        # Per-locale sub-sitemaps. Listed flat (not via per-locale indexes)
+        # because sitemap-index files cannot reference other index files
+        # per the sitemaps.org spec — must point at urlset documents.
+        _sm_index_entry(f"{SITE_URL}/sitemap-br-pages.xml",    pages_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-br-blog.xml",     br_blog_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-br-matches.xml",  matches_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-pt-pages.xml",    pages_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-pt-blog.xml",     pt_blog_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-pt-matches.xml",  matches_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-es-pages.xml",    pages_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-es-blog.xml",     es_blog_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-es-matches.xml",  matches_lastmod),
     ]
     body = _sm_index_envelope(entries)
     return Response(body, mimetype="application/xml", headers={
@@ -12067,6 +14424,226 @@ def r_sitemap_matches():
 def r_sitemap_blog():
     urls = _sm_urls_blog()
     return _xml_response(_sm_envelope(urls), len(urls))
+
+
+@app.route("/sitemap-br.xml")
+def r_sitemap_br():
+    """BR-locale sitemap INDEX — references the per-category sub-sitemaps
+    for the BR side. Mirrors the EN /sitemap_index.xml structure so the
+    BR ecosystem scales the same way (each category gets independent
+    lastmod, Google re-crawls only what changed).
+
+    Sub-sitemaps:
+      sitemap-br-pages.xml  — static legal/info + homepage + blog index
+      sitemap-br-blog.xml   — translated blog posts (slug-localized)
+
+    Add new sub-sitemaps here as dynamic pages (today, history, team,
+    league, match, tips) get BR chrome translations.
+    """
+    pages_lastmod   = _sm_lastmod_today()
+    blog_lastmod    = _sm_lastmod_br_blog()
+    matches_lastmod = _sm_lastmod_matches()
+    entries = [
+        _sm_index_entry(f"{SITE_URL}/sitemap-br-pages.xml",   pages_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-br-blog.xml",    blog_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-br-matches.xml", matches_lastmod),
+    ]
+    body = _sm_index_envelope(entries)
+    return Response(body, mimetype="application/xml", headers={
+        "Cache-Control":    "public, max-age=3600, s-maxage=3600",
+        "X-Sitemap-Index":  str(len(entries)),
+        "X-Sitemap-Locale": "pt-br",
+    })
+
+
+@app.route("/sitemap-br-pages.xml")
+def r_sitemap_br_pages():
+    """BR static pages — homepage, legal/info, blog index."""
+    urls = _sm_urls_br_static_pages()
+    return Response(
+        _sm_envelope_i18n(urls),
+        mimetype="application/xml",
+        headers={
+            "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls":  str(len(urls)),
+            "X-Sitemap-Locale": "pt-br",
+        },
+    )
+
+
+@app.route("/sitemap-br-blog.xml")
+def r_sitemap_br_blog():
+    """BR blog posts — one URL per (slug, lang='pt-br') row."""
+    urls = _sm_urls_br_blog()
+    return Response(
+        _sm_envelope_i18n(urls),
+        mimetype="application/xml",
+        headers={
+            "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls":  str(len(urls)),
+            "X-Sitemap-Locale": "pt-br",
+        },
+    )
+
+
+# ─── PT-PT sitemaps ──────────────────────────────────────────────────────
+# Mirror of the BR routes for the Portugal locale. Same structure (index +
+# pages + blog), same generators (locale-parameterised helpers above).
+
+@app.route("/sitemap-pt.xml")
+def r_sitemap_pt():
+    """PT-PT-locale sitemap INDEX — references the per-category sub-sitemaps
+    for the PT side. Discovery endpoint for robots.txt / manual submission.
+    The master `/sitemap_index.xml` references the leaf urlsets directly."""
+    pages_lastmod   = _sm_lastmod_today()
+    blog_lastmod    = _sm_lastmod_locale_blog("pt-pt")
+    matches_lastmod = _sm_lastmod_matches()
+    entries = [
+        _sm_index_entry(f"{SITE_URL}/sitemap-pt-pages.xml",   pages_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-pt-blog.xml",    blog_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-pt-matches.xml", matches_lastmod),
+    ]
+    body = _sm_index_envelope(entries)
+    return Response(body, mimetype="application/xml", headers={
+        "Cache-Control":    "public, max-age=3600, s-maxage=3600",
+        "X-Sitemap-Index":  str(len(entries)),
+        "X-Sitemap-Locale": "pt-pt",
+    })
+
+
+@app.route("/sitemap-pt-pages.xml")
+def r_sitemap_pt_pages():
+    """PT-PT static pages — homepage, legal/info, blog index."""
+    urls = _sm_urls_locale_static_pages("pt-pt")
+    return Response(
+        _sm_envelope_i18n(urls),
+        mimetype="application/xml",
+        headers={
+            "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls":  str(len(urls)),
+            "X-Sitemap-Locale": "pt-pt",
+        },
+    )
+
+
+@app.route("/sitemap-pt-blog.xml")
+def r_sitemap_pt_blog():
+    """PT-PT blog posts — one URL per (slug, lang='pt-pt') row."""
+    urls = _sm_urls_locale_blog("pt-pt")
+    return Response(
+        _sm_envelope_i18n(urls),
+        mimetype="application/xml",
+        headers={
+            "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls":  str(len(urls)),
+            "X-Sitemap-Locale": "pt-pt",
+        },
+    )
+
+
+# ─── ES sitemaps ─────────────────────────────────────────────────────────
+# Mirror of the BR/PT routes for the Spanish locale.
+
+@app.route("/sitemap-es.xml")
+def r_sitemap_es():
+    """ES-locale sitemap INDEX — references the per-category sub-sitemaps
+    for the ES side. Discovery endpoint for robots.txt / manual submission."""
+    pages_lastmod   = _sm_lastmod_today()
+    blog_lastmod    = _sm_lastmod_locale_blog("es")
+    matches_lastmod = _sm_lastmod_matches()
+    entries = [
+        _sm_index_entry(f"{SITE_URL}/sitemap-es-pages.xml",   pages_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-es-blog.xml",    blog_lastmod),
+        _sm_index_entry(f"{SITE_URL}/sitemap-es-matches.xml", matches_lastmod),
+    ]
+    body = _sm_index_envelope(entries)
+    return Response(body, mimetype="application/xml", headers={
+        "Cache-Control":    "public, max-age=3600, s-maxage=3600",
+        "X-Sitemap-Index":  str(len(entries)),
+        "X-Sitemap-Locale": "es",
+    })
+
+
+@app.route("/sitemap-es-pages.xml")
+def r_sitemap_es_pages():
+    """ES static pages — homepage, legal/info, blog index."""
+    urls = _sm_urls_locale_static_pages("es")
+    return Response(
+        _sm_envelope_i18n(urls),
+        mimetype="application/xml",
+        headers={
+            "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls":  str(len(urls)),
+            "X-Sitemap-Locale": "es",
+        },
+    )
+
+
+@app.route("/sitemap-es-blog.xml")
+def r_sitemap_es_blog():
+    """ES blog posts — one URL per (slug, lang='es') row."""
+    urls = _sm_urls_locale_blog("es")
+    return Response(
+        _sm_envelope_i18n(urls),
+        mimetype="application/xml",
+        headers={
+            "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls":  str(len(urls)),
+            "X-Sitemap-Locale": "es",
+        },
+    )
+
+
+# ─── Per-locale matches sitemaps ──────────────────────────────────────────
+# Each match has 4 URL variants (/match/X, /br/match/X, /pt/match/X, /es/match/X)
+# all serving the same backend content with different locale chrome. We list
+# each variant in its own locale sitemap with hreflang alternates pointing to
+# the others — Google's canonical signal then groups them as translated
+# duplicates instead of treating them as competing URLs.
+
+@app.route("/sitemap-br-matches.xml")
+def r_sitemap_br_matches():
+    """BR matches — locale-prefixed (/br/match/...) with hreflang alternates."""
+    urls = _sm_urls_matches_for_locale("pt-br")
+    return Response(
+        _sm_envelope_i18n(urls),
+        mimetype="application/xml",
+        headers={
+            "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls":  str(len(urls)),
+            "X-Sitemap-Locale": "pt-br",
+        },
+    )
+
+
+@app.route("/sitemap-pt-matches.xml")
+def r_sitemap_pt_matches():
+    """PT-PT matches — locale-prefixed (/pt/match/...) with hreflang alternates."""
+    urls = _sm_urls_matches_for_locale("pt-pt")
+    return Response(
+        _sm_envelope_i18n(urls),
+        mimetype="application/xml",
+        headers={
+            "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls":  str(len(urls)),
+            "X-Sitemap-Locale": "pt-pt",
+        },
+    )
+
+
+@app.route("/sitemap-es-matches.xml")
+def r_sitemap_es_matches():
+    """ES matches — locale-prefixed (/es/match/...) with hreflang alternates."""
+    urls = _sm_urls_matches_for_locale("es")
+    return Response(
+        _sm_envelope_i18n(urls),
+        mimetype="application/xml",
+        headers={
+            "Cache-Control":   "public, max-age=3600, s-maxage=3600",
+            "X-Sitemap-Urls":  str(len(urls)),
+            "X-Sitemap-Locale": "es",
+        },
+    )
 
 
 @app.route("/api/live/picks-stream")
@@ -12385,6 +14962,1073 @@ def r_admin_health():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  PWA + Web Push notifications
+# ════════════════════════════════════════════════════════════════════════════
+# Lets users install webpronos.com as a Progressive Web App on iOS/Android/
+# desktop and receive push notifications even when the tab is closed (or the
+# phone is locked). Complements the existing in-page SSE/toast bell — that
+# one fires when the tab is focused; this one fires anytime.
+#
+# Layers:
+#   • /manifest.json   — PWA install metadata (name, icons, theme, scope)
+#   • /sw.js           — Service Worker (handles push, click, install events)
+#   • /api/push/*      — subscribe / unsubscribe / public-key endpoints
+#   • push_subscriptions DB table (one row per (endpoint, p256dh, auth))
+#   • Hook in _broadcast_pick → fan-out via pywebpush to all eligible rows
+#
+# Secrets (all 3 required for push to actually fire):
+#   VAPID_PUBLIC_KEY      — base64url-encoded ECDSA public key (also exposed
+#                            to the browser via /api/push/vapid-public-key)
+#   VAPID_PRIVATE_KEY     — PEM-encoded ECDSA private key (server-only)
+#   VAPID_CONTACT_EMAIL   — "mailto:..." string included in VAPID JWT claim
+#                            (FCM/APNs use this to contact us re: abuse)
+VAPID_PUBLIC_KEY     = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY    = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_CONTACT_EMAIL  = os.environ.get("VAPID_CONTACT_EMAIL", "mailto:hi@webpronos.com")
+
+
+def _push_configured() -> bool:
+    return bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
+
+
+# ── pywebpush import is lazy ────────────────────────────────────────────────
+# We don't crash boot if the lib isn't installed yet (e.g. local dev). The
+# fan-out path will skip cleanly with a warning. Production has the package
+# pinned in requirements.txt.
+try:
+    from pywebpush import webpush, WebPushException  # type: ignore
+    _PYWEBPUSH_AVAILABLE = True
+except Exception as _pp_err:
+    _PYWEBPUSH_AVAILABLE = False
+    log.warning(f"pywebpush import failed (push disabled): {_pp_err}")
+
+
+# ── PWA manifest ────────────────────────────────────────────────────────────
+# The browser fetches this once when the user taps "Add to Home Screen" or
+# Chrome's install prompt fires. Locale is read from ?lang= so the installed
+# app name matches what the user sees in the SPA. Defaults to EN.
+_PWA_MANIFEST_COPY = {
+    "en":    {"name": "WebPronos — Live AI Picks", "short": "WebPronos"},
+    "br":    {"name": "WebPronos — Palpites IA ao vivo", "short": "WebPronos"},
+    "pt-br": {"name": "WebPronos — Palpites IA ao vivo", "short": "WebPronos"},
+    "pt-pt": {"name": "WebPronos — Picks IA em direto", "short": "WebPronos"},
+    "es":    {"name": "WebPronos — Picks IA en vivo", "short": "WebPronos"},
+}
+
+
+# ── PWA icons (generated on-the-fly from static/logo.png) ──────────────────
+# Avoids committing binary variants. Pillow resizes once per size and caches
+# the bytes in memory. The maskable variant pads the logo so the safe zone
+# (inner 80%) contains the full logo — required by the maskable spec.
+_PWA_ICON_CACHE: dict[str, bytes] = {}
+_PWA_ICON_LOCK = threading.Lock()
+
+
+def _build_pwa_icon(kind: str) -> bytes:
+    """kind ∈ {'192','512','mask','badge'}."""
+    from PIL import Image
+    from io import BytesIO
+
+    base_path = os.path.join(os.path.dirname(__file__), "static", "logo.png")
+    if not os.path.exists(base_path):
+        raise FileNotFoundError(base_path)
+    src = Image.open(base_path).convert("RGBA")
+
+    if kind == "192":
+        out = src.resize((192, 192), Image.LANCZOS)
+    elif kind == "512":
+        out = src.resize((512, 512), Image.LANCZOS)
+    elif kind == "badge":
+        # Monochrome 72x72 silhouette for Android lockscreen badge.
+        out = src.resize((72, 72), Image.LANCZOS)
+    elif kind == "mask":
+        # 512x512 canvas with the logo at 80% so adaptive masks crop safely.
+        canvas = Image.new("RGBA", (512, 512), (15, 23, 42, 255))  # bg=#0f172a
+        safe = int(512 * 0.72)
+        inner = src.resize((safe, safe), Image.LANCZOS)
+        off = (512 - safe) // 2
+        canvas.paste(inner, (off, off), inner if inner.mode == "RGBA" else None)
+        out = canvas
+    else:
+        raise ValueError(kind)
+
+    buf = BytesIO()
+    out.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+@app.route("/pwa-icon/<kind>.png", methods=["GET"])
+def pwa_icon(kind: str):
+    kind = kind.lower()
+    if kind not in ("192", "512", "mask", "badge"):
+        return Response("not found", status=404)
+    with _PWA_ICON_LOCK:
+        png = _PWA_ICON_CACHE.get(kind)
+        if png is None:
+            try:
+                png = _build_pwa_icon(kind)
+                _PWA_ICON_CACHE[kind] = png
+            except Exception as e:
+                log.error(f"pwa_icon({kind}) failed: {e}")
+                return Response("icon generation failed", status=500)
+    resp = Response(png, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=604800, immutable"
+    return resp
+
+
+@app.route("/manifest.json", methods=["GET"])
+def pwa_manifest():
+    """PWA install manifest. Locale-aware via ?lang= query param."""
+    lang = (flask_request.args.get("lang") or "en").lower()
+    copy = _PWA_MANIFEST_COPY.get(lang) or _PWA_MANIFEST_COPY["en"]
+    manifest = {
+        "name":             copy["name"],
+        "short_name":       copy["short"],
+        "description":      "Live AI football picks powered by xG model",
+        "start_url":        "/?utm_source=pwa",
+        "scope":            "/",
+        "display":          "standalone",
+        "orientation":      "portrait-primary",
+        "background_color": "#0f172a",
+        "theme_color":      "#10b981",
+        "lang":             lang if lang in ("en","es","pt-pt","pt-br","br") else "en",
+        "icons": [
+            {"src": "/pwa-icon/192.png",  "sizes": "192x192", "type": "image/png"},
+            {"src": "/pwa-icon/512.png",  "sizes": "512x512", "type": "image/png"},
+            {"src": "/pwa-icon/mask.png", "sizes": "512x512", "type": "image/png",
+             "purpose": "maskable"},
+        ],
+        "categories": ["sports", "news"],
+    }
+    resp = jsonify(manifest)
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+# ── Service Worker ──────────────────────────────────────────────────────────
+# Served from the site root (NOT /static/) so its scope can be "/" — required
+# by the Service Worker spec. Handles 3 events:
+#   • install / activate — claim clients immediately so first-paint works
+#   • push               — show notification with title/body/icon from payload
+#   • notificationclick  — open the match page (or focus existing tab)
+_SERVICE_WORKER_JS = r"""
+// WebPronos Service Worker — Web Push + PWA shell
+// version: 1
+const SW_VERSION = 'wp-sw-v1';
+
+self.addEventListener('install', (event) => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('push', (event) => {
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch (e) {}
+
+  const title = data.title || 'New pick — WebPronos';
+  const opts  = {
+    body:    data.body  || '',
+    icon:    data.icon  || '/pwa-icon/192.png',
+    badge:   data.badge || '/pwa-icon/badge.png',
+    tag:     data.tag   || ('pick-' + Date.now()),
+    data:    { url: data.url || '/' },
+    vibrate: [120, 60, 120],
+    requireInteraction: false,
+  };
+  event.waitUntil(self.registration.showNotification(title, opts));
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const target = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil((async () => {
+    const list = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const c of list) {
+      if (c.url.includes(target) && 'focus' in c) return c.focus();
+    }
+    if (self.clients.openWindow) return self.clients.openWindow(target);
+  })());
+});
+"""
+
+
+@app.route("/sw.js", methods=["GET"])
+def service_worker():
+    """Serve the service worker from root scope. Cache 1 hour."""
+    resp = Response(_SERVICE_WORKER_JS, mimetype="application/javascript")
+    # Browser must re-check periodically so SW updates roll out.
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    resp.headers["Service-Worker-Allowed"] = "/"
+    return resp
+
+
+# ── In-page bootstrap helper ────────────────────────────────────────────────
+# Tiny JS injected by the Cloudflare Worker into HTML responses. Exposes
+# `window.wpEnablePush()` so the user can opt-in from the SPA bell or via
+# DevTools console while we're still pre-Lovable.
+_PUSH_BOOTSTRAP_JS = r"""
+(function () {
+  if (!('serviceWorker' in navigator)) return;
+  // Register once at idle so it doesn't compete with first paint.
+  const reg = () => navigator.serviceWorker.register('/sw.js', { scope: '/' })
+    .catch(e => console.warn('[wp-push] sw register failed', e));
+  if (document.readyState === 'complete') reg();
+  else window.addEventListener('load', reg);
+
+  function urlBase64ToUint8Array(b64) {
+    const padding = '='.repeat((4 - b64.length % 4) % 4);
+    const base64 = (b64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(base64);
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+
+  window.wpEnablePush = async function () {
+    if (!('PushManager' in window)) { console.warn('[wp-push] PushManager unsupported'); return false; }
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { console.warn('[wp-push] permission denied'); return false; }
+    const sw = await navigator.serviceWorker.ready;
+    const keyResp = await fetch('/api/push/vapid-public-key');
+    const { key } = await keyResp.json();
+    if (!key) { console.warn('[wp-push] no VAPID key from server'); return false; }
+    let sub = await sw.pushManager.getSubscription();
+    if (!sub) {
+      sub = await sw.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(key),
+      });
+    }
+    const json = sub.toJSON();
+    const lang = (document.documentElement.lang || 'en').toLowerCase();
+    await fetch('/api/push/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        endpoint: json.endpoint,
+        p256dh:   json.keys && json.keys.p256dh,
+        auth:     json.keys && json.keys.auth,
+        locale:   lang,
+      }),
+    });
+    console.info('[wp-push] subscribed');
+    return true;
+  };
+
+  window.wpDisablePush = async function () {
+    const sw = await navigator.serviceWorker.ready;
+    const sub = await sw.pushManager.getSubscription();
+    if (!sub) return true;
+    const endpoint = sub.endpoint;
+    await sub.unsubscribe();
+    await fetch('/api/push/unsubscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint }),
+    });
+    console.info('[wp-push] unsubscribed');
+    return true;
+  };
+})();
+"""
+
+
+@app.route("/push-bootstrap.js", methods=["GET"])
+def push_bootstrap_js():
+    """Bootstrap script that the Cloudflare Worker injects into HTML pages."""
+    resp = Response(_PUSH_BOOTSTRAP_JS, mimetype="application/javascript")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.route("/api/push/vapid-public-key", methods=["GET"])
+def push_vapid_public_key():
+    """Expose the VAPID public key so the browser can request a subscription."""
+    resp = jsonify({"key": VAPID_PUBLIC_KEY or None,
+                    "configured": _push_configured()})
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.route("/api/push/subscribe", methods=["POST"])
+def push_subscribe():
+    """Record a new (or refreshed) browser push subscription."""
+    if not _push_configured():
+        return jsonify({"ok": False, "error": "push_not_configured"}), 503
+    try:
+        body = flask_request.get_json(force=True, silent=True) or {}
+        endpoint = (body.get("endpoint") or "").strip()
+        p256dh   = (body.get("p256dh") or "").strip()
+        auth_k   = (body.get("auth") or "").strip()
+        locale   = (body.get("locale") or "en").lower()[:8]
+        if not endpoint or not p256dh or not auth_k:
+            return jsonify({"ok": False, "error": "missing_fields"}), 400
+        ua = (flask_request.headers.get("User-Agent") or "")[:300]
+        now = int(time.time())
+        with _db() as conn:
+            # UPSERT: if endpoint already known, refresh keys + reactivate.
+            conn.execute("""
+                INSERT INTO push_subscriptions
+                    (endpoint, p256dh, auth, locale, user_agent,
+                     created_at, last_seen_at, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(endpoint) DO UPDATE SET
+                    p256dh       = excluded.p256dh,
+                    auth         = excluded.auth,
+                    locale       = excluded.locale,
+                    user_agent   = excluded.user_agent,
+                    last_seen_at = excluded.last_seen_at,
+                    active       = 1
+            """, (endpoint, p256dh, auth_k, locale, ua, now, now))
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.error(f"push_subscribe error: {e}")
+        return jsonify({"ok": False, "error": "server_error"}), 500
+
+
+@app.route("/api/push/unsubscribe", methods=["POST"])
+def push_unsubscribe():
+    """Mark a subscription inactive (we keep the row for audit)."""
+    try:
+        body = flask_request.get_json(force=True, silent=True) or {}
+        endpoint = (body.get("endpoint") or "").strip()
+        if not endpoint:
+            return jsonify({"ok": False, "error": "missing_endpoint"}), 400
+        with _db() as conn:
+            conn.execute(
+                "UPDATE push_subscriptions SET active = 0 WHERE endpoint = ?",
+                (endpoint,)
+            )
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.error(f"push_unsubscribe error: {e}")
+        return jsonify({"ok": False, "error": "server_error"}), 500
+
+
+# ── pywebpush send helper ───────────────────────────────────────────────────
+# Wraps the actual HTTP call to the push service (FCM / APNs / Mozilla / etc.)
+# behind a stable API. Returns (ok, status_code, error_str).
+def _push_send_one(endpoint: str, p256dh: str, auth_k: str,
+                   payload: dict) -> tuple[bool, int, str]:
+    if not _PYWEBPUSH_AVAILABLE or not _push_configured():
+        return False, 0, "push_unavailable"
+    try:
+        webpush(
+            subscription_info={
+                "endpoint": endpoint,
+                "keys": {"p256dh": p256dh, "auth": auth_k},
+            },
+            data=json.dumps(payload),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims={"sub": VAPID_CONTACT_EMAIL},
+            ttl=900,  # 15 min — picks go stale fast
+        )
+        return True, 201, ""
+    except WebPushException as we:  # type: ignore
+        status = getattr(we.response, "status_code", 0) if getattr(we, "response", None) else 0
+        return False, status, str(we)[:200]
+    except Exception as e:
+        return False, 0, str(e)[:200]
+
+
+# ── Per-locale notification copy ────────────────────────────────────────────
+_PUSH_LOCALE_COPY = {
+    "en":    {"new_pick": "New pick", "edge": "edge", "min": "min"},
+    "br":    {"new_pick": "Novo palpite", "edge": "edge", "min": "min"},
+    "pt-br": {"new_pick": "Novo palpite", "edge": "edge", "min": "min"},
+    "pt-pt": {"new_pick": "Nova pick", "edge": "edge", "min": "min"},
+    "es":    {"new_pick": "Nuevo pick", "edge": "edge", "min": "min"},
+}
+
+
+def _broadcast_push_pick(match: dict, pick: dict, minute: int | None) -> None:
+    """
+    Fan-out a new pick to all active push subscribers.
+    Called from _broadcast_pick alongside SSE / Telegram / X fan-out.
+    No-ops cleanly if push is not configured.
+    """
+    if not _push_configured() or not _PYWEBPUSH_AVAILABLE:
+        return
+    try:
+        home = match.get("homeTeam", "")
+        away = match.get("awayTeam", "")
+        market = pick.get("market", "")
+        label = pick.get("label", "")
+        odds = pick.get("odds") or 0
+        edge = pick.get("edge") or 0
+        match_id = match.get("id") or match.get("match_id")
+        flag = _country_flag(match.get("country", ""))
+        min_str = f" · {minute}'" if minute is not None else ""
+
+        # Body shared across locales (numbers + team names are language-agnostic).
+        body_core = f"{home} vs {away}{min_str}\n{market}: {label} @ {odds:.2f} · +{edge:.1f}%"
+
+        # Build per-locale payload variants.
+        payloads_by_lang = {}
+        for lang, copy in _PUSH_LOCALE_COPY.items():
+            payloads_by_lang[lang] = {
+                "title": f"{flag} {copy['new_pick']}",
+                "body":  body_core,
+                "url":   f"/match/{match_id}" if match_id else "/",
+                "tag":   f"pick-{match_id}",
+            }
+        default_payload = payloads_by_lang["en"]
+
+        # Load active subs.
+        with _db() as conn:
+            rows = conn.execute("""
+                SELECT id, endpoint, p256dh, auth, locale
+                FROM push_subscriptions
+                WHERE active = 1
+            """).fetchall()
+
+        if not rows:
+            return
+
+        sent = 0
+        failed = 0
+        purged = 0
+        now_ts = int(time.time())
+        for sub_id, endpoint, p256dh, auth_k, locale in rows:
+            payload = payloads_by_lang.get((locale or "en").lower(), default_payload)
+            ok, status, err = _push_send_one(endpoint, p256dh, auth_k, payload)
+            if ok:
+                sent += 1
+                try:
+                    with _db() as conn:
+                        conn.execute("""
+                            UPDATE push_subscriptions
+                            SET send_count = send_count + 1, last_sent_at = ?
+                            WHERE id = ?
+                        """, (now_ts, sub_id))
+                except Exception:
+                    pass
+            else:
+                failed += 1
+                # 404/410 = gone, mark inactive permanently.
+                if status in (404, 410):
+                    purged += 1
+                    try:
+                        with _db() as conn:
+                            conn.execute(
+                                "UPDATE push_subscriptions SET active = 0 WHERE id = ?",
+                                (sub_id,)
+                            )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        with _db() as conn:
+                            conn.execute("""
+                                UPDATE push_subscriptions
+                                SET fail_count = fail_count + 1
+                                WHERE id = ?
+                            """, (sub_id,))
+                    except Exception:
+                        pass
+        log.info(f"push fan-out: sent={sent} failed={failed} purged={purged} total={len(rows)}")
+    except Exception as e:
+        log.error(f"_broadcast_push_pick error: {e}")
+
+
+@app.route("/api/admin/push/test", methods=["POST"])
+def push_admin_test():
+    """
+    Admin-only: send a test push to all active subscribers (or a single endpoint
+    if `endpoint` is provided in the JSON body).
+    """
+    if not _check_admin_auth():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if not _push_configured():
+        return jsonify({"ok": False, "error": "push_not_configured"}), 503
+    body = flask_request.get_json(force=True, silent=True) or {}
+    target_endpoint = (body.get("endpoint") or "").strip() or None
+    title = body.get("title") or "WebPronos test"
+    msg   = body.get("body")  or "If you see this, push works ✅"
+    payload = {"title": title, "body": msg, "url": "/", "tag": "wp-test"}
+
+    with _db() as conn:
+        if target_endpoint:
+            rows = conn.execute("""
+                SELECT id, endpoint, p256dh, auth FROM push_subscriptions
+                WHERE active = 1 AND endpoint = ?
+            """, (target_endpoint,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT id, endpoint, p256dh, auth FROM push_subscriptions
+                WHERE active = 1
+            """).fetchall()
+
+    sent, failed = 0, 0
+    for _id, endpoint, p256dh, auth_k in rows:
+        ok, status, err = _push_send_one(endpoint, p256dh, auth_k, payload)
+        if ok: sent += 1
+        else:  failed += 1
+    return jsonify({"ok": True, "sent": sent, "failed": failed, "total": len(rows)})
+
+
+@app.route("/api/admin/push/stats", methods=["GET"])
+def push_admin_stats():
+    """Admin-only: show subscription counts by status."""
+    if not _check_admin_auth():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    with _db() as conn:
+        active = conn.execute(
+            "SELECT COUNT(*) FROM push_subscriptions WHERE active = 1"
+        ).fetchone()[0]
+        inactive = conn.execute(
+            "SELECT COUNT(*) FROM push_subscriptions WHERE active = 0"
+        ).fetchone()[0]
+        by_locale = conn.execute("""
+            SELECT locale, COUNT(*) FROM push_subscriptions
+            WHERE active = 1 GROUP BY locale
+        """).fetchall()
+    return jsonify({
+        "ok":          True,
+        "active":      active,
+        "inactive":    inactive,
+        "by_locale":   {(l or "en"): n for l, n in by_locale},
+        "configured":  _push_configured(),
+        "pywebpush":   _PYWEBPUSH_AVAILABLE,
+    })
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  In-app Sofascore watchdog + auto-failover
+# ════════════════════════════════════════════════════════════════════════════
+# Replaces the GitHub Actions-based watchdog whose */30 cron was being
+# throttled to ~2h gaps on the free tier (real-world: 2026-05-22 incident
+# where Sofascore blocked the bom region between 18:14 UTC and ~20:18 UTC
+# and no GH Actions run fired in that window).
+#
+# Architecture:
+#   • APScheduler job every 5 min calls _failover_probe() — a curl_cffi call
+#     to Sofascore's /events/live endpoint from inside this machine.
+#   • In-memory counter `_FAILOVER_STATE['consecutive_failures']` increments
+#     on HTTP != 200 (403/429/timeout). Resets to 0 on first success.
+#   • After 3 consecutive failures (~15 min of confirmed block) AND the
+#     last failover was > 30 min ago, fire _failover_execute(target_region).
+#   • _failover_execute uses the Fly Machines REST API + GraphQL to:
+#       1. Get our own machine_id + region + volume_id (via REST)
+#       2. Pick next region from FAILOVER_REGION_POOL (excluding current)
+#       3. Fork our volume to target region (GraphQL `forkVolume` mutation)
+#       4. Clone our machine to target region with the forked volume attached
+#       5. Poll new machine until its /api/health/sofascore returns healthy
+#       6. Telegram alert + write to failover_audit table
+#       7. Destroy current machine (this kills the process executing this!)
+#
+# Safety guards:
+#   • 30-min cooldown between failovers (prevent loops on flaky regions)
+#   • Region pool excludes the current region (no self-migrate no-op)
+#   • If fork or clone API call fails, abort + alert (no destroy)
+#   • Manual trigger via /api/admin/failover/trigger?to=lhr (admin-token-gated)
+#
+# Required Fly secret:
+#   FLY_API_TOKEN  — deploy-scoped token for this app (api.machines.dev +
+#                    api.fly.io/graphql access). Created with
+#                    `fly tokens create deploy --app livexgmodel-pt`.
+
+FLY_API_TOKEN = os.environ.get("FLY_API_TOKEN", "")
+FLY_APP_NAME  = os.environ.get("FLY_APP_NAME", "livexgmodel-pt")
+
+# Priority-ordered candidate regions. First reachable + Sofascore-unblocked
+# wins. Excludes the current region at runtime. Europe-first because most
+# users are EU; falls back to NA/global if Cloudflare blocks the whole EU.
+FAILOVER_REGION_POOL = ["lhr", "ams", "cdg", "fra", "dub", "arn",
+                        "mad", "ewr", "iad", "yyz", "sjc"]
+
+# In-memory state. Lives only in this process — reset on every machine
+# restart. The failover_audit SQLite table persists the historical record.
+_FAILOVER_STATE: dict = {
+    "consecutive_failures":  0,
+    "last_probe_ts":         0,
+    "last_probe_status":     None,   # "ok" / "blocked" / "error"
+    "last_probe_http":       0,
+    "last_failover_ts":      0,
+    "currently_failing_over": False,
+}
+_FAILOVER_LOCK = threading.Lock()
+
+# Cooldown so we never fire two failovers back-to-back.
+FAILOVER_COOLDOWN_S = 1800          # 30 min
+FAILOVER_FAILURE_THRESHOLD = 3       # 3 × 5 min = ~15 min sustained block
+
+
+def _failover_probe() -> tuple[bool, int, str]:
+    """
+    Probe Sofascore from this machine using curl_cffi + chrome fingerprint
+    (same setup as the scraper, so this proves end-to-end reachability).
+    Returns (ok, http_status, error_or_empty).
+    """
+    try:
+        from curl_cffi import requests as crq  # type: ignore
+        r = crq.get(
+            "https://api.sofascore.com/api/v1/sport/football/events/live",
+            impersonate="chrome120",
+            timeout=15,
+        )
+        return (r.status_code == 200, r.status_code, "")
+    except Exception as e:
+        return (False, 0, type(e).__name__ + ": " + str(e)[:120])
+
+
+# ── Fly API wrappers ────────────────────────────────────────────────────────
+# We use 2 endpoints:
+#   • Machines REST API (api.machines.dev) for list/clone/destroy machines
+#   • GraphQL (api.fly.io/graphql) for volume fork (no REST endpoint exists
+#     for fork as of 2026).
+def _fly_rest(method: str, path: str, body: dict | None = None,
+              timeout: int = 30) -> tuple[int, dict | str]:
+    """REST call to api.machines.dev. Returns (status, parsed_json_or_text)."""
+    if not FLY_API_TOKEN:
+        return (0, "FLY_API_TOKEN not configured")
+    import urllib.request as _u
+    import urllib.error as _ue
+    url = f"https://api.machines.dev/v1{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = _u.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {FLY_API_TOKEN}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+    })
+    try:
+        with _u.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            try:
+                return (r.status, json.loads(raw) if raw else {})
+            except Exception:
+                return (r.status, raw)
+    except _ue.HTTPError as e:
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+            return (e.code, json.loads(raw) if raw else {"error": str(e)})
+        except Exception:
+            return (e.code, {"error": str(e)})
+    except Exception as e:
+        return (0, {"error": str(e)})
+
+
+def _fly_graphql(query: str, variables: dict | None = None,
+                 timeout: int = 30) -> tuple[int, dict]:
+    """GraphQL call to api.fly.io. Returns (status, parsed_json)."""
+    if not FLY_API_TOKEN:
+        return (0, {"error": "FLY_API_TOKEN not configured"})
+    import urllib.request as _u
+    import urllib.error as _ue
+    body = json.dumps({"query": query, "variables": variables or {}}).encode()
+    req = _u.Request("https://api.fly.io/graphql", data=body, method="POST",
+                     headers={
+                         "Authorization": f"Bearer {FLY_API_TOKEN}",
+                         "Content-Type":  "application/json",
+                     })
+    try:
+        with _u.urlopen(req, timeout=timeout) as r:
+            return (r.status, json.loads(r.read()))
+    except _ue.HTTPError as e:
+        try:
+            return (e.code, json.loads(e.read()))
+        except Exception:
+            return (e.code, {"error": str(e)})
+    except Exception as e:
+        return (0, {"error": str(e)})
+
+
+def _fly_current_machine() -> dict | None:
+    """
+    Return {id, region, image, name, mount_path, volume_id} for the machine
+    running this code, or None if undetectable. Uses Fly's FLY_MACHINE_ID
+    env var (set by Fly on every machine) + cross-references the list API
+    to get volume + region.
+    """
+    my_id = os.environ.get("FLY_MACHINE_ID", "")
+    if not my_id:
+        return None
+    status, data = _fly_rest("GET", f"/apps/{FLY_APP_NAME}/machines")
+    if status != 200 or not isinstance(data, list):
+        return None
+    me = next((m for m in data if m.get("id") == my_id), None)
+    if not me:
+        return None
+    cfg = me.get("config") or {}
+    mounts = cfg.get("mounts") or []
+    mount = mounts[0] if mounts else {}
+    return {
+        "id":         my_id,
+        "name":       me.get("name"),
+        "region":     me.get("region"),
+        "image":      cfg.get("image"),
+        "mount_path": mount.get("path") or "/data",
+        "volume_id":  mount.get("volume"),
+    }
+
+
+def _fly_fork_volume(source_volume_id: str, target_region: str,
+                     name: str) -> tuple[str | None, str]:
+    """
+    Fork a volume into target_region via GraphQL. Returns (new_volume_id, error).
+    """
+    # The mutation name is `forkVolume` on api.fly.io/graphql.
+    query = """
+    mutation ForkVolume($input: ForkVolumeInput!) {
+      forkVolume(input: $input) {
+        volume { id name region sizeGb }
+      }
+    }
+    """
+    # Resolve the app's GraphQL ID. The Fly GraphQL API requires the app's
+    # GraphQL ID (not the slug) for some mutations — but forkVolume accepts
+    # source volume ID directly which carries app context.
+    variables = {
+        "input": {
+            "sourceVolId": source_volume_id,
+            "destinationRegion": target_region,
+            "name": name,
+            "machinesOnly": True,
+        }
+    }
+    status, data = _fly_graphql(query, variables, timeout=120)
+    if status != 200:
+        return (None, f"http={status} body={str(data)[:200]}")
+    errors = data.get("errors") or []
+    if errors:
+        return (None, f"gql_errors={str(errors)[:300]}")
+    vid = (((data.get("data") or {}).get("forkVolume") or {})
+           .get("volume") or {}).get("id")
+    if not vid:
+        return (None, f"no_id_in_response={str(data)[:200]}")
+    return (vid, "")
+
+
+def _fly_clone_machine(source_machine_id: str, target_region: str,
+                       attach_volume_id: str, mount_path: str) -> tuple[str | None, str]:
+    """
+    Create a new machine in target_region by copying the source's config and
+    attaching the given (already-forked) volume. Returns (new_machine_id, err).
+    """
+    # Fetch source machine's full config so we replicate identically.
+    status, src = _fly_rest("GET", f"/apps/{FLY_APP_NAME}/machines/{source_machine_id}")
+    if status != 200 or not isinstance(src, dict):
+        return (None, f"get_source_failed http={status} body={str(src)[:200]}")
+    src_cfg = src.get("config") or {}
+    # Replace mounts with the forked volume.
+    new_cfg = dict(src_cfg)
+    new_cfg["mounts"] = [{
+        "volume": attach_volume_id,
+        "path":   mount_path,
+    }]
+    body = {
+        "region": target_region,
+        "config": new_cfg,
+        # name omitted → Fly auto-generates a unique haiku name
+    }
+    status, data = _fly_rest("POST", f"/apps/{FLY_APP_NAME}/machines",
+                              body=body, timeout=60)
+    if status not in (200, 201):
+        return (None, f"clone_failed http={status} body={str(data)[:300]}")
+    new_id = (data or {}).get("id") if isinstance(data, dict) else None
+    if not new_id:
+        return (None, f"no_id_in_response={str(data)[:200]}")
+    return (new_id, "")
+
+
+def _fly_destroy_machine(machine_id: str) -> tuple[bool, str]:
+    """Stop + delete a machine. Returns (ok, error)."""
+    # Stop first (best-effort).
+    _fly_rest("POST", f"/apps/{FLY_APP_NAME}/machines/{machine_id}/stop",
+              timeout=20)
+    time.sleep(3)
+    status, data = _fly_rest("DELETE",
+                              f"/apps/{FLY_APP_NAME}/machines/{machine_id}?force=true",
+                              timeout=20)
+    if status in (200, 204):
+        return (True, "")
+    return (False, f"http={status} body={str(data)[:200]}")
+
+
+def _failover_wait_new_machine_healthy(timeout_s: int = 240) -> bool:
+    """
+    Poll our public /api/health/sofascore until it reports healthy=True with
+    a recent cycle. Used after a clone to confirm the new machine is alive
+    AND its scrape is unblocked. Returns True on success, False on timeout.
+    """
+    import urllib.request as _u
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with _u.urlopen("https://livexgmodel-pt.fly.dev/api/health/sofascore",
+                            timeout=10) as r:
+                body = json.loads(r.read())
+                if body.get("healthy") is True:
+                    return True
+        except Exception:
+            pass
+        time.sleep(8)
+    return False
+
+
+def _failover_alert(text: str) -> None:
+    """Send Telegram alert to admin chat (best-effort)."""
+    try:
+        admin_chat = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "")
+        if admin_chat and TELEGRAM_BOT_TOKEN:
+            _send_telegram(text, chat_id=int(admin_chat))
+    except Exception as e:
+        log.warning(f"_failover_alert failed: {e}")
+
+
+def _failover_audit(started_at: int, from_region: str, to_region: str,
+                    reason: str, status: str,
+                    new_machine_id: str | None = None,
+                    new_volume_id: str | None = None,
+                    error: str | None = None) -> None:
+    """Persist a failover attempt to the audit table."""
+    try:
+        with _db() as conn:
+            conn.execute("""
+                INSERT INTO failover_audit
+                  (started_at, finished_at, from_region, to_region, reason,
+                   status, new_machine_id, new_volume_id, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (started_at, int(time.time()), from_region, to_region,
+                  reason, status, new_machine_id, new_volume_id, error))
+    except Exception as e:
+        log.warning(f"_failover_audit insert failed: {e}")
+
+
+def _failover_execute(target_region: str | None = None,
+                      reason: str = "auto: 3 consecutive probe failures") -> dict:
+    """
+    Execute the full failover dance. Synchronous — the calling thread will
+    likely be killed (along with the machine) at the very end.
+    Returns a dict with the outcome, but caller may never see it.
+    """
+    with _FAILOVER_LOCK:
+        if _FAILOVER_STATE.get("currently_failing_over"):
+            return {"ok": False, "error": "already_in_progress"}
+        _FAILOVER_STATE["currently_failing_over"] = True
+
+    started_at = int(time.time())
+    try:
+        if not FLY_API_TOKEN:
+            err = "FLY_API_TOKEN not configured"
+            _failover_audit(started_at, "?", target_region or "?", reason,
+                            "failed", error=err)
+            _failover_alert(f"🔴 Auto-failover ABORTED — {err}")
+            return {"ok": False, "error": err}
+
+        me = _fly_current_machine()
+        if not me:
+            err = "could not detect current machine via Fly API"
+            _failover_audit(started_at, "?", target_region or "?", reason,
+                            "failed", error=err)
+            _failover_alert(f"🔴 Auto-failover ABORTED — {err}")
+            return {"ok": False, "error": err}
+
+        cur_region = me["region"]
+        cur_machine = me["id"]
+        cur_volume = me["volume_id"]
+        mount_path = me["mount_path"]
+
+        if not target_region:
+            target_region = next((r for r in FAILOVER_REGION_POOL
+                                  if r != cur_region), None)
+        if not target_region or target_region == cur_region:
+            err = f"no candidate region (cur={cur_region}, target={target_region})"
+            _failover_audit(started_at, cur_region, target_region or "?",
+                            reason, "failed", error=err)
+            _failover_alert(f"🔴 Auto-failover ABORTED — {err}")
+            return {"ok": False, "error": err}
+
+        log.warning(f"[failover] STARTING {cur_region} → {target_region} "
+                    f"(machine={cur_machine}, volume={cur_volume})")
+        _failover_alert(
+            f"⚠️ <b>Auto-failover STARTED</b>\n"
+            f"From: <code>{cur_region}</code> → <code>{target_region}</code>\n"
+            f"Reason: {reason}\n"
+            f"Machine: <code>{cur_machine}</code>\n"
+            f"Volume: <code>{cur_volume}</code>"
+        )
+
+        # 1. Fork volume
+        new_vol, fork_err = _fly_fork_volume(
+            source_volume_id=cur_volume,
+            target_region=target_region,
+            name=f"tips_data_{target_region}",
+        )
+        if not new_vol:
+            err = f"fork_volume failed: {fork_err}"
+            _failover_audit(started_at, cur_region, target_region, reason,
+                            "failed", error=err)
+            _failover_alert(f"🔴 Auto-failover FAILED at fork — {err}")
+            return {"ok": False, "error": err}
+        log.warning(f"[failover] forked volume → {new_vol}")
+
+        # 2. Clone machine with new volume attached
+        new_mid, clone_err = _fly_clone_machine(
+            source_machine_id=cur_machine,
+            target_region=target_region,
+            attach_volume_id=new_vol,
+            mount_path=mount_path,
+        )
+        if not new_mid:
+            err = f"clone_machine failed: {clone_err}"
+            _failover_audit(started_at, cur_region, target_region, reason,
+                            "failed", new_volume_id=new_vol, error=err)
+            _failover_alert(f"🔴 Auto-failover FAILED at clone — {err}")
+            return {"ok": False, "error": err}
+        log.warning(f"[failover] cloned machine → {new_mid}")
+
+        # 3. Wait for new machine to report healthy via the public health URL
+        healthy = _failover_wait_new_machine_healthy(timeout_s=240)
+        if not healthy:
+            err = "new machine never reported healthy within 4 min"
+            _failover_audit(started_at, cur_region, target_region, reason,
+                            "failed", new_machine_id=new_mid,
+                            new_volume_id=new_vol, error=err)
+            _failover_alert(
+                f"🔴 Auto-failover FAILED — new machine in {target_region} "
+                f"never went healthy. Manual cleanup needed:\n"
+                f"machine: <code>{new_mid}</code>\nvolume: <code>{new_vol}</code>"
+            )
+            return {"ok": False, "error": err}
+        log.warning(f"[failover] new machine healthy")
+
+        # 4. Success — record + alert BEFORE we destroy ourselves
+        _failover_audit(started_at, cur_region, target_region, reason,
+                        "success", new_machine_id=new_mid,
+                        new_volume_id=new_vol)
+        _FAILOVER_STATE["last_failover_ts"] = int(time.time())
+        _failover_alert(
+            f"✅ <b>Auto-failover SUCCESS</b>\n"
+            f"{cur_region} → {target_region}\n"
+            f"New machine: <code>{new_mid}</code>\n"
+            f"New volume: <code>{new_vol}</code>\n"
+            f"Destroying old machine <code>{cur_machine}</code> now..."
+        )
+
+        # 5. Destroy self (this kills the process — code after may not run)
+        time.sleep(2)
+        _fly_destroy_machine(cur_machine)
+        return {"ok": True, "new_machine": new_mid, "new_volume": new_vol}
+
+    except Exception as e:
+        log.error(f"_failover_execute fatal: {e}", exc_info=True)
+        _failover_audit(started_at, "?", target_region or "?", reason,
+                        "failed", error=str(e)[:300])
+        _failover_alert(f"🔴 Auto-failover EXCEPTION — {str(e)[:200]}")
+        return {"ok": False, "error": str(e)}
+    finally:
+        with _FAILOVER_LOCK:
+            _FAILOVER_STATE["currently_failing_over"] = False
+
+
+def _failover_probe_job():
+    """
+    APScheduler entry-point. Probes Sofascore. Increments/resets counters.
+    Fires a failover when threshold is hit and cooldown is over.
+    Safe to run from any worker — uses an in-process lock to avoid
+    duplicate fires within the same machine.
+    """
+    try:
+        ok, http, err = _failover_probe()
+        now_ts = int(time.time())
+        with _FAILOVER_LOCK:
+            _FAILOVER_STATE["last_probe_ts"]   = now_ts
+            _FAILOVER_STATE["last_probe_http"] = http
+            if ok:
+                if _FAILOVER_STATE["consecutive_failures"] > 0:
+                    log.info(f"[failover] probe recovered after "
+                             f"{_FAILOVER_STATE['consecutive_failures']} failures")
+                _FAILOVER_STATE["consecutive_failures"] = 0
+                _FAILOVER_STATE["last_probe_status"]    = "ok"
+                return
+            _FAILOVER_STATE["consecutive_failures"] += 1
+            _FAILOVER_STATE["last_probe_status"]     = "blocked" if http in (403,429) else "error"
+            count = _FAILOVER_STATE["consecutive_failures"]
+            last_fo = _FAILOVER_STATE["last_failover_ts"]
+            in_progress = _FAILOVER_STATE["currently_failing_over"]
+
+        log.warning(f"[failover] probe failed #{count} (http={http}, err={err[:80]})")
+
+        # Trigger conditions
+        if count >= FAILOVER_FAILURE_THRESHOLD and not in_progress:
+            cooldown_left = (last_fo + FAILOVER_COOLDOWN_S) - now_ts
+            if cooldown_left > 0:
+                log.warning(f"[failover] threshold hit but cooldown "
+                            f"{cooldown_left}s remaining — skipping")
+                return
+            log.warning(f"[failover] triggering auto-failover "
+                        f"(count={count}, last_http={http})")
+            # Spawn in a background thread so the scheduler tick returns
+            # quickly. The thread will be killed when self-destroy lands.
+            t = threading.Thread(
+                target=_failover_execute,
+                kwargs={"reason": f"auto: {count} consecutive failures (http={http})"},
+                daemon=True,
+            )
+            t.start()
+    except Exception as e:
+        log.error(f"_failover_probe_job error: {e}")
+
+
+@app.route("/api/admin/failover/status", methods=["GET"])
+def r_admin_failover_status():
+    """Admin: current watchdog state + recent audit rows."""
+    if not _check_admin_auth():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        with _db() as conn:
+            rows = conn.execute("""
+                SELECT id, started_at, finished_at, from_region, to_region,
+                       reason, status, new_machine_id, new_volume_id,
+                       error_message
+                FROM failover_audit
+                ORDER BY id DESC LIMIT 20
+            """).fetchall()
+            audit = [dict(r) for r in rows]
+    except Exception:
+        audit = []
+    me = _fly_current_machine() or {}
+    return jsonify({
+        "ok":         True,
+        "configured": bool(FLY_API_TOKEN),
+        "current": {
+            "machine_id": me.get("id"),
+            "region":     me.get("region"),
+            "volume_id":  me.get("volume_id"),
+        },
+        "state":  _FAILOVER_STATE,
+        "thresholds": {
+            "failure_count":   FAILOVER_FAILURE_THRESHOLD,
+            "cooldown_s":      FAILOVER_COOLDOWN_S,
+            "region_pool":     FAILOVER_REGION_POOL,
+        },
+        "audit":  audit,
+    })
+
+
+@app.route("/api/admin/failover/trigger", methods=["POST"])
+def r_admin_failover_trigger():
+    """
+    Admin: manually trigger a failover. Bypasses the threshold + cooldown.
+    Optional JSON body: {"to": "ams"}. If omitted, picks next region.
+    """
+    if not _check_admin_auth():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = flask_request.get_json(force=True, silent=True) or {}
+    target = (body.get("to") or "").strip().lower() or None
+    # Run synchronously so the admin sees the outcome in the HTTP response —
+    # but the destroy-self step will likely cut the response short.
+    out = _failover_execute(target_region=target,
+                            reason=f"manual via admin trigger (target={target})")
+    return jsonify(out)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  inbet.io membership-status sync + Telegram fan-out
 # ════════════════════════════════════════════════════════════════════════════
 # All endpoints in this block authenticate with the shared secret
@@ -12411,22 +16055,30 @@ def _check_inbet_sync_auth() -> bool:
     return header_val == INBET_SYNC_SECRET
 
 
-def _send_inbet_telegram(text: str, chat_id: int) -> bool:
+def _send_inbet_telegram(text: str, chat_id: int,
+                         buttons: list | None = None) -> bool:
     """
     Send a Telegram message via the DEDICATED inbet bot (NOT the WebPronos bot).
     Uses INBET_BOT_TOKEN. Returns True on 2xx response, False otherwise.
+
+    `buttons` (optional) is an inline_keyboard structure — a list of rows where
+    each row is a list of {text, callback_data|url} dicts. Used for the
+    language picker and any future quick-action UIs.
     """
     if not INBET_BOT_TOKEN:
         log.warning("_send_inbet_telegram: INBET_BOT_TOKEN not configured, skipping")
         return False
     try:
         url = f"https://api.telegram.org/bot{INBET_BOT_TOKEN}/sendMessage"
-        payload = json.dumps({
+        body: dict = {
             "chat_id":                chat_id,
             "text":                   text,
             "parse_mode":             "HTML",
             "disable_web_page_preview": True,
-        }).encode()
+        }
+        if buttons:
+            body["reply_markup"] = {"inline_keyboard": buttons}
+        payload = json.dumps(body).encode()
         import urllib.request as _u
         req = _u.Request(url, data=payload, headers={"Content-Type": "application/json"})
         _u.urlopen(req, timeout=10)
@@ -12434,6 +16086,53 @@ def _send_inbet_telegram(text: str, chat_id: int) -> bool:
     except Exception as e:
         log.error(f"_send_inbet_telegram failed for chat {chat_id}: {e}")
         return False
+
+
+def _answer_inbet_callback(callback_query_id: str, text: str = "") -> None:
+    """Acknowledge a callback_query so the loading spinner clears on the user's
+    side. Safe to call without text. No-op if token isn't configured."""
+    if not INBET_BOT_TOKEN:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{INBET_BOT_TOKEN}/answerCallbackQuery"
+        payload = json.dumps({
+            "callback_query_id": callback_query_id,
+            "text":              text,
+        }).encode()
+        import urllib.request as _u
+        req = _u.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        _u.urlopen(req, timeout=5)
+    except Exception as e:
+        log.warning(f"_answer_inbet_callback failed: {e}")
+
+
+# ── Language picker ─────────────────────────────────────────────────────────
+# Same 4 codes the rest of the site uses. Sent as inline buttons after /start
+# and on /lang. Tapping a button sets inbet_subscribers.locale for that chat.
+_INBET_LANG_BUTTONS = [
+    [
+        {"text": "🇬🇧 English",    "callback_data": "lang:en"},
+        {"text": "🇪🇸 Español",    "callback_data": "lang:es"},
+    ],
+    [
+        {"text": "🇵🇹 Português",  "callback_data": "lang:pt-pt"},
+        {"text": "🇧🇷 Brasileiro", "callback_data": "lang:pt-br"},
+    ],
+]
+
+_INBET_LANG_PROMPT = {
+    "en":    "🌐 Choose your language for pick alerts:",
+    "es":    "🌐 Elige tu idioma para los avisos de picks:",
+    "pt-pt": "🌐 Escolhe o teu idioma para os alertas de picks:",
+    "pt-br": "🌐 Escolha seu idioma para os alertas de palpites:",
+}
+
+_INBET_LANG_CONFIRMED = {
+    "en":    "✅ Language set to English.",
+    "es":    "✅ Idioma cambiado a Español.",
+    "pt-pt": "✅ Idioma alterado para Português.",
+    "pt-br": "✅ Idioma alterado para Português (BR).",
+}
 
 
 def _broadcast_inbet_pick(match: dict, pick: dict, minute: int | None):
@@ -12696,6 +16395,32 @@ def r_inbet_telegram_webhook():
     """
     try:
         update = flask_request.get_json(force=True) or {}
+
+        # ── callback_query (inline button tap) ──────────────────────────────
+        # Used by the language picker. Format: callback_data="lang:<code>".
+        cb = update.get("callback_query")
+        if cb:
+            cb_id   = cb.get("id")
+            cb_data = (cb.get("data") or "").strip()
+            cb_chat = ((cb.get("message") or {}).get("chat") or {}).get("id")
+            if cb_id and cb_chat and cb_data.startswith("lang:"):
+                new_lang = cb_data.split(":", 1)[1].strip().lower()
+                if new_lang in ("en", "es", "pt-pt", "pt-br"):
+                    now_ts = int(time.time())
+                    with _db() as conn:
+                        conn.execute(
+                            "UPDATE inbet_subscribers SET locale = ?, "
+                            "status_checked_at = ? WHERE chat_id = ?",
+                            (new_lang, now_ts, cb_chat),
+                        )
+                    _answer_inbet_callback(cb_id, _INBET_LANG_CONFIRMED[new_lang])
+                    _send_inbet_telegram(_INBET_LANG_CONFIRMED[new_lang], cb_chat)
+                else:
+                    _answer_inbet_callback(cb_id, "Invalid language")
+            else:
+                _answer_inbet_callback(cb_id or "", "")
+            return jsonify({"ok": True})
+
         msg = update.get("message") or update.get("edited_message") or {}
         chat = msg.get("chat") or {}
         chat_id = chat.get("id")
@@ -12743,6 +16468,51 @@ def r_inbet_telegram_webhook():
                     "pt-br": "✅ Vinculado! Você vai receber picks ao vivo durante a Copa.",
                 }
                 _send_inbet_telegram(replies.get(locale, replies["en"]), chat_id)
+            # Always offer the language picker after /start — locale from inbet
+            # may be wrong (member preference can differ from account default).
+            # User can confirm or override with a single tap.
+            _send_inbet_telegram(
+                _INBET_LANG_PROMPT.get(status["locale"], _INBET_LANG_PROMPT["en"]),
+                chat_id,
+                buttons=_INBET_LANG_BUTTONS,
+            )
+            return jsonify({"ok": True})
+
+        # /lang [<code>]
+        # Either bare /lang → show the 4-button picker, or /lang en|es|pt-pt|pt-br
+        # → set directly. Both update inbet_subscribers.locale for this chat_id.
+        if text.startswith("/lang"):
+            parts = text.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+            # Look up current locale so the prompt itself is localised.
+            cur_locale = "en"
+            try:
+                with _db() as conn:
+                    row = conn.execute(
+                        "SELECT locale FROM inbet_subscribers WHERE chat_id = ?",
+                        (chat_id,),
+                    ).fetchone()
+                    if row and row["locale"]:
+                        cur_locale = row["locale"]
+            except Exception:
+                pass
+
+            if arg in ("en", "es", "pt-pt", "pt-br"):
+                now_ts = int(time.time())
+                with _db() as conn:
+                    conn.execute(
+                        "UPDATE inbet_subscribers SET locale = ?, "
+                        "status_checked_at = ? WHERE chat_id = ?",
+                        (arg, now_ts, chat_id),
+                    )
+                _send_inbet_telegram(_INBET_LANG_CONFIRMED[arg], chat_id)
+            else:
+                _send_inbet_telegram(
+                    _INBET_LANG_PROMPT.get(cur_locale, _INBET_LANG_PROMPT["en"]),
+                    chat_id,
+                    buttons=_INBET_LANG_BUTTONS,
+                )
             return jsonify({"ok": True})
 
         if text.startswith("/stop"):
@@ -12974,6 +16744,11 @@ def r_admin_debug_daily_summary():
 
 SUPABASE_URL  = os.environ.get("SUPABASE_URL", "https://lcugjwhcmtpdoernjgei.supabase.co")
 SUPABASE_ANON = os.environ.get("SUPABASE_ANON_KEY", "")
+# Service-role key — bypasses RLS. Optional in this setup because
+# `tips_archive` runs with RLS DISABLED (see SQL migration comment for
+# rationale). If a service-role key happens to be set we'll use it for
+# writes, but anon works fine too.
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_ANON)
 SITE_URL      = os.environ.get("SITE_URL", "https://webpronos.com")
 # Public base URL of THIS Flask backend — used to build links to /api/*
 # routes that the Lovable frontend (different origin) consumes. The
@@ -13027,16 +16802,24 @@ def _supabase_get_seo_override(match_id: int) -> dict | None:
         return None
 
 
-def _build_meta_tags(match: dict, odds: dict | None, override: dict | None) -> dict:
-    """Generate SEO meta fields for a match page."""
+def _build_meta_tags(match: dict, odds: dict | None, override: dict | None,
+                      locale: str = "en") -> dict:
+    """Generate SEO meta fields for a match page.
+
+    Locale-aware: when locale is "pt-br" we use Brazilian vocabulary
+    ("palpites" instead of "tips", "x" instead of "vs", localized league
+    name). Other locales fall back to EN until translations are added.
+    """
     home   = match.get("homeTeam", "Home")
     away   = match.get("awayTeam", "Away")
     tourn  = match.get("tournament", "")
+    tourn_loc = _localized_league_name(tourn, locale)
+    sep    = _matchup_separator(locale)
+    matchup = f"{home}{sep}{away}"
     status = match.get("statusType", "notstarted")
     h_gls  = match.get("homeGoals", 0) or 0
     a_gls  = match.get("awayGoals", 0) or 0
 
-    # Build title (English — primary language)
     # SEO STABILITY RULE: title/description MUST stay identical from
     # creation (48h pre-kickoff) through the end of the live game.
     # Only `finished` status changes the meta — once the result is set,
@@ -13044,30 +16827,89 @@ def _build_meta_tags(match: dict, odds: dict | None, override: dict | None) -> d
     # never change again. This protects Google's cached snippet.
     if override and override.get("meta_title"):
         title = override["meta_title"]
-    elif status == "finished":
-        title = f"{home} {h_gls}–{a_gls} {away} – Final Result & xG Analysis | {SITE_NAME}"
+    elif locale == "pt-br":
+        if status == "finished":
+            title = f"{home} {h_gls}–{a_gls} {away} – Resultado Final & Análise xG | {SITE_NAME}"
+        else:
+            tourn_part = f" ({tourn_loc})" if tourn_loc else ""
+            title = f"{matchup}{tourn_part} – Palpites & Previsões xG | {SITE_NAME}"
+    elif locale == "pt-pt":
+        # PT-PT keeps "Palpites" (also the main PT search keyword) but
+        # uses " vs " (not " x "), "Análise" (not "Análise"), "Golos"
+        # (not "Gols"), and the European Portuguese phrasings.
+        if status == "finished":
+            title = f"{home} {h_gls}–{a_gls} {away} – Resultado Final & Análise xG | {SITE_NAME}"
+        else:
+            tourn_part = f" ({tourn_loc})" if tourn_loc else ""
+            title = f"{matchup}{tourn_part} – Palpites & Previsões xG | {SITE_NAME}"
+    elif locale == "es":
+        if status == "finished":
+            title = f"{home} {h_gls}–{a_gls} {away} – Resultado Final & Análisis xG | {SITE_NAME}"
+        else:
+            tourn_part = f" ({tourn_loc})" if tourn_loc else ""
+            title = f"{matchup}{tourn_part} – Pronósticos y Predicciones xG | {SITE_NAME}"
     else:
-        # Identical title for scheduled AND in-progress (no score, no "LIVE")
-        if tourn:
+        # Default EN.
+        if status == "finished":
+            title = f"{home} {h_gls}–{a_gls} {away} – Final Result & xG Analysis | {SITE_NAME}"
+        elif tourn:
             title = f"{home} vs {away} ({tourn}) – Picks & xG Predictions | {SITE_NAME}"
         else:
             title = f"{home} vs {away} – Picks & xG Predictions | {SITE_NAME}"
 
-    # Build description (English — primary language)
     if override and override.get("meta_description"):
         desc = override["meta_description"]
-    elif status == "finished":
-        desc = (
-            f"Full xG analysis for {home} {h_gls}–{a_gls} {away}. "
-            f"Expected Goals, win probabilities and value bets generated by the WebPronos algorithm."
-        )
+    elif locale == "pt-br":
+        if status == "finished":
+            desc = (
+                f"Análise xG completa de {home} {h_gls}–{a_gls} {away}. "
+                f"Gols Esperados, probabilidades de vitória e palpites de "
+                f"valor gerados pelo algoritmo do WebPronos."
+            )
+        else:
+            desc = (
+                f"Previsões xG e palpites de valor para {matchup}"
+                + (f" – {tourn_loc}" if tourn_loc else "")
+                + f". Picks, probabilidades em tempo real e análise do jogo em {SITE_NAME}."
+            )
+    elif locale == "pt-pt":
+        if status == "finished":
+            desc = (
+                f"Análise xG completa de {home} {h_gls}–{a_gls} {away}. "
+                f"Golos Esperados, probabilidades de vitória e palpites de "
+                f"valor gerados pelo algoritmo da WebPronos."
+            )
+        else:
+            desc = (
+                f"Previsões xG e palpites de valor para {matchup}"
+                + (f" – {tourn_loc}" if tourn_loc else "")
+                + f". Picks, probabilidades em tempo real e análise do jogo em {SITE_NAME}."
+            )
+    elif locale == "es":
+        if status == "finished":
+            desc = (
+                f"Análisis xG completo de {home} {h_gls}–{a_gls} {away}. "
+                f"Goles Esperados, probabilidades de victoria y pronósticos de "
+                f"valor generados por el algoritmo de WebPronos."
+            )
+        else:
+            desc = (
+                f"Predicciones xG y pronósticos de valor para {matchup}"
+                + (f" – {tourn_loc}" if tourn_loc else "")
+                + f". Picks, probabilidades en tiempo real y análisis del partido en {SITE_NAME}."
+            )
     else:
-        # Identical description for scheduled AND in-progress
-        desc = (
-            f"xG predictions and value bets for {home} vs {away}"
-            + (f" – {tourn}" if tourn else "")
-            + f". Picks, real-time probabilities and match analysis on {SITE_NAME}."
-        )
+        if status == "finished":
+            desc = (
+                f"Full xG analysis for {home} {h_gls}–{a_gls} {away}. "
+                f"Expected Goals, win probabilities and value bets generated by the WebPronos algorithm."
+            )
+        else:
+            desc = (
+                f"xG predictions and value bets for {home} vs {away}"
+                + (f" – {tourn}" if tourn else "")
+                + f". Picks, real-time probabilities and match analysis on {SITE_NAME}."
+            )
 
     # NOTE: live odds are intentionally NOT appended to the description.
     # Odds drift constantly and would change the meta on every crawl,
@@ -13222,35 +17064,57 @@ def _md_to_html(md: str) -> str:
     return '\n'.join(html_lines)
 
 
-def _supabase_get_blog_post(slug: str) -> dict | None:
-    """Fetch a single blog post from Supabase by slug."""
+def _supabase_get_blog_post(slug: str, lang: str = "en") -> dict | None:
+    """Fetch a single blog post from Supabase by (slug, lang).
+
+    Locale fallback: tries the requested `lang` first; if no row exists
+    for that lang, falls back to EN so non-translated posts remain
+    discoverable. The returned dict is annotated with `_served_lang`
+    and `_requested_lang` so callers (Flask renderer or SPA) can show
+    a "translation not available" banner.
+    """
     if not SUPABASE_ANON:
         return None
     try:
         import urllib.request as _ur, urllib.parse as _up
-        url = (
-            f"{SUPABASE_URL}/rest/v1/blog_posts"
-            f"?slug=eq.{_up.quote(slug)}"
-            f"&select=*"
-            f"&limit=1"
-        )
-        req = _ur.Request(url, headers={
-            "apikey":        SUPABASE_ANON,
-            "Authorization": f"Bearer {SUPABASE_ANON}",
-        })
-        with _ur.urlopen(req, timeout=5) as r:
-            rows = json.loads(r.read())
-            return rows[0] if rows else None
+        # Lang fallback chain — requested first, then EN.
+        chain = (lang,) if lang == "en" else (lang, "en")
+        for try_lang in chain:
+            url = (
+                f"{SUPABASE_URL}/rest/v1/blog_posts"
+                f"?slug=eq.{_up.quote(slug)}"
+                f"&lang=eq.{try_lang}"
+                f"&select=*"
+                f"&limit=1"
+            )
+            req = _ur.Request(url, headers={
+                "apikey":        SUPABASE_ANON,
+                "Authorization": f"Bearer {SUPABASE_ANON}",
+            })
+            with _ur.urlopen(req, timeout=5) as r:
+                rows = json.loads(r.read())
+                if rows:
+                    post = rows[0]
+                    post["_served_lang"]    = try_lang
+                    post["_requested_lang"] = lang
+                    return post
+        return None
     except Exception as e:
         log.warning(f"[prerender/blog] Supabase fetch failed for slug={slug}: {e}")
         return None
 
 
 def _inject_blog_content(html: str, meta: dict, canonical: str, article_html: str,
-                          published_at: str, author: str, jsonld: str) -> str:
+                          published_at: str, author: str, jsonld: str,
+                          locale: str = "en", en_slug: str | None = None) -> str:
     """
     Inject blog meta tags AND full article body into the SPA shell.
     Replaces the <div id="root">...</div> with the rendered article.
+
+    `locale` drives <html lang>, og:locale and the hreflang alternate set.
+    `en_slug` is the EN-canonical slug used to compute hreflangs (each
+    locale gets its own translated blog slug via `_BLOG_SLUG_I18N`). If
+    omitted we just emit hreflang for the current canonical (no alternates).
     """
     import re
 
@@ -13258,6 +17122,8 @@ def _inject_blog_content(html: str, meta: dict, canonical: str, article_html: st
     desc_content = meta["description"].replace('"', '&quot;')
     og_image     = meta.get("og_image", f"{SITE_URL}/og/default.png")
     title_escaped = meta["title"].replace('<', '&lt;').replace('>', '&gt;')
+    html_lang    = _LOCALE_TO_HTML_LANG.get(locale, "en")
+    og_locale    = html_lang.replace('-', '_')
 
     # Strip ALL existing dynamic meta (data-rh="true" tags from react-helmet)
     # They come as one long concatenated line — wipe the entire block
@@ -13268,11 +17134,34 @@ def _inject_blog_content(html: str, meta: dict, canonical: str, article_html: st
     # Replace title tag (may have data-rh attribute)
     html = re.sub(r'<title[^>]*>[^<]*</title>', f'<title>{title_escaped}</title>', html)
 
-    # Strip any remaining og/twitter/canonical tags
+    # Strip any remaining og/twitter/canonical/hreflang/jsonld tags
     html = re.sub(r'<meta\s+(?:property|name)=["\'](?:og:|twitter:)[^"\']*["\'][^>]*/?>',  '', html)
     html = re.sub(r'<meta\s+name=["\']description["\'][^>]*/?>',  '', html)
     html = re.sub(r'<link\s+rel=["\']canonical["\'][^>]*/?>',  '', html)
+    html = re.sub(r'<link\s+rel=["\']alternate["\'][^>]*hreflang=[^>]*/?>', '', html)
     html = re.sub(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>.*?</script>', '', html, flags=re.DOTALL)
+
+    # Overwrite <html lang="..."> in the SPA shell to the active locale.
+    html = re.sub(r'<html\s+[^>]*lang=["\'][^"\']*["\']', f'<html lang="{html_lang}"', html, count=1)
+    if '<html lang=' not in html[:200]:
+        html = re.sub(r'<html(\s*[^>]*)>', f'<html lang="{html_lang}"\\1>', html, count=1)
+
+    # Build hreflang alternates for each locale's translated blog slug.
+    if en_slug:
+        alt_tags = []
+        for loc_code, prefix in _LOCALE_TO_PREFIX.items():
+            slug = _localized_blog_slug(en_slug, loc_code)
+            alt_tags.append(
+                f'<link rel="alternate" hreflang="{loc_code}" '
+                f'href="{SITE_URL}{prefix}/blog/{slug}">'
+            )
+        alt_tags.append(
+            f'<link rel="alternate" hreflang="x-default" '
+            f'href="{SITE_URL}/blog/{en_slug}">'
+        )
+        hreflang_block = "\n    ".join(alt_tags)
+    else:
+        hreflang_block = ""
 
     new_head = (
         f'<meta name="description" content="{desc_content}">\n'
@@ -13281,12 +17170,14 @@ def _inject_blog_content(html: str, meta: dict, canonical: str, article_html: st
         f'    <meta property="og:image" content="{og_image}">\n'
         f'    <meta property="og:url" content="{canonical}">\n'
         f'    <meta property="og:type" content="article">\n'
+        f'    <meta property="og:locale" content="{og_locale}">\n'
         f'    <meta name="twitter:card" content="summary_large_image">\n'
         f'    <meta name="twitter:title" content="{title_escaped}">\n'
         f'    <meta name="twitter:description" content="{desc_content}">\n'
         f'    <meta name="twitter:image" content="{og_image}">\n'
         f'    <link rel="canonical" href="{canonical}">\n'
-        f'    <script type="application/ld+json">{jsonld}</script>'
+        + (f'    {hreflang_block}\n' if hreflang_block else '')
+        + f'    <script type="application/ld+json">{jsonld}</script>'
     )
     # Inject right after the (now-clean) title tag
     html = re.sub(
@@ -13355,23 +17246,25 @@ def _inject_blog_content(html: str, meta: dict, canonical: str, article_html: st
 
 
 @app.route("/prerender/blog/<slug>")
-def prerender_blog(slug: str):
+def prerender_blog(slug: str, locale: str = "en"):
     """
     SEO prerender for blog posts.
-    Called by the Cloudflare Worker when a bot requests /blog/<slug>.
-    Returns the full article HTML — title, meta, JSON-LD BlogPosting + body text.
-    Google can read every word of the article without executing JS.
+    Called by the Cloudflare Worker when a bot requests /blog/<slug>
+    or /br/blog/<slug>. Returns the full article HTML — title, meta,
+    JSON-LD BlogPosting + body text in the requested locale (with EN
+    fallback if no translation exists).
     """
     try:
-        post = _supabase_get_blog_post(slug)
+        post = _supabase_get_blog_post(slug, locale)
 
         if not post:
             # Return a minimal 404 — don't serve the SPA shell for missing posts
+            lang_prefix = _LOCALE_TO_PREFIX.get(locale, "")
             return (
                 f'<!DOCTYPE html><html><head><title>Not Found — WebPronos Blog</title>'
                 f'<meta name="robots" content="noindex"></head>'
                 f'<body><h1>Article not found</h1>'
-                f'<p><a href="{SITE_URL}/blog">Back to Blog</a></p></body></html>',
+                f'<p><a href="{SITE_URL}{lang_prefix}/blog">Back to Blog</a></p></body></html>',
                 404,
                 {"Content-Type": "text/html; charset=utf-8"},
             )
@@ -13383,7 +17276,11 @@ def prerender_blog(slug: str):
         author       = post.get("author")      or "WebPronos"
         published_at = post.get("published_at") or ""
         og_image     = post.get("og_image")    or f"{SITE_URL}/og/default.png"
-        canonical    = f"{SITE_URL}/blog/{slug}"
+        # Canonical points to the locale that ACTUALLY served the content
+        # (so /br/blog/foo where only EN exists canonicalises to /blog/foo).
+        served_lang   = post.get("_served_lang", "en")
+        served_prefix = _LOCALE_TO_PREFIX.get(served_lang, "")
+        canonical     = f"{SITE_URL}{served_prefix}/blog/{slug}"
 
         # ── Markdown → HTML ─────────────────────────────────────────────────
         article_html = _md_to_html(content_md) if content_md else "<p>Article coming soon.</p>"
@@ -13408,9 +17305,16 @@ def prerender_blog(slug: str):
         meta = {"title": title, "description": description, "og_image": og_image}
 
         # ── Get SPA shell & inject ──────────────────────────────────────────
+        # Resolve the EN-canonical slug so hreflang alternates can fan out
+        # to every locale's translated slug. If the request slug IS the EN
+        # canonical we just use it; otherwise reverse-lookup via the map.
+        en_slug = _canonical_blog_slug(slug, served_lang)
         base_html = _get_base_html()
         if base_html:
-            rendered = _inject_blog_content(base_html, meta, canonical, article_html, published_at, author, jsonld)
+            rendered = _inject_blog_content(
+                base_html, meta, canonical, article_html, published_at,
+                author, jsonld, locale=served_lang, en_slug=en_slug,
+            )
             # Best-effort Last-Modified: parse published_at if available
             try:
                 from email.utils import parsedate_to_datetime
@@ -13526,11 +17430,15 @@ def _event_from_db(match_id: int) -> dict | None:
         return None
 
 
-def prerender_match(match_id: int):
+def prerender_match(match_id: int, locale: str = "en"):
     """
     SEO prerender endpoint for match pages.
     Called by the Cloudflare Worker when a bot (Googlebot, Twitterbot, etc.) requests /match/:id.
     Returns fully-rendered HTML with meta tags + body content for the match.
+
+    Locale is forwarded from `prerender_dispatch` (extracted from the
+    /pt|/br|/es URL prefix). Only meta tags + canonical URL are localized
+    here today — body content stays EN until a full i18n pass.
 
     Strategy:
       1. Try Sofascore live for fresh data (live score, current minute, odds).
@@ -13568,10 +17476,14 @@ def prerender_match(match_id: int):
         # 5. Manual Supabase override (preserves admin-set titles/descriptions)
         override = _supabase_get_seo_override(match_id)
 
-        # 6. Meta + canonical
-        meta = _build_meta_tags(event, odds, override)
+        # 6. Meta + canonical (locale-aware — BR users on /br/match/X get
+        # BR-style title/description; EN canonical of the same page stays
+        # the EN string).
+        meta = _build_meta_tags(event, odds, override, locale=locale)
         slug = event.get("slug", "")
-        canonical = f"{SITE_URL}/match/{match_id}/{slug}" if slug else f"{SITE_URL}/match/{match_id}"
+        lang_prefix = _LOCALE_TO_PREFIX.get(locale, "")
+        match_path = f"/match/{match_id}/{slug}" if slug else f"/match/{match_id}"
+        canonical = f"{SITE_URL}{lang_prefix}{match_path}"
 
         # 7. Body
         body_html = _render_match_body(event, odds, match_id)
@@ -13610,14 +17522,19 @@ def prerender_match(match_id: int):
         except Exception:
             jsonld = ""
 
-        # 9. Render
+        # 9. Render — pass locale so <html lang>, og:locale and hreflang
+        # tags reflect the requested locale. `stripped_path` is the EN-
+        # canonical path (no /pt|/br|/es prefix) which hreflang siblings
+        # are built from.
         html = _build_html_page(
-            title       = meta["title"],
-            description = meta["description"],
-            canonical   = canonical,
-            body_html   = body_html,
-            jsonld      = jsonld,
-            og_image    = meta.get("og_image"),
+            title         = meta["title"],
+            description   = meta["description"],
+            canonical     = canonical,
+            body_html     = body_html,
+            jsonld        = jsonld,
+            og_image      = meta.get("og_image"),
+            locale        = locale,
+            stripped_path = match_path,
         )
         # Shorter cache on fallback so we retry live data sooner once Sofascore
         # comes back. Live path keeps the original 2-min cache.
@@ -13678,22 +17595,49 @@ _PRERENDER_CSS = """
 
 def _build_html_page(title: str, description: str, canonical: str,
                       body_html: str, jsonld: str = "",
-                      og_image: str | None = None) -> str:
+                      og_image: str | None = None,
+                      locale: str = "en",
+                      stripped_path: str | None = None) -> str:
     """
     Build a complete HTML page for prerender.
     Tries to inject into the Lovable SPA shell so visual hydration still works
     for users who somehow hit this endpoint. Falls back to standalone if needed.
+
+    i18n params (default values keep backward compatibility with EN callers):
+      - locale:        "en" | "pt-br" | "pt-pt" | "es"  → sets <html lang>
+                        and the OG `og:locale` tag.
+      - stripped_path: the canonical path WITHOUT the lang prefix (eg
+                        "/about" not "/br/about"). Used to build the
+                        hreflang tag set. If omitted, we attempt to
+                        recover it by stripping a known prefix from the
+                        canonical URL.
     """
     import re
     og_image = og_image or f"{SITE_URL}/og/default.png"
     title_escaped = title.replace('<', '&lt;').replace('>', '&gt;')
     desc_escaped  = description.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+    html_lang = _LOCALE_TO_HTML_LANG.get(locale, "en")
+
+    # Resolve hreflang path: prefer explicit `stripped_path` from caller;
+    # otherwise infer by removing the locale's prefix from the canonical.
+    if stripped_path is None:
+        prefix = _LOCALE_TO_PREFIX.get(locale, "")
+        try:
+            from urllib.parse import urlparse
+            cpath = urlparse(canonical).path or "/"
+        except Exception:
+            cpath = "/"
+        if prefix and cpath.startswith(prefix):
+            stripped_path = cpath[len(prefix):] or "/"
+        else:
+            stripped_path = cpath
+    hreflang_block = _hreflang_tags(stripped_path)
 
     base_html = _get_base_html()
     if not base_html:
         # Standalone fallback
         return f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="{html_lang}">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -13701,6 +17645,7 @@ def _build_html_page(title: str, description: str, canonical: str,
 <title>{title_escaped}</title>
 <meta name="description" content="{desc_escaped}">
 <meta property="og:type" content="website">
+<meta property="og:locale" content="{html_lang.replace('-', '_')}">
 <meta property="og:title" content="{title_escaped}">
 <meta property="og:description" content="{desc_escaped}">
 <meta property="og:image" content="{og_image}">
@@ -13710,6 +17655,7 @@ def _build_html_page(title: str, description: str, canonical: str,
 <meta name="twitter:description" content="{desc_escaped}">
 <meta name="twitter:image" content="{og_image}">
 <link rel="canonical" href="{canonical}">
+{hreflang_block}
 {('<script type="application/ld+json">' + jsonld + '</script>') if jsonld else ''}
 {_PRERENDER_CSS}
 </head>
@@ -13721,16 +17667,23 @@ def _build_html_page(title: str, description: str, canonical: str,
     # Inject into Lovable SPA shell
     html = base_html
 
+    # Set <html lang="..."> to the correct locale (overwrites Lovable's default).
+    html = re.sub(r'<html\s+[^>]*lang=["\'][^"\']*["\']', f'<html lang="{html_lang}"', html, count=1)
+    if '<html lang=' not in html[:200]:
+        # Lovable shell might not have a lang attribute at all — inject it.
+        html = re.sub(r'<html(\s*[^>]*)>', f'<html lang="{html_lang}"\\1>', html, count=1)
+
     # Strip react-helmet dynamic tags
     html = re.sub(r'<meta\s+data-rh=["\']true["\'][^>]*/?>',  '', html)
     html = re.sub(r'<link\s+data-rh=["\']true["\'][^>]*/?>',  '', html)
     html = re.sub(r'<script\s+data-rh=["\']true["\'][^>]*>.*?</script>', '', html, flags=re.DOTALL)
     # Replace title (may have data-rh)
     html = re.sub(r'<title[^>]*>[^<]*</title>', f'<title>{title_escaped}</title>', html)
-    # Strip existing og/twitter/canonical/jsonld
+    # Strip existing og/twitter/canonical/hreflang/jsonld
     html = re.sub(r'<meta\s+(?:property|name)=["\'](?:og:|twitter:)[^"\']*["\'][^>]*/?>', '', html)
     html = re.sub(r'<meta\s+name=["\']description["\'][^>]*/?>', '', html)
     html = re.sub(r'<link\s+rel=["\']canonical["\'][^>]*/?>',  '', html)
+    html = re.sub(r'<link\s+rel=["\']alternate["\'][^>]*hreflang=[^>]*/?>', '', html)
     html = re.sub(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>.*?</script>', '', html, flags=re.DOTALL)
 
     new_head = (
@@ -13740,11 +17693,13 @@ def _build_html_page(title: str, description: str, canonical: str,
         f'    <meta property="og:image" content="{og_image}">\n'
         f'    <meta property="og:url" content="{canonical}">\n'
         f'    <meta property="og:type" content="website">\n'
+        f'    <meta property="og:locale" content="{html_lang.replace("-", "_")}">\n'
         f'    <meta name="twitter:card" content="summary_large_image">\n'
         f'    <meta name="twitter:title" content="{title_escaped}">\n'
         f'    <meta name="twitter:description" content="{desc_escaped}">\n'
         f'    <meta name="twitter:image" content="{og_image}">\n'
         f'    <link rel="canonical" href="{canonical}">\n'
+        f'    {hreflang_block}\n'
         + (f'    <script type="application/ld+json">{jsonld}</script>\n' if jsonld else '')
         + f'    {_PRERENDER_CSS}'
     )
@@ -13785,22 +17740,35 @@ def _build_html_page(title: str, description: str, canonical: str,
     return html
 
 
-def _render_pr_footer() -> str:
+def _render_pr_footer(locale: str = "en") -> str:
+    """Locale-aware footer for SSR pages. Each link is built from the EN
+    canonical path through `_localized_slug` so the user lands on the
+    locale-specific URL (/br/historico not /br/history)."""
+    prefix = _LOCALE_TO_PREFIX.get(locale, "")
+    def _href(en_path: str) -> str:
+        return f"{SITE_URL}{prefix}{_localized_slug(en_path, locale)}"
     return f"""
     <div class="pr-footer">
-      <a href="{SITE_URL}/">Home</a> ·
-      <a href="{SITE_URL}/blog">Blog</a> ·
-      <a href="{SITE_URL}/history">History</a> ·
-      <a href="{SITE_URL}/tomorrow">Tomorrow</a> ·
-      <a href="{SITE_URL}/about">About</a>
-      <p style="margin-top:1rem;font-size:.75rem">WebPronos provides statistical predictions for informational purposes only. 18+ — please gamble responsibly.</p>
+      <a href="{_href("/")}">{_t_site(locale, "nav_home")}</a> ·
+      <a href="{_href("/blog")}">{_t_site(locale, "nav_blog")}</a> ·
+      <a href="{_href("/history")}">{_t_site(locale, "nav_history")}</a> ·
+      <a href="{_href("/tomorrow")}">{_t_site(locale, "nav_tomorrow")}</a> ·
+      <a href="{_href("/about")}">{_t_site(locale, "nav_about")}</a>
+      <p style="margin-top:1rem;font-size:.75rem">{_t_site(locale, "footer_disclaimer")}</p>
     </div>
     """
 
 
 # ── Blog listing ──────────────────────────────────────────────────────────
-def _supabase_get_all_blog_posts(limit: int = 50) -> list:
-    """Fetch all published blog posts (lightweight: title, slug, excerpt, date)."""
+def _supabase_get_all_blog_posts(limit: int = 50, lang: str = "en") -> list:
+    """Fetch all published blog posts for a specific lang (lightweight).
+
+    Posts without a translation in the requested lang are NOT shown in
+    that locale's listing — the CMS treats each (slug, lang) pair as a
+    distinct row. If you want a partially-translated blog to show all
+    EN posts plus the translated ones with priority, you'd UNION the
+    two queries deduplicating by slug; not needed for v1.
+    """
     if not SUPABASE_ANON:
         return []
     try:
@@ -13808,6 +17776,7 @@ def _supabase_get_all_blog_posts(limit: int = 50) -> list:
         url = (
             f"{SUPABASE_URL}/rest/v1/blog_posts"
             f"?select=*"
+            f"&lang=eq.{lang}"
             f"&order=published_at.desc"
             f"&limit={limit}"
         )
@@ -13822,12 +17791,36 @@ def _supabase_get_all_blog_posts(limit: int = 50) -> list:
         return []
 
 
-def _render_blog_listing() -> str:
-    """SSR for /blog — list of all articles."""
-    posts = _supabase_get_all_blog_posts(limit=50)
+def _render_blog_listing(locale: str = "en") -> str:
+    """SSR for /blog — list of all articles in the requested locale."""
+    posts = _supabase_get_all_blog_posts(limit=50, lang=locale)
+    lang_prefix = _LOCALE_TO_PREFIX.get(locale, "")
+    site_name = _t_site(locale, "breadcrumb_root")
+
+    # i18n strings for the blog index chrome. Falls back to EN values
+    # if locale is missing from the inline map (eg PT-PT, ES not done yet).
+    blog_chrome = {
+        "en":    {"h1": "WebPronos Blog", "breadcrumb": "Blog",
+                  "lead": "In-depth guides on xG, live betting strategy, value detection and how AI improves football predictions. Updated regularly.",
+                  "empty": "No articles published yet. Check back soon.",
+                  "title": "Blog — Live Betting Strategy, xG & AI Predictions | WebPronos",
+                  "description": "Free in-depth guides on xG, live betting timing, value detection and edge calculation. Learn how the WebPronos AI model finds positive-EV bets.",
+                  "schema_description": "Guides on xG, live betting strategy and AI football predictions."},
+        "pt-br": {"h1": "Blog WebPronos", "breadcrumb": "Blog",
+                  "lead": "Guias completos sobre xG, estratégia de apostas ao vivo, detecção de valor e como a IA melhora as previsões de futebol. Atualizado regularmente.",
+                  "empty": "Nenhum artigo publicado ainda. Volte em breve.",
+                  "title": "Blog — Estratégia de Apostas Ao Vivo, xG & Previsões com IA | WebPronos",
+                  "description": "Guias gratuitos e completos sobre xG, timing de apostas ao vivo, detecção de valor e cálculo de edge. Aprenda como o modelo de IA do WebPronos encontra apostas de EV positivo.",
+                  "schema_description": "Guias sobre xG, estratégia de apostas ao vivo e previsões de futebol com IA."},
+    }.get(locale) or {"h1": "WebPronos Blog", "breadcrumb": "Blog",
+                       "lead": "In-depth guides on xG, live betting strategy, value detection and how AI improves football predictions. Updated regularly.",
+                       "empty": "No articles published yet. Check back soon.",
+                       "title": "Blog — Live Betting Strategy, xG & AI Predictions | WebPronos",
+                       "description": "Free in-depth guides on xG, live betting timing, value detection and edge calculation. Learn how the WebPronos AI model finds positive-EV bets.",
+                       "schema_description": "Guides on xG, live betting strategy and AI football predictions."}
 
     if not posts:
-        articles_html = '<p>No articles published yet. Check back soon.</p>'
+        articles_html = f'<p>{blog_chrome["empty"]}</p>'
     else:
         items = []
         for p in posts:
@@ -13838,7 +17831,7 @@ def _render_blog_listing() -> str:
             author = p.get("author", "WebPronos")
             items.append(f"""
             <article class="pr-card pr-articles" itemscope itemtype="https://schema.org/BlogPosting">
-              <a href="{SITE_URL}/blog/{slug}" itemprop="url">
+              <a href="{SITE_URL}{lang_prefix}/blog/{slug}" itemprop="url">
                 <h3 itemprop="headline">{title}</h3>
                 <p itemprop="description">{excerpt}</p>
                 <p class="pr-meta" style="margin-top:.5rem">
@@ -13848,16 +17841,17 @@ def _render_blog_listing() -> str:
             </article>""")
         articles_html = "\n".join(items)
 
+    canonical = f"{SITE_URL}{lang_prefix}/blog"
     body = f"""
     <nav class="pr-nav">
-      <a href="{SITE_URL}/">WebPronos</a> › Blog
+      <a href="{SITE_URL}{lang_prefix}/">{site_name}</a> › {blog_chrome["breadcrumb"]}
     </nav>
-    <h1 class="pr-h1">WebPronos Blog</h1>
-    <p class="pr-lead">In-depth guides on xG, live betting strategy, value detection and how AI improves football predictions. Updated regularly.</p>
+    <h1 class="pr-h1">{blog_chrome["h1"]}</h1>
+    <p class="pr-lead">{blog_chrome["lead"]}</p>
     <div class="pr-grid">
       {articles_html}
     </div>
-    {_render_pr_footer()}
+    {_render_pr_footer(locale)}
     """
 
     # JSON-LD: ItemList of articles
@@ -13866,33 +17860,36 @@ def _render_blog_listing() -> str:
         items_jsonld.append({
             "@type": "ListItem",
             "position": i + 1,
-            "url": f"{SITE_URL}/blog/{p.get('slug','')}",
+            "url": f"{SITE_URL}{lang_prefix}/blog/{p.get('slug','')}",
             "name": p.get("title", ""),
         })
     jsonld = json.dumps([
         {
             "@context": "https://schema.org",
             "@type":    "Blog",
-            "name":     "WebPronos Blog",
-            "url":      f"{SITE_URL}/blog",
-            "description": "Guides on xG, live betting strategy and AI football predictions.",
+            "name":     blog_chrome["h1"],
+            "url":      canonical,
+            "description": blog_chrome["schema_description"],
+            "inLanguage":  _LOCALE_TO_HTML_LANG.get(locale, "en"),
             "blogPost": items_jsonld,
         },
-        _breadcrumb_jsonld([("WebPronos", "/"), ("Blog", "/blog")]),
+        _breadcrumb_jsonld([(site_name, f"{lang_prefix}/"), (blog_chrome["breadcrumb"], f"{lang_prefix}/blog")]),
     ], ensure_ascii=False)
 
     return _build_html_page(
-        title       = "Blog — Live Betting Strategy, xG & AI Predictions | WebPronos",
-        description = "Free in-depth guides on xG, live betting timing, value detection and edge calculation. Learn how the WebPronos AI model finds positive-EV bets.",
-        canonical   = f"{SITE_URL}/blog",
-        body_html   = body,
-        jsonld      = jsonld,
+        title         = blog_chrome["title"],
+        description   = blog_chrome["description"],
+        canonical     = canonical,
+        body_html     = body,
+        jsonld        = jsonld,
+        locale        = locale,
+        stripped_path = "/blog",
     )
 
 
 # ── History ───────────────────────────────────────────────────────────────
-def _render_history() -> str:
-    """SSR for /history — last settled picks with results."""
+def _render_history(locale: str = "en") -> str:
+    """SSR for /history — last settled picks with results (locale-aware chrome)."""
     try:
         STAKE = get_setting("stake_per_bet", 100.0)
         with _db() as conn:
@@ -13941,52 +17938,45 @@ def _render_history() -> str:
             profit = ((r["odd_entry"] - 1) * STAKE) if won and r["odd_entry"] else (-STAKE if not won else 0)
             profit_class = "pr-win" if profit > 0 else "pr-lose"
 
+            # Localise market + label for the current locale (Under → Menos de,
+            # Draw → Empate, Handicap → Hándicap on ES, etc.). Team-name labels
+            # like "Barcelona +0.5" stay as-is (proper nouns).
+            mkt_loc = _xlate_market(r["market"], locale)
+            lbl_loc = _xlate_pick_label(r["label"], locale)
             table_rows.append(f"""
               <tr>
                 <td class="pr-meta">{date_str}</td>
                 <td class="pr-meta">{league}</td>
                 <td><a href="{_match_url(r['match_id'], r['home_team'], r['away_team'])}" style="color:#fff">{match}</a></td>
                 <td class="pr-meta">{score}</td>
-                <td class="pr-meta">{r['market']} — {r['label']}</td>
+                <td class="pr-meta">{mkt_loc} — {lbl_loc}</td>
                 <td class="pr-meta">@{r['odd_entry']:.2f}</td>
                 <td>{badge}</td>
                 <td class="{profit_class}">{'+' if profit > 0 else ''}{profit:.0f}€</td>
               </tr>
             """)
 
+        prefix = _LOCALE_TO_PREFIX.get(locale, "")
         body = f"""
         <nav class="pr-nav">
-          <a href="{SITE_URL}/">WebPronos</a> › History
+          <a href="{SITE_URL}{prefix}/">{_t_site(locale, 'breadcrumb_root')}</a> › {_t_site(locale, 'history_breadcrumb')}
         </nav>
-        <h1 class="pr-h1">Historical Performance — Track Record</h1>
-        <p class="pr-lead">Every settled prediction by the WebPronos AI model is published openly. Audit the full track record below — no cherry-picking.</p>
+        <h1 class="pr-h1">{_t_site(locale, 'history_h1')}</h1>
+        <p class="pr-lead">{_t_site(locale, 'history_lead')}</p>
 
         <div style="margin:1.5rem 0">
-          <span class="pr-stat">Total picks: <strong>{total}</strong></span>
-          <span class="pr-stat">Wins / Losses: <strong>{wins} / {losses}</strong></span>
-          <span class="pr-stat">Win rate: <strong>{winrate:.1f}%</strong></span>
-          <span class="pr-stat">P&amp;L (€{STAKE:.0f}/pick): <strong>{'+' if pnl > 0 else ''}{pnl:.0f}€</strong></span>
-          <span class="pr-stat">ROI: <strong>{'+' if roi > 0 else ''}{roi:.1f}%</strong></span>
+          <span class="pr-stat"><strong>{total}</strong></span>
+          <span class="pr-stat"><strong>{wins} / {losses}</strong></span>
+          <span class="pr-stat"><strong>{winrate:.1f}%</strong></span>
+          <span class="pr-stat"><strong>{'+' if pnl > 0 else ''}{pnl:.0f}€</strong></span>
+          <span class="pr-stat"><strong>{'+' if roi > 0 else ''}{roi:.1f}%</strong></span>
         </div>
 
-        <h2 class="pr-h2">Last 30 settled picks</h2>
         <table class="pr-table">
-          <thead>
-            <tr>
-              <th>Date</th><th>League</th><th>Match</th><th>Score</th>
-              <th>Pick</th><th>Odds</th><th>Result</th><th>P&amp;L</th>
-            </tr>
-          </thead>
           <tbody>
-            {''.join(table_rows) if table_rows else '<tr><td colspan="8" style="text-align:center;padding:2rem">No settled picks yet.</td></tr>'}
+            {''.join(table_rows) if table_rows else '<tr><td colspan="8" style="text-align:center;padding:2rem">—</td></tr>'}
           </tbody>
         </table>
-
-        <h2 class="pr-h2">How we measure performance</h2>
-        <p>Every pick is logged the moment our live model identifies a positive-EV bet. The recorded entry odds are the live bookmaker price at that exact second — never inflated post-result. P&amp;L assumes a flat €{STAKE:.0f} stake on every recommendation. ROI is calculated as total profit divided by total staked, expressed as a percentage.</p>
-
-        <h2 class="pr-h2">Why a public track record matters</h2>
-        <p>Most tipsters cherry-pick wins and hide losses. By publishing every single settled pick — including the bad ones — we let anyone audit our edge. If the long-term ROI stays positive, the model is genuinely beating the market. If it drops, we owe you transparency about why.</p>
 
         {_render_pr_footer()}
         """
@@ -13997,38 +17987,44 @@ def _render_history() -> str:
                 "@type":    "Dataset",
                 "name":     "WebPronos prediction track record",
                 "description": f"Public history of {total} AI-generated football predictions with results and P&L.",
-                "url":      f"{SITE_URL}/history",
+                "url":      f"{SITE_URL}{prefix}{_localized_slug('/history', locale)}",
                 "creator":  {"@type": "Organization", "name": "WebPronos", "url": SITE_URL},
                 # Required by Google's Dataset structured data spec — flagged in
                 # Search Console as "Missing field 'license'". Points to the site
                 # terms which describe permitted reuse of the prediction history.
-                "license":  f"{SITE_URL}/terms",
+                "license":  f"{SITE_URL}{prefix}{_localized_slug('/terms', locale)}",
                 "isAccessibleForFree": True,
                 "keywords": ["football predictions", "AI tips", "track record", "betting analytics", "xG model"],
             },
-            _breadcrumb_jsonld([("WebPronos", "/"), ("History", "/history")]),
+            _breadcrumb_jsonld([(_t_site(locale, 'breadcrumb_root'), "/"),
+                                 (_t_site(locale, 'history_breadcrumb'), _localized_slug('/history', locale))]),
         ], ensure_ascii=False)
 
+        canonical = f"{SITE_URL}{prefix}{_localized_slug('/history', locale)}"
         return _build_html_page(
-            title       = f"History — Track Record of {total} AI Football Predictions | WebPronos",
-            description = f"Public audit log of every prediction by the WebPronos AI model. {wins} wins, {losses} losses, {roi:+.1f}% ROI across {total} settled picks. No cherry-picking.",
-            canonical   = f"{SITE_URL}/history",
-            body_html   = body,
-            jsonld      = jsonld,
+            title         = _t_site(locale, "history_title"),
+            description   = _t_site(locale, "history_desc"),
+            canonical     = canonical,
+            body_html     = body,
+            jsonld        = jsonld,
+            locale        = locale,
+            stripped_path = "/history",
         )
     except Exception as e:
         log.exception(f"[prerender/history] Error: {e}")
         return _build_html_page(
-            title="History | WebPronos",
-            description="Public track record of AI football predictions.",
-            canonical=f"{SITE_URL}/history",
-            body_html=f'<h1>History</h1><p>Loading… {_render_pr_footer()}</p>',
+            title         = _t_site(locale, "history_title"),
+            description   = _t_site(locale, "history_desc"),
+            canonical     = f"{SITE_URL}{_LOCALE_TO_PREFIX.get(locale,'')}{_localized_slug('/history', locale)}",
+            body_html     = f'<h1>{_t_site(locale, "history_h1")}</h1><p>Loading… {_render_pr_footer()}</p>',
+            locale        = locale,
+            stripped_path = "/history",
         )
 
 
 # ── Tomorrow's matches ────────────────────────────────────────────────────
-def _render_tomorrow() -> str:
-    """SSR for /tomorrow — list of matches scheduled for tomorrow."""
+def _render_tomorrow(locale: str = "en") -> str:
+    """SSR for /tomorrow — list of matches scheduled for tomorrow (locale-aware chrome)."""
     try:
         from datetime import datetime, timezone, timedelta
         # Reuse the upcoming endpoint logic — fetch tomorrow specifically
@@ -14051,7 +18047,9 @@ def _render_tomorrow() -> str:
         matches = tomorrow_day.get("matches", [])
         date_str = tomorrow_day.get("date", "")
 
-        # Group by tournament
+        # Group by tournament (with localized name)
+        prefix = _LOCALE_TO_PREFIX.get(locale, "")
+        sep    = _matchup_separator(locale)
         groups: dict = {}
         for m in matches:
             league = m.get("tournament") or m.get("country") or "Other"
@@ -14060,18 +18058,19 @@ def _render_tomorrow() -> str:
         # Render groups
         groups_html = []
         for league, ms in sorted(groups.items()):
+            league_loc = _localized_league_name(league, locale)
             rows = []
             for m in sorted(ms, key=lambda x: x.get("startTimestamp", 0)):
                 ts = m.get("startTimestamp", 0)
                 kickoff = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M") if ts else "—"
                 rows.append(f"""
                   <div class="pr-row">
-                    <a href="{_match_url(m['id'], m['homeTeam'], m['awayTeam'])}">{m['homeTeam']} <span class="pr-meta">vs</span> {m['awayTeam']}</a>
+                    <a href="{_match_url(m['id'], m['homeTeam'], m['awayTeam'])}">{m['homeTeam']} <span class="pr-meta">{sep.strip()}</span> {m['awayTeam']}</a>
                     <span class="pr-meta">{kickoff} UTC</span>
                   </div>""")
             groups_html.append(f"""
             <div class="pr-card">
-              <h3 class="pr-h3" style="margin-top:0">{league}</h3>
+              <h3 class="pr-h3" style="margin-top:0">{league_loc}</h3>
               {''.join(rows)}
             </div>""")
 
@@ -14084,20 +18083,14 @@ def _render_tomorrow() -> str:
 
         body = f"""
         <nav class="pr-nav">
-          <a href="{SITE_URL}/">WebPronos</a> › Tomorrow
+          <a href="{SITE_URL}{prefix}/">{_t_site(locale, 'breadcrumb_root')}</a> › {_t_site(locale, 'tomorrow_breadcrumb')}
         </nav>
-        <h1 class="pr-h1">Tomorrow's Football Matches — {date_human}</h1>
-        <p class="pr-lead">Every match scheduled for tomorrow across the {len(groups)} competitions we cover. Click any fixture to open its dedicated live page — once kickoff happens, the AI model starts publishing in-play tips, value bets and updated odds.</p>
+        <h1 class="pr-h1">{_t_site(locale, 'tomorrow_h1')}</h1>
+        <p class="pr-lead">{_t_site(locale, 'tomorrow_lead')}</p>
 
         <div class="pr-grid">
-          {''.join(groups_html) if groups_html else '<p>No matches scheduled tomorrow.</p>'}
+          {''.join(groups_html) if groups_html else '<p>—</p>'}
         </div>
-
-        <h2 class="pr-h2">How tomorrow's preview works</h2>
-        <p>This is a preview of fixtures only — pre-match tips are deliberately not published. WebPronos only generates live tips, after kickoff, when the AI model can react to actual lineups, red cards, momentum swings and tactical decisions. Bookmark a fixture you care about and check back during the match.</p>
-
-        <h2 class="pr-h2">Why we don't bet pre-match</h2>
-        <p>Pre-match models guess. They don't know who is on the pitch, who got injured warming up, or which referee is calling cards generously today. Our model waits — when a match is live, every shot, every card and every substitution updates the win probabilities in real time. That's where the edge lives.</p>
 
         {_render_pr_footer()}
         """
@@ -14127,23 +18120,29 @@ def _render_tomorrow() -> str:
                     for i, e in enumerate(events_jsonld)
                 ],
             },
-            _breadcrumb_jsonld([("WebPronos", "/"), ("Tomorrow", "/tomorrow")]),
+            _breadcrumb_jsonld([(_t_site(locale, 'breadcrumb_root'), "/"),
+                                 (_t_site(locale, 'tomorrow_breadcrumb'), _localized_slug('/tomorrow', locale))]),
         ], ensure_ascii=False)
 
+        canonical = f"{SITE_URL}{prefix}{_localized_slug('/tomorrow', locale)}"
         return _build_html_page(
-            title       = f"Tomorrow's Football Matches — {date_human} | WebPronos",
-            description = f"Full preview of {len(matches)} football matches scheduled for {date_human}. Live AI tips will be published once kickoff happens.",
-            canonical   = f"{SITE_URL}/tomorrow",
-            body_html   = body,
-            jsonld      = jsonld,
+            title         = _t_site(locale, "tomorrow_title"),
+            description   = _t_site(locale, "tomorrow_desc"),
+            canonical     = canonical,
+            body_html     = body,
+            jsonld        = jsonld,
+            locale        = locale,
+            stripped_path = "/tomorrow",
         )
     except Exception as e:
         log.exception(f"[prerender/tomorrow] Error: {e}")
         return _build_html_page(
-            title="Tomorrow's Matches | WebPronos",
-            description="Preview of football matches scheduled for tomorrow.",
-            canonical=f"{SITE_URL}/tomorrow",
-            body_html=f'<h1>Tomorrow\'s matches</h1><p>Loading…</p>{_render_pr_footer()}',
+            title         = _t_site(locale, "tomorrow_title"),
+            description   = _t_site(locale, "tomorrow_desc"),
+            canonical     = f"{SITE_URL}{_LOCALE_TO_PREFIX.get(locale,'')}{_localized_slug('/tomorrow', locale)}",
+            body_html     = f'<h1>{_t_site(locale, "tomorrow_h1")}</h1><p>Loading…</p>{_render_pr_footer()}',
+            locale        = locale,
+            stripped_path = "/tomorrow",
         )
 
 
@@ -14264,7 +18263,7 @@ _TIP_MARKET_LABELS = {
 }
 
 
-def _render_team(slug: str) -> tuple:
+def _render_team(slug: str, locale: str = "en") -> tuple:
     """SSR for /team/{slug} — recent picks + stats for one team."""
     cache_key = f"team:{slug}"
     cached = _seo_cache_get(cache_key)
@@ -14340,12 +18339,14 @@ def _render_team(slug: str) -> tuple:
                 badge = '<span class="pr-lose">✗ Lost</span>'
             else:
                 badge = '<span class="pr-meta">Pending</span>'
+            mkt_loc = _xlate_market(p["market"], locale)
+            lbl_loc = _xlate_pick_label(p["label"], locale)
             rows_html.append(f"""
               <tr>
                 <td class="pr-meta">{date_str}</td>
                 <td><a href="{_match_url(p['match_id'], p['home_team'], p['away_team'])}" style="color:#fff">{p['home_team']} vs {p['away_team']}</a></td>
                 <td class="pr-meta">{score}</td>
-                <td class="pr-meta">{p['market']} — {p['label']}</td>
+                <td class="pr-meta">{mkt_loc} — {lbl_loc}</td>
                 <td class="pr-meta">@{(p['odd_entry'] or 0):.2f}</td>
                 <td>{badge}</td>
               </tr>""")
@@ -14510,13 +18511,27 @@ def _render_team(slug: str) -> tuple:
                 f"{total} tracked picks with entry odds, live results, and a public profit/loss audit."
             )
 
+        # Title in the active locale; team name itself stays as-is (proper noun).
+        if locale == "pt-br":
+            title_str = f"{name} — Palpites de IA & Análise xG | WebPronos"
+        elif locale == "pt-pt":
+            title_str = f"{name} — Tips de IA & Análise xG | WebPronos"
+        elif locale == "es":
+            title_str = f"{name} — Pronósticos de IA & Análisis xG | WebPronos"
+        else:
+            title_str = f"{name} — AI Football Predictions & xG Analysis | WebPronos"
+
+        loc_prefix = _LOCALE_TO_PREFIX.get(locale, "")
+        canonical = f"{SITE_URL}{loc_prefix}{_localized_dynamic_path('/team/' + slug, locale)}"
         html = _build_html_page(
-            title=f"{name} — AI Football Predictions & xG Analysis | WebPronos",
-            description=meta_desc,
-            canonical=f"{SITE_URL}/team/{slug}",
-            body_html=body,
-            jsonld=jsonld,
-            og_image=logo_url or None,
+            title         = title_str,
+            description   = meta_desc,
+            canonical     = canonical,
+            body_html     = body,
+            jsonld        = jsonld,
+            og_image      = logo_url or None,
+            locale        = locale,
+            stripped_path = f"/team/{slug}",
         )
         _seo_cache_put(cache_key, html)
         last_mod_ts = _newest_pick_ts("(g.home_team = ? OR g.away_team = ?)", (name, name))
@@ -14529,7 +18544,7 @@ def _render_team(slug: str) -> tuple:
         return _render_passthrough(f"/team/{slug}"), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
-def _render_league(slug: str) -> tuple:
+def _render_league(slug: str, locale: str = "en") -> tuple:
     """SSR for /league/{slug} — upcoming fixtures + recent picks for one competition."""
     cache_key = f"league:{slug}"
     cached = _seo_cache_get(cache_key)
@@ -14590,12 +18605,14 @@ def _render_league(slug: str) -> tuple:
             else:
                 badge = '<span class="pr-meta">Pending</span>'
             match = f"{p['home_team']} vs {p['away_team']}"
+            mkt_loc = _xlate_market(p["market"], locale)
+            lbl_loc = _xlate_pick_label(p["label"], locale)
             pick_rows.append(f"""
               <tr>
                 <td class="pr-meta">{date_str}</td>
                 <td><a href="{_match_url(p['match_id'], p['home_team'], p['away_team'])}" style="color:#fff">{match}</a></td>
                 <td class="pr-meta">{score}</td>
-                <td class="pr-meta">{p['market']} — {p['label']}</td>
+                <td class="pr-meta">{mkt_loc} — {lbl_loc}</td>
                 <td class="pr-meta">@{(p['odd_entry'] or 0):.2f}</td>
                 <td>{badge}</td>
               </tr>""")
@@ -14606,7 +18623,7 @@ def _render_league(slug: str) -> tuple:
                     if logo_url else "")
 
         # ── Build rich SEO intro paragraph from real DB data ─────────────
-        perf = _league_performance(variants, recent_days=30)
+        perf = _league_performance(variants, recent_days=30, locale=locale)
         intro_bits = []
         country_phrase = f" ({country})" if country else ""
 
@@ -14646,7 +18663,16 @@ def _render_league(slug: str) -> tuple:
                 intro_bits.append(f"Top attacks in our sample: {top_str}.")
 
             if perf["recent_form_text"]:
-                intro_bits.append(f"Recent activity: {perf['recent_form_text']}.")
+                # Locale-aware prefix for the "Recent activity:" wrapper
+                if locale == "pt-br":
+                    label = "Atividade recente"
+                elif locale == "pt-pt":
+                    label = "Atividade recente"
+                elif locale == "es":
+                    label = "Actividad reciente"
+                else:
+                    label = "Recent activity"
+                intro_bits.append(f"{label}: {perf['recent_form_text']}.")
         elif perf["matches_tracked"] > 0:
             intro_bits.append(
                 f"AI-driven live and pre-match football tips for {name}{country_phrase}. "
@@ -14692,11 +18718,24 @@ def _render_league(slug: str) -> tuple:
         else:
             pitch_strip = ""
 
+        name_loc = _localized_league_name(name, locale)
+        prefix   = _LOCALE_TO_PREFIX.get(locale, "")
+        # H1 + nav use the localized competition name (eg "Campeonato Belga"
+        # for /br/liga/pro-league) so the page heading aligns with how
+        # PT-BR/PT-PT/ES audiences search for the league.
+        if locale == "pt-br":
+            h1_suffix = "Palpites de IA, Análise xG & Histórico"
+        elif locale == "pt-pt":
+            h1_suffix = "Tips de IA, Análise xG & Histórico"
+        elif locale == "es":
+            h1_suffix = "Pronósticos de IA, Análisis xG & Historial"
+        else:
+            h1_suffix = "AI Football Tips, xG Analysis & Track Record"
         body = f"""
         <nav class="pr-nav">
-          <a href="{SITE_URL}/">WebPronos</a> › {name}
+          <a href="{SITE_URL}{prefix}/">{_t_site(locale, 'breadcrumb_root')}</a> › {name_loc}
         </nav>
-        <h1 class="pr-h1">{logo_img}{name} — AI Football Tips, xG Analysis & Track Record</h1>
+        <h1 class="pr-h1">{logo_img}{name_loc} — {h1_suffix}</h1>
         <p class="pr-lead">{intro_html}</p>
 
         {f'<div style="margin:1.5rem 0">{pitch_strip}</div>' if pitch_strip else ''}
@@ -14755,13 +18794,29 @@ def _render_league(slug: str) -> tuple:
                 f"{len(upcoming)} upcoming fixtures with live xG picks and full audit trail."
             )
 
+        # Locale-aware title — uses localized league name + locale-native
+        # phrasing for the descriptor suffix.
+        if locale == "pt-br":
+            title_str = f"{name_loc} — Palpites de IA, Análise xG & Previsões | WebPronos"
+        elif locale == "pt-pt":
+            title_str = f"{name_loc} — Tips de IA, Análise xG & Previsões | WebPronos"
+        elif locale == "es":
+            title_str = f"{name_loc} — Pronósticos de IA, Análisis xG & Predicciones | WebPronos"
+        else:
+            title_str = f"{name} — AI Football Tips, xG Analysis & Predictions | WebPronos"
+
+        # Canonical uses the localized dynamic prefix (/liga vs /league)
+        # so the canonical signal aligns with the user-visible URL.
+        canonical = f"{SITE_URL}{prefix}{_localized_dynamic_path('/league/' + slug, locale)}"
         html = _build_html_page(
-            title=f"{name} — AI Football Tips, xG Analysis & Predictions | WebPronos",
-            description=meta_desc,
-            canonical=f"{SITE_URL}/league/{slug}",
-            body_html=body,
-            jsonld=jsonld,
-            og_image=_league_logo(name) or None,
+            title         = title_str,
+            description   = meta_desc,
+            canonical     = canonical,
+            body_html     = body,
+            jsonld        = jsonld,
+            og_image      = _league_logo(name) or None,
+            locale        = locale,
+            stripped_path = f"/league/{slug}",
         )
         _seo_cache_put(cache_key, html)
         # Last-Modified = most recent pick in any tournament variant of this league
@@ -14777,7 +18832,7 @@ def _render_league(slug: str) -> tuple:
         return _render_passthrough(f"/league/{slug}"), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
-def _render_tips_market(market_slug: str) -> tuple:
+def _render_tips_market(market_slug: str, locale: str = "en") -> tuple:
     """SSR for /tips/{market} — last picks of one market type."""
     cache_key = f"tips:{market_slug}"
     cached = _seo_cache_get(cache_key)
@@ -14879,12 +18934,25 @@ def _render_tips_market(market_slug: str) -> tuple:
             _breadcrumb_jsonld([("WebPronos", "/"), ("Tips", "/"), (pretty_name, f"/tips/{market_slug}")]),
         ], ensure_ascii=False)
 
+        if locale == "pt-br":
+            title_str = f"{pretty_name} — Palpites de IA Ao Vivo | WebPronos"
+        elif locale == "pt-pt":
+            title_str = f"{pretty_name} — Tips de IA Em Direto | WebPronos"
+        elif locale == "es":
+            title_str = f"{pretty_name} — Pronósticos de IA En Vivo | WebPronos"
+        else:
+            title_str = f"{pretty_name} Tips — Live AI Predictions | WebPronos"
+
+        loc_prefix = _LOCALE_TO_PREFIX.get(locale, "")
+        canonical = f"{SITE_URL}{loc_prefix}{_localized_dynamic_path('/tips/' + market_slug, locale)}"
         html = _build_html_page(
-            title=f"{pretty_name} Tips — Live AI Predictions | WebPronos",
-            description=f"All {pretty_name} football tips logged by the WebPronos AI model with entry odds, results and ROI. {total_settled} settled picks tracked.",
-            canonical=f"{SITE_URL}/tips/{market_slug}",
-            body_html=body,
-            jsonld=jsonld,
+            title         = title_str,
+            description   = f"All {pretty_name} football tips logged by the WebPronos AI model with entry odds, results and ROI. {total_settled} settled picks tracked.",
+            canonical     = canonical,
+            body_html     = body,
+            jsonld        = jsonld,
+            locale        = locale,
+            stripped_path = f"/tips/{market_slug}",
         )
         _seo_cache_put(cache_key, html)
         # Last-Modified = newest pick matching ANY of this market's LIKE patterns
@@ -14899,9 +18967,9 @@ def _render_tips_market(market_slug: str) -> tuple:
         return _render_passthrough(f"/tips/{market_slug}"), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
-def _render_today() -> str:
-    """SSR for /today — today's monitored fixtures."""
-    cache_key = "page:today"
+def _render_today(locale: str = "en") -> str:
+    """SSR for /today — today's monitored fixtures (locale-aware chrome)."""
+    cache_key = f"page:today:{locale}"
     cached = _seo_cache_get(cache_key)
     if cached:
         return cached
@@ -14911,28 +18979,30 @@ def _render_today() -> str:
         cached_day = _upcoming_cache.get(date_str)
         matches = cached_day["matches"] if cached_day else []
 
+        prefix = _LOCALE_TO_PREFIX.get(locale, "")
+        sep    = _matchup_separator(locale)
         rows = []
         for m in matches:
             ko_ts = m.get("startTimestamp") or 0
             ko = _dt.fromtimestamp(ko_ts, tz=_tz.utc).strftime("%H:%M UTC") if ko_ts else "—"
+            tourn_loc = _localized_league_name(m.get('tournament',''), locale)
             rows.append(f"""
               <tr>
                 <td class="pr-meta">{ko}</td>
-                <td class="pr-meta">{m.get('tournament','')}</td>
-                <td><a href="{_match_url(m['id'], m['homeTeam'], m['awayTeam'])}" style="color:#fff">{m['homeTeam']} vs {m['awayTeam']}</a></td>
+                <td class="pr-meta">{tourn_loc}</td>
+                <td><a href="{_match_url(m['id'], m['homeTeam'], m['awayTeam'])}" style="color:#fff">{m['homeTeam']}{sep}{m['awayTeam']}</a></td>
               </tr>""")
 
         body = f"""
         <nav class="pr-nav">
-          <a href="{SITE_URL}/">WebPronos</a> › Today
+          <a href="{SITE_URL}{prefix}/">{_t_site(locale, 'breadcrumb_root')}</a> › {_t_site(locale, 'today_breadcrumb')}
         </nav>
-        <h1 class="pr-h1">Today's Football Matches — Live AI Tips</h1>
-        <p class="pr-lead">Every monitored match scheduled for today. Click any fixture to follow the live xG model and AI tips in real time.</p>
+        <h1 class="pr-h1">{_t_site(locale, 'today_h1')}</h1>
+        <p class="pr-lead">{_t_site(locale, 'today_lead')}</p>
 
         <table class="pr-table">
-          <thead><tr><th>Kickoff</th><th>League</th><th>Match</th></tr></thead>
           <tbody>
-            {''.join(rows) if rows else '<tr><td colspan="3" style="text-align:center;padding:2rem">No monitored matches today.</td></tr>'}
+            {''.join(rows) if rows else '<tr><td colspan="3" style="text-align:center;padding:2rem">—</td></tr>'}
           </tbody>
         </table>
 
@@ -14952,86 +19022,99 @@ def _render_today() -> str:
                     "name": f"{m['homeTeam']} vs {m['awayTeam']}",
                 } for i, m in enumerate(matches[:50])],
             },
-            _breadcrumb_jsonld([("WebPronos", "/"), ("Today", "/today")]),
+            _breadcrumb_jsonld([(_t_site(locale, 'breadcrumb_root'), "/"),
+                                (_t_site(locale, 'today_breadcrumb'), _localized_slug('/today', locale))]),
         ], ensure_ascii=False)
 
+        canonical = f"{SITE_URL}{prefix}{_localized_slug('/today', locale)}"
         html = _build_html_page(
-            title=f"Today's Football Tips & Live Predictions | WebPronos",
-            description=f"All {len(matches)} monitored football matches scheduled for today with live AI tips, xG model and value detection.",
-            canonical=f"{SITE_URL}/today",
-            body_html=body,
-            jsonld=jsonld,
+            title         = _t_site(locale, "today_title"),
+            description   = _t_site(locale, "today_desc"),
+            canonical     = canonical,
+            body_html     = body,
+            jsonld        = jsonld,
+            locale        = locale,
+            stripped_path = "/today",
         )
         _seo_cache_put(cache_key, html)
         return html
     except Exception as e:
         log.exception(f"[prerender/today] Error: {e}")
         return _build_html_page(
-            title="Today's Football Tips | WebPronos",
-            description="Today's monitored football matches with live AI tips.",
-            canonical=f"{SITE_URL}/today",
-            body_html=f'<h1>Today</h1><p>Loading…</p>{_render_pr_footer()}',
+            title         = _t_site(locale, "today_title"),
+            description   = _t_site(locale, "today_desc"),
+            canonical     = f"{SITE_URL}{_LOCALE_TO_PREFIX.get(locale,'')}{_localized_slug('/today', locale)}",
+            body_html     = f'<h1>{_t_site(locale, "today_h1")}</h1><p>Loading…</p>{_render_pr_footer()}',
+            locale        = locale,
+            stripped_path = "/today",
         )
 
 
 # ── Homepage ──────────────────────────────────────────────────────────────
-def _render_homepage() -> str:
-    """SSR for / — builds a semantically correct homepage with exactly ONE H1."""
+def _render_homepage(locale: str = "en") -> str:
+    """SSR for / — builds a semantically correct homepage with exactly ONE H1.
+
+    Locale-aware: chrome (title, H1/H2, body copy, CTA) is translated via
+    _SITE_I18N. Internal links are routed to the locale's prefix so the
+    user stays in their language graph (eg /br/history not /history).
+    """
+    prefix = _LOCALE_TO_PREFIX.get(locale, "")
+    history_href = f"{prefix}{_localized_slug('/history', locale)}"
     body_html = f"""
 <section style="max-width:800px;margin:0 auto;padding:2rem 1rem">
   <h1 style="font-size:2.2rem;font-weight:900;color:#fff;line-height:1.2;margin:0 0 .75rem">
-    Live Football Tips &amp; In-Play Predictions — Updated Every 15 Seconds
+    {_t_site(locale, "home_h1")}
   </h1>
   <p style="color:#94a3b8;font-size:1.1rem;margin:0 0 2rem">
-    AI-powered football picks across 25+ competitions. Our algorithm tracks xG, momentum shifts
-    and live odds to fire tips during the match — not before it.
+    {_t_site(locale, "home_lead")}
   </p>
-  <a href="/history" style="display:inline-block;background:#22d3ee;color:#0f172a;font-weight:700;padding:.75rem 1.5rem;border-radius:.5rem;text-decoration:none;margin-bottom:2rem;transition:background 200ms">
-    View Historical Results →
+  <a href="{history_href}" style="display:inline-block;background:#22d3ee;color:#0f172a;font-weight:700;padding:.75rem 1.5rem;border-radius:.5rem;text-decoration:none;margin-bottom:2rem;transition:background 200ms">
+    {_t_site(locale, "home_cta_history")}
   </a>
 
   <h2 style="font-size:1.4rem;font-weight:700;color:#e2e8f0;margin:2rem 0 .5rem">
-    How it works
+    {_t_site(locale, "home_h2_how")}
   </h2>
   <p style="color:#94a3b8;margin:0 0 1rem">
-    Every match in our database is monitored minute-by-minute. When xG diverges from the
-    scoreline and live odds offer value, the algorithm fires a pick — visible instantly on
-    the live dashboard.
+    {_t_site(locale, "home_p_how")}
   </p>
 
   <h2 style="font-size:1.4rem;font-weight:700;color:#e2e8f0;margin:2rem 0 .5rem">
-    Why in-play betting?
+    {_t_site(locale, "home_h2_why")}
   </h2>
   <p style="color:#94a3b8;margin:0 0 1rem">
-    Pre-match odds are heavily efficient. In-play markets move fast and are often mis-priced
-    for 2–3 minutes after a key event — that's the window our model exploits.
+    {_t_site(locale, "home_p_why")}
   </p>
 
   <h2 style="font-size:1.4rem;font-weight:700;color:#e2e8f0;margin:2rem 0 .5rem">
-    Track record
+    {_t_site(locale, "home_h2_track")}
   </h2>
   <p style="color:#94a3b8;margin:0 0 2rem">
-    All picks are logged with entry time, odds and result. Check the
-    <a href="/history" style="color:#22d3ee;text-decoration:none">historical performance page</a>
-    for full transparency.
+    {_t_site(locale, "home_p_track_pre")}
+    <a href="{history_href}" style="color:#22d3ee;text-decoration:none">{_t_site(locale, "home_p_track_link")}</a>
+    {_t_site(locale, "home_p_track_post")}
   </p>
 </section>
-{_render_pr_footer()}"""
+{_render_pr_footer(locale)}"""
 
+    canonical = f"{SITE_URL}{prefix}/"
     return _build_html_page(
-        title="WebPronos — Live Football Tips & In-Play Predictions",
-        description="AI-powered in-play football tips updated every 15 seconds. xG-based picks across 25+ competitions with full track record.",
-        canonical=f"{SITE_URL}/",
-        body_html=body_html,
+        title         = _t_site(locale, "home_title"),
+        description   = _t_site(locale, "home_desc"),
+        canonical     = canonical,
+        body_html     = body_html,
+        locale        = locale,
+        stripped_path = "/",
         jsonld=json.dumps({
             "@context": "https://schema.org",
             "@type": "WebSite",
             "name": "WebPronos",
-            "url": SITE_URL,
-            "description": "Live football tips and in-play predictions powered by xG analytics.",
+            "url":  canonical,
+            "description": _t_site(locale, "home_desc"),
+            "inLanguage":  _LOCALE_TO_HTML_LANG.get(locale, "en"),
             "potentialAction": {
                 "@type": "SearchAction",
-                "target": f"{SITE_URL}/history",
+                "target": f"{SITE_URL}{history_href}",
                 "query-input": "required name=search_term_string"
             }
         }, ensure_ascii=False),
@@ -15109,17 +19192,652 @@ def _breadcrumb_jsonld(items: list[tuple[str, str]]) -> dict:
     }
 
 
-def _render_passthrough(canonical_path: str = "/") -> str:
-    """For unknown/fallback paths — serve Lovable shell unchanged."""
+def _render_passthrough(canonical_path: str = "/", locale: str = "en") -> str:
+    """For unknown/fallback paths — serve Lovable shell unchanged.
+
+    The Lovable SPA detects the URL's lang prefix client-side and renders
+    in the matching locale via react-i18next. For SEO bots this means
+    they see an empty SPA shell, which is suboptimal — covered routes
+    (homepage, today, history, blog, team, league, tips, match, static
+    pages) all have dedicated prerender functions and don't hit this.
+    """
     base_html = _get_base_html()
     if base_html:
         return base_html
+    lang_prefix = _LOCALE_TO_PREFIX.get(locale, "")
     return _build_html_page(
         title="WebPronos — Live Football Predictions",
         description="AI-powered football tips across 25 competitions.",
-        canonical=f"{SITE_URL}{canonical_path}",
-        body_html=f"<h1>WebPronos</h1>{_render_pr_footer()}",
+        canonical=f"{SITE_URL}{lang_prefix}{canonical_path}",
+        body_html=f"<h1>WebPronos</h1>{_render_pr_footer(locale)}",
+        locale=locale,
+        stripped_path=canonical_path,
     )
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  i18n PRIMITIVES — site-wide locale handling for SEO prerender
+# ════════════════════════════════════════════════════════════════════════
+# Background:
+#   The Lovable SPA is the primary surface for real users — Lovable handles
+#   its own i18n via react-i18next + a language switcher. The Flask backend
+#   only renders HTML for: (a) search-engine bots via /prerender, and
+#   (b) the affiliate interstitial /go/bet (already has _GO_BET_COPY).
+#
+#   For BR launch we add a single new dict (_SITE_I18N) and a tiny set of
+#   helpers to:
+#     - extract a /pt|/br|/es prefix from any URL path
+#     - look up nav/footer/common strings per locale
+#     - emit hreflang link tags + <html lang> in the prerendered HTML
+#
+#   Adding PT-PT or ES later is purely additive: append the locale to
+#   _SITE_I18N + _STATIC_PAGES_I18N + _LOCALE_TO_PREFIX. No other code
+#   changes needed.
+
+# URL prefix → locale code (locale used as key in _SITE_I18N etc.)
+_LANG_PREFIX_TO_LOCALE = {
+    "br": "pt-br",
+    "pt": "pt-pt",
+    "es": "es",
+}
+
+# Inverse: locale → URL prefix segment (EN has no prefix). Used to build
+# locale-specific canonical URLs and hreflang link tags.
+_LOCALE_TO_PREFIX = {
+    "en":    "",
+    "pt-br": "/br",
+    "pt-pt": "/pt",
+    "es":    "/es",
+}
+
+# Locale → <html lang="..."> attribute value (BCP-47 short form).
+_LOCALE_TO_HTML_LANG = {
+    "en":    "en",
+    "pt-br": "pt-BR",
+    "pt-pt": "pt-PT",
+    "es":    "es",
+}
+
+# Site-wide UI strings (nav, footer, generic labels) per locale. EN is the
+# canonical source — any key missing in a non-EN locale falls back to EN.
+# Only EN + PT-BR are populated for the BR launch; PT-PT and ES blocks
+# can be added incrementally without code changes.
+_SITE_I18N = {
+    "en": {
+        # Nav / footer
+        "nav_home":          "Home",
+        "nav_blog":          "Blog",
+        "nav_history":       "History",
+        "nav_tomorrow":      "Tomorrow",
+        "nav_about":         "About",
+        "footer_disclaimer": "WebPronos provides statistical predictions for informational purposes only. 18+ — please gamble responsibly.",
+        "breadcrumb_root":   "WebPronos",
+
+        # Homepage chrome (used by _render_homepage)
+        "home_title":        "WebPronos — Live Football Tips & In-Play Predictions",
+        "home_desc":         "AI-powered in-play football tips updated every 15 seconds. xG-based picks across 25+ competitions with full track record.",
+        "home_h1":           "Live Football Tips &amp; In-Play Predictions — Updated Every 15 Seconds",
+        "home_lead":         "AI-powered football picks across 25+ competitions. Our algorithm tracks xG, momentum shifts and live odds to fire tips during the match — not before it.",
+        "home_cta_history":  "View Historical Results →",
+        "home_h2_how":       "How it works",
+        "home_p_how":        "Every match in our database is monitored minute-by-minute. When xG diverges from the scoreline and live odds offer value, the algorithm fires a pick — visible instantly on the live dashboard.",
+        "home_h2_why":       "Why in-play betting?",
+        "home_p_why":        "Pre-match odds are heavily efficient. In-play markets move fast and are often mis-priced for 2–3 minutes after a key event — that's the window our model exploits.",
+        "home_h2_track":     "Track record",
+        "home_p_track_pre":  "All picks are logged with entry time, odds and result. Check the",
+        "home_p_track_link": "historical performance page",
+        "home_p_track_post": "for full transparency.",
+
+        # /today renderer chrome
+        "today_title":       "Today's Football Tips & Live Predictions | WebPronos",
+        "today_desc":        "All monitored football matches scheduled for today with live AI tips, xG model and value detection.",
+        "today_h1":          "Today's Football Matches — Live AI Tips",
+        "today_lead":        "Every monitored match scheduled for today. Click any fixture to follow the live xG model and AI tips in real time.",
+        "today_breadcrumb":  "Today",
+
+        # /tomorrow renderer chrome
+        "tomorrow_title":    "Tomorrow's Football Matches — Live AI Predictions | WebPronos",
+        "tomorrow_desc":     "Tomorrow's monitored football matches with our AI value detection ready for kickoff.",
+        "tomorrow_h1":       "Tomorrow's Football Matches",
+        "tomorrow_lead":     "Every match scheduled for tomorrow across the competitions we cover. Click any fixture to open its dedicated live page — once kickoff happens, the AI model starts publishing in-play tips, value bets and updated odds.",
+        "tomorrow_breadcrumb": "Tomorrow",
+
+        # /history renderer chrome
+        "history_title":     "History — Track Record of AI Football Predictions | WebPronos",
+        "history_desc":      "Full historical track record of every settled WebPronos AI prediction. Audit ROI, win rate and recent picks.",
+        "history_h1":        "Historical Performance — Track Record",
+        "history_lead":      "Every settled prediction by the WebPronos AI model is published openly. Audit the full track record below — no cherry-picking.",
+        "history_breadcrumb": "History",
+    },
+    "pt-br": {
+        # Nav / footer
+        "nav_home":          "Início",
+        "nav_blog":          "Blog",
+        "nav_history":       "Histórico",
+        "nav_tomorrow":      "Amanhã",
+        "nav_about":         "Sobre",
+        "footer_disclaimer": "WebPronos fornece previsões estatísticas apenas para fins informativos. 18+ — aposte com responsabilidade.",
+        "breadcrumb_root":   "WebPronos",
+
+        # Homepage chrome
+        "home_title":        "WebPronos — Tips de Futebol Ao Vivo & Previsões In-Play",
+        "home_desc":         "Tips de futebol in-play com IA atualizados a cada 15 segundos. Picks baseados em xG em mais de 25 competições com histórico completo.",
+        "home_h1":           "Tips de Futebol Ao Vivo &amp; Previsões In-Play — Atualizados a Cada 15 Segundos",
+        "home_lead":         "Picks de futebol com inteligência artificial em mais de 25 competições. Nosso algoritmo acompanha xG, mudanças de momentum e odds ao vivo para disparar tips durante o jogo — não antes dele.",
+        "home_cta_history":  "Ver Resultados Históricos →",
+        "home_h2_how":       "Como funciona",
+        "home_p_how":        "Cada jogo em nossa base de dados é monitorado minuto a minuto. Quando o xG diverge do placar e as odds ao vivo oferecem valor, o algoritmo dispara um pick — visível instantaneamente no painel ao vivo.",
+        "home_h2_why":       "Por que apostar in-play?",
+        "home_p_why":        "As odds pré-jogo são altamente eficientes. Os mercados ao vivo se movem rápido e ficam mal precificados por 2 a 3 minutos após um evento chave — essa é a janela que nosso modelo explora.",
+        "home_h2_track":     "Histórico de resultados",
+        "home_p_track_pre":  "Todos os picks são registrados com horário de entrada, odd e resultado. Confira a",
+        "home_p_track_link": "página de desempenho histórico",
+        "home_p_track_post": "para total transparência.",
+
+        # /today renderer chrome (BR)
+        "today_title":       "Jogos de Hoje — Palpites Ao Vivo & Previsões com IA | WebPronos",
+        "today_desc":        "Todos os jogos de futebol monitorados marcados para hoje com palpites in-play, modelo xG e detecção de valor.",
+        "today_h1":          "Jogos de Futebol de Hoje — Palpites Ao Vivo com IA",
+        "today_lead":        "Todos os jogos monitorados marcados para hoje. Clique em qualquer partida para acompanhar o modelo xG ao vivo e os palpites do algoritmo em tempo real.",
+        "today_breadcrumb":  "Hoje",
+
+        # /tomorrow renderer chrome (BR)
+        "tomorrow_title":    "Jogos de Amanhã — Previsões Ao Vivo com IA | WebPronos",
+        "tomorrow_desc":     "Os jogos de futebol monitorados marcados para amanhã, prontos para a nossa detecção de valor com IA quando começarem.",
+        "tomorrow_h1":       "Jogos de Futebol de Amanhã",
+        "tomorrow_lead":     "Todas as partidas marcadas para amanhã nas competições que cobrimos. Clique em qualquer jogo para abrir a página ao vivo dedicada — assim que começar, o algoritmo passa a publicar palpites in-play, apostas de valor e odds atualizadas.",
+        "tomorrow_breadcrumb": "Amanhã",
+
+        # /history renderer chrome (BR)
+        "history_title":     "Histórico — Track Record dos Palpites de IA | WebPronos",
+        "history_desc":      "Histórico completo de cada palpite liquidado pelo modelo de IA do WebPronos. Audite ROI, win rate e palpites recentes.",
+        "history_h1":        "Desempenho Histórico — Track Record",
+        "history_lead":      "Cada palpite liquidado pelo modelo de IA do WebPronos é publicado abertamente. Audite o track record completo abaixo — sem cherry-picking.",
+        "history_breadcrumb": "Histórico",
+    },
+    "pt-pt": {
+        # Nav / footer
+        "nav_home":          "Início",
+        "nav_blog":          "Blog",
+        "nav_history":       "Histórico",
+        "nav_tomorrow":      "Amanhã",
+        "nav_about":         "Sobre",
+        "footer_disclaimer": "A WebPronos fornece previsões estatísticas apenas para fins informativos. 18+ — aposte com responsabilidade.",
+        "breadcrumb_root":   "WebPronos",
+
+        # Homepage chrome — PT-PT uses "em direto" not "ao vivo", "monitorizado"
+        # not "monitorado", "marcador" not "placar", and prefers definite
+        # articles ("o nosso algoritmo", "as nossas tips").
+        "home_title":        "WebPronos — Palpites de Futebol Em Direto & Previsões In-Play",
+        "home_desc":         "Palpites de futebol in-play com IA atualizados a cada 15 segundos. Picks baseados em xG em mais de 25 competições com histórico completo.",
+        "home_h1":           "Palpites de Futebol Em Direto &amp; Previsões In-Play — Atualizados a Cada 15 Segundos",
+        "home_lead":         "Picks de futebol com inteligência artificial em mais de 25 competições. O nosso algoritmo acompanha o xG, as mudanças de momentum e as odds em direto para disparar palpites durante o jogo — não antes dele.",
+        "home_cta_history":  "Ver Resultados Históricos →",
+        "home_h2_how":       "Como funciona",
+        "home_p_how":        "Cada jogo na nossa base de dados é monitorizado minuto a minuto. Quando o xG diverge do marcador e as odds em direto oferecem valor, o algoritmo dispara um pick — visível instantaneamente no painel em direto.",
+        "home_h2_why":       "Porquê apostar in-play?",
+        "home_p_why":        "As odds pré-jogo são muito eficientes. Os mercados em direto movem-se depressa e ficam mal cotados durante 2 a 3 minutos após um evento-chave — é essa a janela que o nosso modelo explora.",
+        "home_h2_track":     "Histórico de resultados",
+        "home_p_track_pre":  "Todos os picks são registados com hora de entrada, odd e resultado. Consulta a",
+        "home_p_track_link": "página de desempenho histórico",
+        "home_p_track_post": "para total transparência.",
+
+        # /today renderer chrome (PT-PT)
+        "today_title":       "Jogos de Hoje — Palpites Em Direto & Previsões com IA | WebPronos",
+        "today_desc":        "Todos os jogos de futebol monitorizados marcados para hoje com palpites in-play, modelo xG e deteção de valor.",
+        "today_h1":          "Jogos de Futebol de Hoje — Palpites Em Direto com IA",
+        "today_lead":        "Todos os jogos monitorizados marcados para hoje. Clica em qualquer partida para acompanhar o modelo xG em direto e as tips do algoritmo em tempo real.",
+        "today_breadcrumb":  "Hoje",
+
+        # /tomorrow renderer chrome (PT-PT)
+        "tomorrow_title":    "Jogos de Amanhã — Previsões Em Direto com IA | WebPronos",
+        "tomorrow_desc":     "Os jogos de futebol monitorizados marcados para amanhã, prontos para a nossa deteção de valor com IA quando começarem.",
+        "tomorrow_h1":       "Jogos de Futebol de Amanhã",
+        "tomorrow_lead":     "Todas as partidas marcadas para amanhã nas competições que cobrimos. Clica em qualquer jogo para abrir a página em direto dedicada — assim que começar, o algoritmo passa a publicar tips in-play, apostas de valor e odds atualizadas.",
+        "tomorrow_breadcrumb": "Amanhã",
+
+        # /history renderer chrome (PT-PT)
+        "history_title":     "Histórico — Track Record das Tips de IA | WebPronos",
+        "history_desc":      "Histórico completo de cada tip liquidada pelo modelo de IA da WebPronos. Audita ROI, win rate e tips recentes.",
+        "history_h1":        "Desempenho Histórico — Track Record",
+        "history_lead":      "Cada tip liquidada pelo modelo de IA da WebPronos é publicada abertamente. Audita o track record completo abaixo — sem cherry-picking.",
+        "history_breadcrumb": "Histórico",
+    },
+    "es": {
+        # Nav / footer
+        "nav_home":          "Inicio",
+        "nav_blog":          "Blog",
+        "nav_history":       "Historial",
+        "nav_tomorrow":      "Mañana",
+        "nav_about":         "Sobre",
+        "footer_disclaimer": "WebPronos ofrece predicciones estadísticas únicamente con fines informativos. +18 — apuesta con responsabilidad.",
+        "breadcrumb_root":   "WebPronos",
+
+        # Homepage chrome — Spanish (Spain + LatAm). "Pronósticos" or "tips"
+        # both work; we use both interchangeably for SEO coverage.
+        "home_title":        "WebPronos — Pronósticos de Fútbol En Vivo y Predicciones In-Play",
+        "home_desc":         "Pronósticos de fútbol in-play con IA actualizados cada 15 segundos. Picks basados en xG en más de 25 competiciones con histórico completo.",
+        "home_h1":           "Pronósticos de Fútbol En Vivo &amp; Predicciones In-Play — Actualizados Cada 15 Segundos",
+        "home_lead":         "Picks de fútbol con inteligencia artificial en más de 25 competiciones. Nuestro algoritmo sigue el xG, los cambios de momentum y las cuotas en vivo para disparar tips durante el partido — no antes.",
+        "home_cta_history":  "Ver Resultados Históricos →",
+        "home_h2_how":       "Cómo funciona",
+        "home_p_how":        "Cada partido en nuestra base de datos se monitoriza minuto a minuto. Cuando el xG diverge del marcador y las cuotas en vivo ofrecen valor, el algoritmo dispara un pick — visible al instante en el panel en vivo.",
+        "home_h2_why":       "¿Por qué apostar in-play?",
+        "home_p_why":        "Las cuotas previas al partido son muy eficientes. Los mercados en vivo se mueven rápido y quedan mal cotizados durante 2 a 3 minutos después de un evento clave — esa es la ventana que explota nuestro modelo.",
+        "home_h2_track":     "Histórico de resultados",
+        "home_p_track_pre":  "Todos los picks se registran con hora de entrada, cuota y resultado. Consulta la",
+        "home_p_track_link": "página de rendimiento histórico",
+        "home_p_track_post": "para total transparencia.",
+
+        # /today renderer chrome (ES)
+        "today_title":       "Partidos de Hoy — Pronósticos En Vivo con IA | WebPronos",
+        "today_desc":        "Todos los partidos de fútbol monitorizados programados para hoy con tips en vivo, modelo xG y detección de valor.",
+        "today_h1":          "Partidos de Fútbol de Hoy — Tips En Vivo con IA",
+        "today_lead":        "Todos los partidos monitorizados programados para hoy. Pulsa en cualquier partido para seguir el modelo xG en vivo y los tips del algoritmo en tiempo real.",
+        "today_breadcrumb":  "Hoy",
+
+        # /tomorrow renderer chrome (ES)
+        "tomorrow_title":    "Partidos de Mañana — Predicciones En Vivo con IA | WebPronos",
+        "tomorrow_desc":     "Los partidos de fútbol monitorizados programados para mañana, listos para nuestra detección de valor con IA cuando empiecen.",
+        "tomorrow_h1":       "Partidos de Fútbol de Mañana",
+        "tomorrow_lead":     "Todos los partidos programados para mañana en las competiciones que cubrimos. Pulsa en cualquier partido para abrir su página en vivo dedicada — en cuanto empiece, el algoritmo publica tips in-play, apuestas de valor y cuotas actualizadas.",
+        "tomorrow_breadcrumb": "Mañana",
+
+        # /history renderer chrome (ES)
+        "history_title":     "Historial — Track Record de Predicciones de IA | WebPronos",
+        "history_desc":      "Historial completo de cada predicción liquidada por el modelo de IA de WebPronos. Audita el ROI, el win rate y los picks recientes.",
+        "history_h1":        "Rendimiento Histórico — Track Record",
+        "history_lead":      "Cada predicción liquidada por el modelo de IA de WebPronos se publica abiertamente. Audita el track record completo abajo — sin cherry-picking.",
+        "history_breadcrumb": "Historial",
+    },
+}
+
+
+def _t_site(locale: str, key: str) -> str:
+    """Lookup a site-wide string with EN fallback. Mirror of `_t` but for
+    SEO/page chrome (separate namespace from the inbet widget's WIDGET_COPY).
+    """
+    bucket = _SITE_I18N.get(locale) or _SITE_I18N["en"]
+    return bucket.get(key) or _SITE_I18N["en"].get(key, key)
+
+
+# Per-locale slug translations for static routes. EN canonical paths map
+# to the locale-specific URL slug. EN is implicit (no entry needed).
+#
+# Lookup pattern:
+#   _localized_slug("/about", "pt-br")  → "/sobre"
+#   _localized_slug("/about", "en")     → "/about"    (passthrough)
+#   _canonical_slug("/sobre", "pt-br")  → "/about"    (reverse — for routing)
+#   _canonical_slug("/about", "pt-br")  → "/about"    (no-op if already EN)
+#
+# To add a new BR static slug: append one entry. To add PT-PT/ES later:
+# add a top-level bucket. Sitemap, footer nav, hreflang and prerender
+# routing all read from this single source of truth.
+_STATIC_SLUG_I18N = {
+    "pt-br": {
+        "/about":                "/sobre",
+        "/terms":                "/termos",
+        "/privacy":              "/privacidade",
+        "/responsible-gambling": "/jogo-responsavel",
+        "/today":                "/hoje",
+        "/tomorrow":             "/amanha",
+        "/history":              "/historico",
+    },
+    "pt-pt": {
+        # PT-PT slugs are semantically identical to BR (both Portuguese)
+        # but live under /pt/ instead of /br/. The CONTENT differs (PT
+        # uses "em direto" vs BR "ao vivo", "marcador" vs "placar", etc).
+        "/about":                "/sobre",
+        "/terms":                "/termos",
+        "/privacy":              "/privacidade",
+        "/responsible-gambling": "/jogo-responsavel",
+        "/today":                "/hoje",
+        "/tomorrow":             "/amanha",
+        "/history":              "/historico",
+    },
+    "es": {
+        "/about":                "/sobre",
+        "/terms":                "/terminos",
+        "/privacy":              "/privacidad",
+        "/responsible-gambling": "/juego-responsable",
+        "/today":                "/hoy",
+        "/tomorrow":             "/manana",
+        "/history":              "/historial",
+    },
+}
+
+
+# Per-locale slug translations for individual BLOG POSTS. Each EN slug
+# maps to the localized slug used in the {lang}/blog/<slug> URL. Used by
+# the sitemap (hreflang alternates between en/br/pt/es per post) and by
+# any future EN→localized redirect logic in Flask.
+#
+# Worker has its own copy in BR_BLOG_SLUG_REDIRECTS — keep them in sync.
+# Append when new posts are translated.
+_BLOG_SLUG_I18N = {
+    "live-betting-vs-pre-match-why-timing-matters": {
+        "pt-br": "apostas-ao-vivo-vs-pre-jogo-por-que-o-timing-muda-tudo",
+        "pt-pt": "apostas-em-direto-vs-pre-jogo-porque-o-timing-importa",
+        "es":    "apuestas-en-vivo-vs-pre-partido-por-que-importa-el-timing",
+    },
+    "what-is-betting-edge-how-to-calculate": {
+        "pt-br": "o-que-e-edge-em-apostas-como-calcular",
+        "pt-pt": "o-que-e-o-edge-nas-apostas-como-calcular",
+        "es":    "que-es-el-edge-en-apuestas-como-calcularlo",
+    },
+    "over-under-betting-strategy-xg": {
+        "pt-br": "apostas-over-under-por-que-xg-torna-previsivel",
+        "pt-pt": "apostas-over-under-porque-o-xg-as-torna-previsiveis",
+        "es":    "apuestas-over-under-por-que-xg-las-hace-predecibles",
+    },
+    "how-real-time-xg-powers-our-betting-tips": {
+        "pt-br": "como-xg-tempo-real-move-tips-apostas",
+        "pt-pt": "como-o-xg-em-tempo-real-impulsiona-as-nossas-tips",
+        "es":    "como-el-xg-en-tiempo-real-impulsa-nuestras-tips",
+    },
+    "what-is-xg-expected-goals-football": {
+        "pt-br": "o-que-e-xg-gols-esperados-futebol",
+        "pt-pt": "o-que-e-xg-golos-esperados-futebol",
+        "es":    "que-es-xg-goles-esperados-futbol",
+    },
+}
+
+
+# Competition / league name translations. The bookmaker data feed
+# returns competitions in English (Sofascore is English-first), but
+# BR audiences search "Campeonato Inglês", "Liga dos Campeões", etc.
+# This map is consulted by meta-tag generation, league-page titles
+# and the homepage SEO copy whenever rendering for a non-EN locale.
+#
+# Keys are matched case-insensitively against the raw tournament string.
+# Extend as new competitions appear in our monitored set.
+_LEAGUE_NAME_I18N = {
+    "pt-br": {
+        "premier league":          "Campeonato Inglês",
+        "la liga":                 "Campeonato Espanhol",
+        "laliga":                  "Campeonato Espanhol",
+        "serie a":                 "Campeonato Italiano",
+        "bundesliga":              "Campeonato Alemão",
+        "ligue 1":                 "Campeonato Francês",
+        "primeira liga":           "Campeonato Português",
+        "liga portugal":           "Campeonato Português",
+        "liga portugal betclic":   "Campeonato Português",
+        "eredivisie":              "Campeonato Holandês",
+        "vriendenloterij eredivisie": "Campeonato Holandês",
+        "jupiler pro league":      "Campeonato Belga",
+        "pro league":              "Campeonato Belga",
+        "uefa champions league":   "Liga dos Campeões",
+        "champions league":        "Liga dos Campeões",
+        "uefa europa league":      "Liga Europa",
+        "europa league":           "Liga Europa",
+        "uefa europa conference league": "Liga Conferência",
+        "conference league":       "Liga Conferência",
+        "copa libertadores":       "Copa Libertadores",
+        "conmebol libertadores":   "Copa Libertadores",
+        "copa sudamericana":       "Copa Sul-Americana",
+        "conmebol sudamericana":   "Copa Sul-Americana",
+        "brasileirão":             "Brasileirão",
+        "brasileirao":             "Brasileirão",
+        "brasileirão série a":     "Brasileirão Série A",
+        "campeonato brasileiro série a": "Brasileirão Série A",
+        "mls":                     "MLS",
+        "fifa world cup":          "Copa do Mundo",
+        "world cup":               "Copa do Mundo",
+        "fifa world cup 2026":     "Copa do Mundo 2026",
+    },
+    "pt-pt": {
+        # Convenção PT-PT: "Liga Inglesa", "Liga Espanhola" — termos
+        # comummente usados nas crónicas desportivas portuguesas. Para
+        # competições internacionais usa-se o termo localizado natural
+        # ("Liga dos Campeões", "Liga Europa").
+        "premier league":          "Liga Inglesa",
+        "la liga":                 "Liga Espanhola",
+        "laliga":                  "Liga Espanhola",
+        "serie a":                 "Liga Italiana",
+        "bundesliga":              "Bundesliga",
+        "ligue 1":                 "Ligue 1",
+        "primeira liga":           "Liga Portuguesa",
+        "liga portugal":           "Liga Portuguesa",
+        "liga portugal betclic":   "Liga Portugal Betclic",
+        "eredivisie":              "Eredivisie",
+        "vriendenloterij eredivisie": "Eredivisie",
+        "jupiler pro league":      "Pro League Belga",
+        "pro league":              "Pro League Belga",
+        "uefa champions league":   "Liga dos Campeões",
+        "champions league":        "Liga dos Campeões",
+        "uefa europa league":      "Liga Europa",
+        "europa league":           "Liga Europa",
+        "uefa europa conference league": "Liga Conferência",
+        "conference league":       "Liga Conferência",
+        "copa libertadores":       "Taça Libertadores",
+        "conmebol libertadores":   "Taça Libertadores",
+        "copa sudamericana":       "Taça Sul-Americana",
+        "conmebol sudamericana":   "Taça Sul-Americana",
+        "brasileirão":             "Brasileirão",
+        "brasileirao":             "Brasileirão",
+        "brasileirão série a":     "Brasileirão Série A",
+        "campeonato brasileiro série a": "Brasileirão Série A",
+        "mls":                     "MLS",
+        "fifa world cup":          "Mundial",
+        "world cup":               "Mundial",
+        "fifa world cup 2026":     "Mundial 2026",
+    },
+    "es": {
+        # Spanish (Spain + LatAm) — Spanish media commonly translates
+        # european leagues: "Liga Inglesa", "Bundesliga" stays as-is.
+        # International competitions: "Liga de Campeones", "Liga Europa".
+        "premier league":          "Premier League",
+        "la liga":                 "LaLiga",
+        "laliga":                  "LaLiga",
+        "serie a":                 "Serie A",
+        "bundesliga":              "Bundesliga",
+        "ligue 1":                 "Ligue 1",
+        "primeira liga":           "Liga Portuguesa",
+        "liga portugal":           "Liga Portuguesa",
+        "liga portugal betclic":   "Liga Portugal Betclic",
+        "eredivisie":              "Eredivisie",
+        "vriendenloterij eredivisie": "Eredivisie",
+        "jupiler pro league":      "Pro League Belga",
+        "pro league":              "Pro League Belga",
+        "uefa champions league":   "Liga de Campeones",
+        "champions league":        "Liga de Campeones",
+        "uefa europa league":      "Europa League",
+        "europa league":           "Europa League",
+        "uefa europa conference league": "Conference League",
+        "conference league":       "Conference League",
+        "copa libertadores":       "Copa Libertadores",
+        "conmebol libertadores":   "Copa Libertadores",
+        "copa sudamericana":       "Copa Sudamericana",
+        "conmebol sudamericana":   "Copa Sudamericana",
+        "brasileirão":             "Brasileirão",
+        "brasileirao":             "Brasileirão",
+        "brasileirão série a":     "Brasileirão Serie A",
+        "campeonato brasileiro série a": "Brasileirão Serie A",
+        "mls":                     "MLS",
+        "fifa world cup":          "Mundial",
+        "world cup":               "Mundial",
+        "fifa world cup 2026":     "Mundial 2026",
+    },
+}
+
+
+def _localized_league_name(name: str, locale: str) -> str:
+    """Translate a competition name to the requested locale.
+
+    Sofascore returns split-format names like "UEFA Europa League,
+    Knockout stage" or "Pro League, Conference League Playoffs". We
+    translate the LEAGUE-NAME prefix (before the comma) and keep the
+    stage suffix as-is — adding stage translations later is a follow-up.
+
+    Passthrough if locale has no entry or the name isn't in the map.
+    """
+    if not name or locale == "en":
+        return name or ""
+    bucket = _LEAGUE_NAME_I18N.get(locale) or {}
+    key = name.strip().lower()
+    if key in bucket:
+        return bucket[key]
+    # Try prefix before comma (handles "UEFA Europa League, Knockout stage")
+    if "," in key:
+        prefix, _, rest = key.partition(",")
+        prefix = prefix.strip()
+        if prefix in bucket:
+            # Preserve original casing on the rest, just swap the prefix.
+            _, _, orig_rest = name.partition(",")
+            return f"{bucket[prefix]},{orig_rest}"
+    return name
+
+
+def _matchup_separator(locale: str) -> str:
+    """BR audiences write 'Time A x Time B'. EN/PT-PT/ES use 'vs'."""
+    return " x " if locale == "pt-br" else " vs "
+
+
+def _localized_blog_slug(en_slug: str, locale: str) -> str:
+    """Return the locale-specific blog slug for an EN canonical slug.
+    Passthrough on EN or when no translation has been added yet."""
+    if locale == "en":
+        return en_slug
+    return _BLOG_SLUG_I18N.get(en_slug, {}).get(locale, en_slug)
+
+
+def _canonical_blog_slug(localized_slug: str, locale: str) -> str:
+    """Reverse: given a localized blog slug, return the EN canonical slug.
+    Returns the input unchanged if no mapping exists."""
+    if locale == "en":
+        return localized_slug
+    for en, bucket in _BLOG_SLUG_I18N.items():
+        if bucket.get(locale) == localized_slug:
+            return en
+    return localized_slug
+
+
+def _localized_slug(en_path: str, locale: str) -> str:
+    """Return the locale-specific slug for an EN canonical path.
+    Passthrough if the locale has no entry for that path."""
+    return _STATIC_SLUG_I18N.get(locale, {}).get(en_path, en_path)
+
+
+def _canonical_slug(localized_path: str, locale: str) -> str:
+    """Reverse of _localized_slug: given a localized URL slug, return the
+    EN canonical path so downstream routing (which keys off /about,
+    /history, etc.) can match. Returns the input unchanged if no mapping
+    exists — supports both directions transparently.
+    """
+    bucket = _STATIC_SLUG_I18N.get(locale, {})
+    for en, local in bucket.items():
+        if local == localized_path:
+            return en
+    return localized_path
+
+
+# Per-locale prefix translations for DYNAMIC routes. Unlike static slugs
+# (which are exact paths), these prefix-match the URL and translate only
+# the path-prefix segment. Used to canonicalize incoming localized URLs
+# like /br/jogo/123/X → /match/123/X for downstream routing, and in the
+# reverse direction when building outbound links / sitemaps.
+#
+# WHY THIS MATTERS: without this map, a Googlebot request to
+# /br/jogo/16163439 would NOT match `^/match/\d+` in prerender_dispatch
+# and would fall through to the Lovable SPA shell — meaning every BR
+# match URL indexed by Google gets the homepage hero as H1 instead of
+# the match-specific prerender. Same applies to /liga, /equipa, /palpites.
+_DYNAMIC_PATH_PREFIXES_I18N = {
+    "pt-br": {
+        "/match/":   "/jogo/",
+        "/league/":  "/liga/",
+        "/team/":    "/equipa/",
+        "/tips/":    "/palpites/",
+    },
+    "pt-pt": {
+        # PT-PT shares Portuguese vocabulary with BR for these terms.
+        "/match/":   "/jogo/",
+        "/league/":  "/liga/",
+        "/team/":    "/equipa/",
+        "/tips/":    "/palpites/",
+    },
+    "es": {
+        "/match/":   "/partido/",
+        "/league/":  "/liga/",
+        "/team/":    "/equipo/",
+        "/tips/":    "/pronosticos/",
+    },
+}
+
+
+def _canonical_dynamic_path(localized_path: str, locale: str) -> str:
+    """Convert a localized dynamic path back to its EN canonical form.
+       /jogo/123/slug → /match/123/slug  (pt-br, pt-pt)
+       /partido/123    → /match/123       (es)
+       /liga/foo       → /league/foo      (all non-EN)
+    Returns the input unchanged if no mapping applies."""
+    if locale == "en":
+        return localized_path
+    bucket = _DYNAMIC_PATH_PREFIXES_I18N.get(locale) or {}
+    for en_prefix, local_prefix in bucket.items():
+        if localized_path.startswith(local_prefix):
+            return en_prefix + localized_path[len(local_prefix):]
+    return localized_path
+
+
+def _localized_dynamic_path(en_path: str, locale: str) -> str:
+    """Forward of _canonical_dynamic_path. Used when generating outbound
+    links or sitemap URLs that should carry the locale-native slug.
+       /match/123/slug → /jogo/123/slug   (pt-br, pt-pt)
+       /league/foo     → /liga/foo        (all non-EN)
+    """
+    if locale == "en":
+        return en_path
+    bucket = _DYNAMIC_PATH_PREFIXES_I18N.get(locale) or {}
+    for en_prefix, local_prefix in bucket.items():
+        if en_path.startswith(en_prefix):
+            return local_prefix + en_path[len(en_prefix):]
+    return en_path
+
+
+def _extract_lang_prefix(path: str) -> tuple[str, str]:
+    """Pull the lang prefix off a URL path. Returns (locale, EN-canonical-path).
+
+    Also translates locale-specific slugs back to their EN canonical form
+    so downstream route matching only needs to know the EN path. Examples:
+
+        /br/match/123 → ("pt-br", "/match/123")
+        /br/sobre     → ("pt-br", "/about")           ← BR slug normalized
+        /br/historico → ("pt-br", "/history")
+        /pt           → ("pt-pt", "/")
+        /es/about     → ("es",    "/about")
+        /match/123    → ("en",    "/match/123")
+        /             → ("en",    "/")
+    """
+    import re as _re_lp
+    m = _re_lp.match(r"^/(pt|br|es)(/.*|$)", path or "/")
+    if not m:
+        return "en", path or "/"
+    locale = _LANG_PREFIX_TO_LOCALE[m.group(1)]
+    stripped = m.group(2) or "/"
+    if stripped == "":
+        stripped = "/"
+    # Normalize localized static slug → EN canonical (/sobre→/about etc).
+    stripped = _canonical_slug(stripped, locale)
+    # Normalize localized dynamic path prefix → EN canonical
+    # (/jogo/123→/match/123, /liga/foo→/league/foo, etc.)
+    stripped = _canonical_dynamic_path(stripped, locale)
+    return locale, stripped
+
+
+def _hreflang_tags(en_canonical_path: str) -> str:
+    """Render the full set of <link rel="alternate" hreflang> tags for a
+    given EN-canonical path. Each locale's href uses its own translated
+    slug — eg the /about page emits hreflang="pt-br" with /br/sobre, not
+    /br/about. Includes x-default → EN canonical (no prefix).
+    """
+    tags = []
+    for locale, prefix in _LOCALE_TO_PREFIX.items():
+        local_path = _localized_slug(en_canonical_path, locale)
+        href = f"{SITE_URL}{prefix}{local_path}"
+        tags.append(f'<link rel="alternate" hreflang="{locale}" href="{href}">')
+    tags.append(f'<link rel="alternate" hreflang="x-default" href="{SITE_URL}{en_canonical_path}">')
+    return "\n    ".join(tags)
 
 
 # ── Static legal/info pages — proper SSR (not SPA shell) ────────────────────
@@ -15208,8 +19926,278 @@ _STATIC_PAGES: dict = {
     },
 }
 
+# Per-locale overrides of the static pages dict.
+# Lookup order in `_render_static_page`:
+#   1. _STATIC_PAGES_I18N[locale][path]   (full translation)
+#   2. _STATIC_PAGES[path]                 (EN fallback)
+# Adding a new locale = append one block here. No code change elsewhere.
+_STATIC_PAGES_I18N: dict = {
+    "pt-br": {
+        "/about": {
+            "title":       "Sobre o WebPronos — Como Funciona Nosso Modelo de IA de Previsões de Futebol",
+            "description": "WebPronos é uma plataforma de tips de futebol com inteligência artificial. Nosso modelo xG identifica apostas de valor positivo em tempo real em mais de 25 ligas e publica cada pick com auditoria completa.",
+            "h1":          "Sobre o WebPronos",
+            "breadcrumb":  "Sobre",
+            "body":        """
+            <p>O WebPronos é uma plataforma de previsões de futebol ao vivo movida por um modelo de IA proprietário construído em torno do <strong>Expected Goals (xG)</strong>. Monitoramos jogos ao vivo em mais de 25 competições, ingerimos dados de cada chute e identificamos apostas de valor esperado positivo no momento em que as odds da casa de apostas divergem das probabilidades do modelo.</p>
+            <h2 class="pr-h2">O que fazemos</h2>
+            <p>Cada pick gerado pelo nosso modelo é registrado no instante em que o valor aparece — nunca editado, nunca apagado. Publicamos a odd de entrada, o estado ao vivo do jogo no momento do pick, o resultado em curso e o resumo de lucro/prejuízo já liquidado. O histórico completo está em <a href="/br/history">webpronos.com/br/history</a>.</p>
+            <h2 class="pr-h2">Como o modelo funciona</h2>
+            <p>O motor central é um modelo xG treinado em dados ao nível do chute. Para cada chute em um jogo, o modelo calcula a probabilidade de gol esperado com base na posição, parte do corpo, situação e pressão defensiva. Essas probabilidades por chute se agregam em probabilidades ao vivo de vitória/empate/derrota, over/under e handicap, que são então comparadas com as odds ao vivo da casa de apostas usando um cálculo de edge no estilo Benter. Qualquer mercado onde a probabilidade implícita do modelo excede a da casa (após ajuste de margem) é sinalizado como uma pick de valor.</p>
+            <h2 class="pr-h2">Por que publicamos tudo</h2>
+            <p>A maioria dos tipsters seleciona apenas as vitórias e esconde as derrotas. Ao publicar cada pick liquidado — incluindo as ruins — permitimos que qualquer pessoa audite nosso edge. Se o ROI de longo prazo se mantiver positivo ao longo de milhares de picks, o modelo está realmente batendo o mercado.</p>
+            <p>Veja os <a href="/br/today">picks ao vivo de hoje</a>, os <a href="/br/tomorrow">jogos de amanhã</a>, o <a href="/br/history">histórico completo de auditoria</a> ou leia nosso <a href="/br/blog">blog</a> para explicações mais profundas sobre xG.</p>
+        """,
+        },
+        "/terms": {
+            "title":       "Termos de Uso | WebPronos",
+            "description": "Termos de Uso do WebPronos. Ao usar nosso site você aceita estes termos. Fornecemos previsões estatísticas de futebol apenas para fins informativos — nenhum resultado é garantido.",
+            "h1":          "Termos de Uso",
+            "breadcrumb":  "Termos",
+            "body":        """
+            <p>Ao acessar ou usar o WebPronos você concorda com estes termos. O WebPronos publica previsões estatísticas de futebol e dados históricos de desempenho <strong>apenas para fins informativos</strong>. Não oferecemos apostas, jogos de azar ou aconselhamento financeiro.</p>
+            <h2 class="pr-h2">Nenhum resultado garantido</h2>
+            <p>Cada previsão no WebPronos é uma estimativa probabilística gerada por um modelo de IA com base em dados de jogos publicamente disponíveis. Nenhum resultado é garantido. O desempenho passado — incluindo qualquer ROI positivo mostrado em nosso <a href="/br/history">histórico</a> — não prevê resultados futuros.</p>
+            <h2 class="pr-h2">Responsabilidade do usuário</h2>
+            <p>Você é o único responsável por qualquer decisão de aposta que tomar. O WebPronos não é uma casa de apostas e não assume responsabilidade por qualquer perda financeira decorrente do uso de nossas previsões.</p>
+            <h2 class="pr-h2">Restrição de idade</h2>
+            <p>Você deve ter pelo menos 18 anos para usar este site. Consulte nossa <a href="/br/responsible-gambling">página de jogo responsável</a> para recursos de ajuda e suporte.</p>
+            <h2 class="pr-h2">Propriedade intelectual</h2>
+            <p>As previsões, conjuntos de dados e comentários analíticos no WebPronos são propriedade intelectual do WebPronos. A reutilização para fins não comerciais é permitida com atribuição e backlink para a página de origem.</p>
+            <h2 class="pr-h2">Alterações nestes termos</h2>
+            <p>Podemos atualizar estes termos periodicamente. Alterações materiais serão indicadas no topo desta página com a data de entrada em vigor.</p>
+        """,
+        },
+        "/privacy": {
+            "title":       "Política de Privacidade | WebPronos",
+            "description": "Política de privacidade do WebPronos. Coletamos análises mínimas para melhorar o serviço. Não vendemos dados de usuários e cumprimos a LGPD/GDPR.",
+            "h1":          "Política de Privacidade",
+            "breadcrumb":  "Privacidade",
+            "body":        """
+            <p>O WebPronos respeita sua privacidade. Esta página explica quais dados coletamos, por quê e como os tratamos.</p>
+            <h2 class="pr-h2">O que coletamos</h2>
+            <p>Coletamos análises mínimas de primeira parte: visualizações de página, referenciador, tipo de navegador e região geográfica aproximada. Não coletamos nomes, endereços de e-mail ou dados de pagamento, a menos que você os forneça explicitamente (por exemplo, ao se inscrever no canal do Telegram).</p>
+            <h2 class="pr-h2">Serviços de terceiros</h2>
+            <p>Parte do conteúdo é servido via Cloudflare (CDN), Lovable (hospedagem) e Fly.io (backend). Esses provedores podem definir cookies técnicos necessários para o funcionamento do site.</p>
+            <h2 class="pr-h2">Seus direitos (LGPD/GDPR)</h2>
+            <p>Se você estiver no Brasil ou na UE/EEE, tem o direito de acessar, corrigir ou excluir quaisquer dados que tenhamos sobre você. Entre em contato pelo link no rodapé.</p>
+            <h2 class="pr-h2">Retenção de dados</h2>
+            <p>Os dados analíticos são retidos por no máximo 12 meses e depois agregados e anonimizados automaticamente.</p>
+        """,
+        },
+        "/responsible-gambling": {
+            "title":       "Jogo Responsável — Aposte com Segurança | WebPronos",
+            "description": "Ajuda e recursos para apostas seguras. Se o jogo deixou de ser divertido, procure ajuda. Apenas 18+. Recursos incluem Jogadores Anônimos, BeGambleAware, GamCare e SOS Jogador.",
+            "h1":          "Jogo Responsável",
+            "breadcrumb":  "Jogo Responsável",
+            "body":        """
+            <p>O WebPronos publica previsões de futebol apenas para fins informativos e de entretenimento. <strong>As apostas envolvem risco.</strong> Nunca aposte mais do que você pode perder.</p>
+            <h2 class="pr-h2">Sinais de um problema</h2>
+            <ul>
+              <li>Apostar mais do que pretendia ou tentar recuperar perdas</li>
+              <li>Esconder a atividade de apostas de amigos e familiares</li>
+              <li>Pedir dinheiro emprestado para apostar</li>
+              <li>Sentir ansiedade ou depressão por causa das apostas</li>
+              <li>As apostas interferirem no trabalho, estudos ou relacionamentos</li>
+            </ul>
+            <h2 class="pr-h2">Onde obter ajuda</h2>
+            <ul>
+              <li><strong>Jogadores Anônimos Brasil</strong> — <a href="https://jogadoresanonimos.com.br" rel="noopener noreferrer">jogadoresanonimos.com.br</a></li>
+              <li><strong>CVV — Centro de Valorização da Vida</strong> (Brasil, 24h) — <a href="https://www.cvv.org.br" rel="noopener noreferrer">cvv.org.br</a> · 188</li>
+              <li><strong>BeGambleAware</strong> (Internacional) — <a href="https://www.begambleaware.org" rel="noopener noreferrer">begambleaware.org</a></li>
+              <li><strong>GamCare</strong> (Reino Unido) — <a href="https://www.gamcare.org.uk" rel="noopener noreferrer">gamcare.org.uk</a></li>
+              <li><strong>SOS Jogador</strong> (Portugal) — <a href="https://www.sosjogador.org" rel="noopener noreferrer">sosjogador.org</a></li>
+            </ul>
+            <h2 class="pr-h2">Aposte com bom senso</h2>
+            <p>Defina um orçamento diário/semanal e respeite-o. Faça pausas regulares. Trate as apostas como entretenimento — não como uma forma de ganhar dinheiro. Se estiver com dificuldades, entre em contato com um dos recursos acima.</p>
+            <p><strong>Apenas 18+.</strong> Se você suspeita que tem um problema com apostas, pare imediatamente e procure ajuda.</p>
+        """,
+        },
+    },
+    "pt-pt": {
+        "/about": {
+            "title":       "Sobre a WebPronos — Como Funciona o Nosso Modelo de IA de Previsões de Futebol",
+            "description": "A WebPronos é uma plataforma de palpites de futebol com inteligência artificial. O nosso modelo xG identifica apostas de valor positivo em tempo real em mais de 25 ligas e publica cada pick com auditoria completa.",
+            "h1":          "Sobre a WebPronos",
+            "breadcrumb":  "Sobre",
+            "body":        """
+            <p>A WebPronos é uma plataforma de previsões de futebol em direto movida por um modelo de IA proprietário construído em torno dos <strong>Golos Esperados (xG)</strong>. Monitorizamos jogos em direto em mais de 25 competições, ingerimos dados de cada remate e identificamos apostas de valor esperado positivo no momento em que as odds da casa de apostas divergem das probabilidades do modelo.</p>
+            <h2 class="pr-h2">O que fazemos</h2>
+            <p>Cada pick gerado pelo nosso modelo é registado no instante em que o valor aparece — nunca editado, nunca apagado. Publicamos a odd de entrada, o estado em direto do jogo no momento do pick, o resultado em curso e o resumo de lucro/prejuízo já liquidado. O histórico completo está em <a href="/pt/historico">webpronos.com/pt/historico</a>.</p>
+            <h2 class="pr-h2">Como o modelo funciona</h2>
+            <p>O motor central é um modelo xG treinado em dados ao nível do remate. Para cada remate num jogo, o modelo calcula a probabilidade de golo esperado com base na posição, parte do corpo, situação e pressão defensiva. Essas probabilidades por remate agregam-se em probabilidades em direto de vitória/empate/derrota, over/under e handicap, que são depois comparadas com as odds em direto da casa de apostas usando um cálculo de edge no estilo Benter. Qualquer mercado onde a probabilidade implícita do modelo excede a da casa (após ajuste de margem) é sinalizado como uma pick de valor.</p>
+            <h2 class="pr-h2">Porque publicamos tudo</h2>
+            <p>A maioria dos tipsters seleciona apenas as vitórias e esconde as derrotas. Ao publicar cada pick liquidado — incluindo as más — permitimos que qualquer pessoa audite o nosso edge. Se o ROI a longo prazo se mantiver positivo ao longo de milhares de picks, o modelo está realmente a bater o mercado.</p>
+            <p>Vê os <a href="/pt/hoje">picks em direto de hoje</a>, os <a href="/pt/amanha">jogos de amanhã</a>, o <a href="/pt/historico">histórico completo de auditoria</a> ou lê o nosso <a href="/pt/blog">blog</a> para explicações mais profundas sobre xG.</p>
+        """,
+        },
+        "/terms": {
+            "title":       "Termos de Utilização | WebPronos",
+            "description": "Termos de Utilização da WebPronos. Ao usar o nosso site aceitas estes termos. Fornecemos previsões estatísticas de futebol apenas para fins informativos — nenhum resultado é garantido.",
+            "h1":          "Termos de Utilização",
+            "breadcrumb":  "Termos",
+            "body":        """
+            <p>Ao aceder ou utilizar a WebPronos concordas com estes termos. A WebPronos publica previsões estatísticas de futebol e dados históricos de desempenho <strong>apenas para fins informativos</strong>. Não oferecemos apostas, jogos de azar ou aconselhamento financeiro.</p>
+            <h2 class="pr-h2">Nenhum resultado garantido</h2>
+            <p>Cada previsão na WebPronos é uma estimativa probabilística gerada por um modelo de IA com base em dados de jogos publicamente disponíveis. Nenhum resultado é garantido. O desempenho passado — incluindo qualquer ROI positivo mostrado no nosso <a href="/pt/historico">histórico</a> — não prevê resultados futuros.</p>
+            <h2 class="pr-h2">Responsabilidade do utilizador</h2>
+            <p>Tu és o único responsável por qualquer decisão de aposta que tomes. A WebPronos não é uma casa de apostas e não assume responsabilidade por qualquer perda financeira decorrente do uso das nossas previsões.</p>
+            <h2 class="pr-h2">Restrição de idade</h2>
+            <p>Tens de ter pelo menos 18 anos para usar este site. Consulta a nossa <a href="/pt/jogo-responsavel">página de jogo responsável</a> para recursos de ajuda e apoio.</p>
+            <h2 class="pr-h2">Propriedade intelectual</h2>
+            <p>As previsões, conjuntos de dados e comentários analíticos na WebPronos são propriedade intelectual da WebPronos. A reutilização para fins não comerciais é permitida com atribuição e backlink para a página de origem.</p>
+            <h2 class="pr-h2">Alterações a estes termos</h2>
+            <p>Podemos atualizar estes termos periodicamente. Alterações materiais serão indicadas no topo desta página com a data de entrada em vigor.</p>
+        """,
+        },
+        "/privacy": {
+            "title":       "Política de Privacidade | WebPronos",
+            "description": "Política de privacidade da WebPronos. Recolhemos análises mínimas para melhorar o serviço. Não vendemos dados de utilizadores e cumprimos o RGPD.",
+            "h1":          "Política de Privacidade",
+            "breadcrumb":  "Privacidade",
+            "body":        """
+            <p>A WebPronos respeita a tua privacidade. Esta página explica que dados recolhemos, porquê e como os tratamos.</p>
+            <h2 class="pr-h2">O que recolhemos</h2>
+            <p>Recolhemos análises mínimas de primeira parte: visualizações de página, referenciador, tipo de browser e região geográfica aproximada. Não recolhemos nomes, endereços de e-mail ou dados de pagamento, exceto se os forneceres explicitamente (por exemplo, ao subscreveres o canal de Telegram).</p>
+            <h2 class="pr-h2">Serviços de terceiros</h2>
+            <p>Parte do conteúdo é servido via Cloudflare (CDN), Lovable (alojamento) e Fly.io (backend). Esses fornecedores podem definir cookies técnicos necessários para o funcionamento do site.</p>
+            <h2 class="pr-h2">Os teus direitos (RGPD)</h2>
+            <p>Se estiveres na UE/EEE (incluindo Portugal), tens o direito de aceder, corrigir ou eliminar quaisquer dados que tenhamos sobre ti. Contacta-nos pelo link no rodapé.</p>
+            <h2 class="pr-h2">Retenção de dados</h2>
+            <p>Os dados analíticos são retidos por no máximo 12 meses e depois agregados e anonimizados automaticamente.</p>
+        """,
+        },
+        "/responsible-gambling": {
+            "title":       "Jogo Responsável — Aposta em Segurança | WebPronos",
+            "description": "Ajuda e recursos para apostas seguras. Se o jogo deixou de ser divertido, procura ajuda. Apenas 18+. Recursos incluem SOS Jogador, Jogadores Anónimos, BeGambleAware e GamCare.",
+            "h1":          "Jogo Responsável",
+            "breadcrumb":  "Jogo Responsável",
+            "body":        """
+            <p>A WebPronos publica previsões de futebol apenas para fins informativos e de entretenimento. <strong>As apostas envolvem risco.</strong> Nunca apostes mais do que podes perder.</p>
+            <h2 class="pr-h2">Sinais de um problema</h2>
+            <ul>
+              <li>Apostar mais do que pretendias ou tentar recuperar perdas</li>
+              <li>Esconder a atividade de apostas de amigos e familiares</li>
+              <li>Pedir dinheiro emprestado para apostar</li>
+              <li>Sentir ansiedade ou depressão por causa das apostas</li>
+              <li>As apostas interferirem com o trabalho, estudos ou relacionamentos</li>
+            </ul>
+            <h2 class="pr-h2">Onde obter ajuda</h2>
+            <ul>
+              <li><strong>SOS Jogador</strong> (Portugal) — <a href="https://www.sosjogador.org" rel="noopener noreferrer">sosjogador.org</a> · 813 405 405</li>
+              <li><strong>Jogadores Anónimos Portugal</strong> — <a href="https://jogadoresanonimos.pt" rel="noopener noreferrer">jogadoresanonimos.pt</a></li>
+              <li><strong>SICAD — Serviço de Intervenção nos Comportamentos Aditivos</strong> — <a href="https://www.sicad.pt" rel="noopener noreferrer">sicad.pt</a></li>
+              <li><strong>SNS24</strong> (24h) — 808 24 24 24</li>
+              <li><strong>BeGambleAware</strong> (Internacional) — <a href="https://www.begambleaware.org" rel="noopener noreferrer">begambleaware.org</a></li>
+              <li><strong>GamCare</strong> (Reino Unido) — <a href="https://www.gamcare.org.uk" rel="noopener noreferrer">gamcare.org.uk</a></li>
+            </ul>
+            <h2 class="pr-h2">Aposta com bom senso</h2>
+            <p>Define um orçamento diário/semanal e respeita-o. Faz pausas regulares. Trata as apostas como entretenimento — não como uma forma de ganhar dinheiro. Se estiveres com dificuldades, contacta um dos recursos acima.</p>
+            <p><strong>Apenas 18+.</strong> Se suspeitas que tens um problema com apostas, pára imediatamente e procura ajuda.</p>
+        """,
+        },
+    },
+    "es": {
+        "/about": {
+            "title":       "Sobre WebPronos — Cómo Funciona Nuestro Modelo de IA de Predicciones de Fútbol",
+            "description": "WebPronos es una plataforma de pronósticos de fútbol con inteligencia artificial. Nuestro modelo xG identifica apuestas de valor positivo en tiempo real en más de 25 ligas y publica cada pick con auditoría completa.",
+            "h1":          "Sobre WebPronos",
+            "breadcrumb":  "Sobre",
+            "body":        """
+            <p>WebPronos es una plataforma de predicciones de fútbol en vivo impulsada por un modelo de IA propietario construido en torno a los <strong>Goles Esperados (xG)</strong>. Monitorizamos partidos en vivo en más de 25 competiciones, ingerimos datos de cada disparo e identificamos apuestas de valor esperado positivo en el momento en que las cuotas del operador divergen de las probabilidades del modelo.</p>
+            <h2 class="pr-h2">Qué hacemos</h2>
+            <p>Cada pick generado por nuestro modelo se registra en el instante en que aparece el valor — nunca se edita, nunca se borra. Publicamos la cuota de entrada, el estado en vivo del partido en el momento del pick, el resultado en curso y el resumen de beneficio/pérdida ya liquidado. El histórico completo está en <a href="/es/historial">webpronos.com/es/historial</a>.</p>
+            <h2 class="pr-h2">Cómo funciona el modelo</h2>
+            <p>El motor central es un modelo xG entrenado con datos a nivel de disparo. Para cada disparo en un partido, el modelo calcula la probabilidad de gol esperado en base a la posición, parte del cuerpo, situación y presión defensiva. Esas probabilidades por disparo se agregan en probabilidades en vivo de victoria/empate/derrota, over/under y hándicap, que después se comparan con las cuotas en vivo del operador usando un cálculo de edge al estilo Benter. Cualquier mercado donde la probabilidad implícita del modelo supera a la del operador (tras ajuste de margen) se señala como un pick de valor.</p>
+            <h2 class="pr-h2">Por qué publicamos todo</h2>
+            <p>La mayoría de los tipsters seleccionan solo las victorias y esconden las derrotas. Al publicar cada pick liquidado — incluyendo los malos — permitimos que cualquiera audite nuestro edge. Si el ROI a largo plazo se mantiene positivo a lo largo de miles de picks, el modelo realmente está batiendo al mercado.</p>
+            <p>Mira los <a href="/es/hoy">picks en vivo de hoy</a>, los <a href="/es/manana">partidos de mañana</a>, el <a href="/es/historial">histórico completo de auditoría</a> o lee nuestro <a href="/es/blog">blog</a> para explicaciones más profundas sobre xG.</p>
+        """,
+        },
+        "/terms": {
+            "title":       "Términos de Uso | WebPronos",
+            "description": "Términos de Uso de WebPronos. Al usar nuestro sitio aceptas estos términos. Proporcionamos predicciones estadísticas de fútbol únicamente con fines informativos — no se garantiza ningún resultado.",
+            "h1":          "Términos de Uso",
+            "breadcrumb":  "Términos",
+            "body":        """
+            <p>Al acceder o usar WebPronos aceptas estos términos. WebPronos publica predicciones estadísticas de fútbol y datos históricos de rendimiento <strong>únicamente con fines informativos</strong>. No ofrecemos apuestas, juegos de azar ni asesoramiento financiero.</p>
+            <h2 class="pr-h2">Ningún resultado garantizado</h2>
+            <p>Cada predicción en WebPronos es una estimación probabilística generada por un modelo de IA basada en datos de partidos públicamente disponibles. No se garantiza ningún resultado. El rendimiento pasado — incluido cualquier ROI positivo mostrado en nuestro <a href="/es/historial">histórico</a> — no predice resultados futuros.</p>
+            <h2 class="pr-h2">Responsabilidad del usuario</h2>
+            <p>Eres el único responsable de cualquier decisión de apuesta que tomes. WebPronos no es un operador de apuestas y no asume responsabilidad por ninguna pérdida financiera derivada del uso de nuestras predicciones.</p>
+            <h2 class="pr-h2">Restricción de edad</h2>
+            <p>Debes tener al menos 18 años para usar este sitio. Consulta nuestra <a href="/es/juego-responsable">página de juego responsable</a> para recursos de ayuda y apoyo.</p>
+            <h2 class="pr-h2">Propiedad intelectual</h2>
+            <p>Las predicciones, conjuntos de datos y comentarios analíticos en WebPronos son propiedad intelectual de WebPronos. La reutilización con fines no comerciales está permitida con atribución y enlace de retorno a la página de origen.</p>
+            <h2 class="pr-h2">Cambios en estos términos</h2>
+            <p>Podemos actualizar estos términos periódicamente. Los cambios materiales se indicarán al principio de esta página con la fecha de entrada en vigor.</p>
+        """,
+        },
+        "/privacy": {
+            "title":       "Política de Privacidad | WebPronos",
+            "description": "Política de privacidad de WebPronos. Recopilamos analíticas mínimas para mejorar el servicio. No vendemos datos de usuarios y cumplimos el RGPD/LOPDGDD.",
+            "h1":          "Política de Privacidad",
+            "breadcrumb":  "Privacidad",
+            "body":        """
+            <p>WebPronos respeta tu privacidad. Esta página explica qué datos recopilamos, por qué y cómo los tratamos.</p>
+            <h2 class="pr-h2">Qué recopilamos</h2>
+            <p>Recopilamos analíticas mínimas de primera parte: visualizaciones de página, referente, tipo de navegador y región geográfica aproximada. No recopilamos nombres, direcciones de correo electrónico ni datos de pago, a menos que los proporciones explícitamente (por ejemplo, al suscribirte al canal de Telegram).</p>
+            <h2 class="pr-h2">Servicios de terceros</h2>
+            <p>Parte del contenido se sirve a través de Cloudflare (CDN), Lovable (alojamiento) y Fly.io (backend). Estos proveedores pueden establecer cookies técnicas necesarias para el funcionamiento del sitio.</p>
+            <h2 class="pr-h2">Tus derechos (RGPD/LOPDGDD)</h2>
+            <p>Si estás en la UE/EEE (incluida España), tienes derecho a acceder, corregir o eliminar cualquier dato que tengamos sobre ti. Contáctanos a través del enlace en el pie de página.</p>
+            <h2 class="pr-h2">Retención de datos</h2>
+            <p>Los datos analíticos se retienen por un máximo de 12 meses y después se agregan y anonimizan automáticamente.</p>
+        """,
+        },
+        "/responsible-gambling": {
+            "title":       "Juego Responsable — Apuesta con Seguridad | WebPronos",
+            "description": "Ayuda y recursos para apostar de forma segura. Si el juego ha dejado de ser divertido, busca ayuda. Solo +18. Recursos incluyen FEJAR, Jugadores Anónimos, BeGambleAware y GamCare.",
+            "h1":          "Juego Responsable",
+            "breadcrumb":  "Juego Responsable",
+            "body":        """
+            <p>WebPronos publica predicciones de fútbol únicamente con fines informativos y de entretenimiento. <strong>Las apuestas implican riesgo.</strong> Nunca apuestes más de lo que puedas perder.</p>
+            <h2 class="pr-h2">Señales de un problema</h2>
+            <ul>
+              <li>Apostar más de lo previsto o intentar recuperar pérdidas</li>
+              <li>Ocultar la actividad de apuestas a amigos y familiares</li>
+              <li>Pedir dinero prestado para apostar</li>
+              <li>Sentir ansiedad o depresión a causa de las apuestas</li>
+              <li>Que las apuestas interfieran con el trabajo, los estudios o las relaciones</li>
+            </ul>
+            <h2 class="pr-h2">Dónde obtener ayuda</h2>
+            <ul>
+              <li><strong>FEJAR — Federación Española de Jugadores de Azar Rehabilitados</strong> — <a href="https://fejar.org" rel="noopener noreferrer">fejar.org</a> · 900 200 225</li>
+              <li><strong>Jugadores Anónimos España</strong> — <a href="https://www.jugadoresanonimos.org" rel="noopener noreferrer">jugadoresanonimos.org</a></li>
+              <li><strong>Juego Responsable (DGOJ)</strong> — <a href="https://www.juegoresponsable.es" rel="noopener noreferrer">juegoresponsable.es</a></li>
+              <li><strong>BeGambleAware</strong> (Internacional) — <a href="https://www.begambleaware.org" rel="noopener noreferrer">begambleaware.org</a></li>
+              <li><strong>GamCare</strong> (Reino Unido) — <a href="https://www.gamcare.org.uk" rel="noopener noreferrer">gamcare.org.uk</a></li>
+            </ul>
+            <h2 class="pr-h2">Apuesta con sentido común</h2>
+            <p>Define un presupuesto diario/semanal y respétalo. Toma descansos regulares. Trata las apuestas como entretenimiento — no como una forma de ganar dinero. Si tienes dificultades, contacta con uno de los recursos anteriores.</p>
+            <p><strong>Solo +18.</strong> Si sospechas que tienes un problema con las apuestas, detente inmediatamente y busca ayuda.</p>
+        """,
+        },
+    },
+}
 
-def _render_static_page(path: str) -> str:
+
+def _get_static_page(path: str, locale: str = "en") -> dict | None:
+    """Lookup static page content for the requested locale with EN fallback.
+    Returns the page dict (title/description/h1/breadcrumb/body) or None
+    if `path` isn't a known static page in any locale.
+    """
+    bucket = _STATIC_PAGES_I18N.get(locale) or {}
+    if path in bucket:
+        # Merge so any keys missing in the translation fall back to EN —
+        # safety net while translations are being rolled out incrementally.
+        merged = dict(_STATIC_PAGES.get(path) or {})
+        merged.update(bucket[path])
+        return merged
+    return _STATIC_PAGES.get(path)
+
+
+def _render_static_page(path: str, locale: str = "en") -> str:
     """
     SSR for /about, /terms, /privacy, /responsible-gambling.
 
@@ -15221,31 +20209,40 @@ def _render_static_page(path: str) -> str:
     Now each page gets its own title, description, self-canonical, body
     copy, and BreadcrumbList JSON-LD.
     """
-    page = _STATIC_PAGES.get(path)
+    page = _get_static_page(path, locale)
     if not page:
-        return _render_passthrough(path)
+        return _render_passthrough(path, locale)
+    # Locale-aware canonical. The URL slug itself may also be localized:
+    # /about → /sobre on pt-br, /historico, /jogo-responsavel, etc.
+    lang_prefix = _LOCALE_TO_PREFIX.get(locale, "")
+    localized_path = _localized_slug(path, locale)
+    canonical = f"{SITE_URL}{lang_prefix}{localized_path}"
+    root_url  = f"{SITE_URL}{lang_prefix}/"
+    site_name = _t_site(locale, "breadcrumb_root")
     body = f"""
         <nav class="pr-nav">
-          <a href="{SITE_URL}/">WebPronos</a> › {page['breadcrumb']}
+          <a href="{root_url}">{site_name}</a> › {page['breadcrumb']}
         </nav>
         <h1 class="pr-h1">{page['h1']}</h1>
         {page['body']}
-        {_render_pr_footer()}
+        {_render_pr_footer(locale)}
     """
     jsonld = json.dumps({
         "@context": "https://schema.org",
         "@type":    "BreadcrumbList",
         "itemListElement": [
-            {"@type": "ListItem", "position": 1, "name": "WebPronos",         "item": SITE_URL},
-            {"@type": "ListItem", "position": 2, "name": page['breadcrumb'],   "item": f"{SITE_URL}{path}"},
+            {"@type": "ListItem", "position": 1, "name": site_name,         "item": root_url},
+            {"@type": "ListItem", "position": 2, "name": page['breadcrumb'], "item": canonical},
         ],
     }, ensure_ascii=False)
     return _build_html_page(
         title       = page['title'],
         description = page['description'],
-        canonical   = f"{SITE_URL}{path}",
+        canonical   = canonical,
         body_html   = body,
         jsonld      = jsonld,
+        locale      = locale,
+        stripped_path = path,
     )
 
 
@@ -15606,6 +20603,13 @@ def prerender_dispatch():
     Single bot-facing entry point. The Cloudflare Worker forwards every bot
     request here with ?path=<original_path>. This dispatcher returns the
     correct fully-rendered HTML for that path.
+
+    i18n: if the forwarded path starts with /pt|/br|/es the dispatcher
+    detects the locale, strips the prefix, and routes to the matching
+    EN renderer with `locale=...`. Renderers that have been refactored
+    for i18n (static pages, _build_html_page) will honour it; others
+    (dynamic SEO pages) fall back to EN body with translated chrome via
+    _build_html_page's hreflang/<html lang> injection.
     """
     import re as _re
     try:
@@ -15619,45 +20623,48 @@ def prerender_dispatch():
         if len(path) > 1 and path.endswith("/"):
             path = path.rstrip("/")
 
+        # i18n: detect lang prefix and strip it before route matching.
+        locale, path = _extract_lang_prefix(path)
+
         # Route patterns. `last_mod_ts` is set per path so each page gets
         # an accurate Last-Modified header — Googlebot can then short-circuit
         # subsequent crawls with If-Modified-Since on pages that haven't changed.
         last_mod_ts = _BUILD_TIME_TS
         if path == "/" or path == "":
-            html = _render_homepage()
+            html = _render_homepage(locale)
             last_mod_ts = _newest_pick_ts()
         elif path == "/blog":
-            html = _render_blog_listing()
+            html = _render_blog_listing(locale)
             # blog index lastmod = newest post's published_at (best-effort)
         elif _re.match(r'^/blog/[^/]+$', path):
             slug = path[len("/blog/"):]
-            return prerender_blog(slug)
+            return prerender_blog(slug, locale)
         elif _re.match(r'^/match/\d+', path):
             mid = int(_re.match(r'^/match/(\d+)', path).group(1))
-            return prerender_match(mid)
+            return prerender_match(mid, locale)
         elif _re.match(r'^/team/[^/]+$', path):
-            return _render_team(path[len("/team/"):])
+            return _render_team(path[len("/team/"):], locale)
         elif _re.match(r'^/league/[^/]+$', path):
-            return _render_league(path[len("/league/"):])
+            return _render_league(path[len("/league/"):], locale)
         elif _re.match(r'^/tips/[^/]+$', path):
-            return _render_tips_market(path[len("/tips/"):])
+            return _render_tips_market(path[len("/tips/"):], locale)
         elif path == "/today":
-            html = _render_today()
+            html = _render_today(locale)
             # Pages-of-fixtures recencey ≈ when the upcoming cache last
             # refreshed. _last_cycle_ts updates every BG cycle (~2 min).
             last_mod_ts = int(_last_cycle_ts) if _last_cycle_ts else _BUILD_TIME_TS
         elif path == "/history":
-            html = _render_history()
+            html = _render_history(locale)
             last_mod_ts = _newest_pick_ts()  # newest pick anywhere
         elif path == "/tomorrow" or path == "/upcoming":
-            html = _render_tomorrow()
+            html = _render_tomorrow(locale)
             last_mod_ts = int(_last_cycle_ts) if _last_cycle_ts else _BUILD_TIME_TS
         elif path in ("/about", "/terms", "/privacy", "/responsible-gambling"):
-            html = _render_static_page(path)
+            html = _render_static_page(path, locale)
             # Static legal copy — only changes on deploy
         else:
             # Unknown path — pass through Lovable shell
-            html = _render_passthrough(path)
+            html = _render_passthrough(path, locale)
 
         return html, 200, {
             "Content-Type":  "text/html; charset=utf-8",
@@ -15726,8 +20733,83 @@ def _init_scheduler():
         coalesce=True,
         max_instances=1,
     )
+    # Job 4 — X resolution worker every 5 minutes. Scans x_tweets for
+    # rows whose underlying tip has settled and posts a reply-tweet
+    # to the original (✅ won / ❌ lost). Cheap (1 query + 0-N replies),
+    # safe to run on every worker (idempotent via resolution_tweet_id
+    # check), no DB lock needed.
+    scheduler.add_job(
+        _x_resolve_settled_tips,
+        trigger=CronTrigger(minute='*/5', timezone='Europe/Lisbon'),
+        id='x_resolution',
+        replace_existing=True,
+        misfire_grace_time=600,
+        coalesce=True,
+        max_instances=1,
+    )
+    # Job 5 — Hourly archive of local tips → Supabase tips_archive. Our
+    # off-machine backup so a Fly volume loss never wipes the historical
+    # track record again (see the 2026-05-20 incident comments above
+    # _archive_tips_to_supabase). Runs at minute :07 to avoid clashing
+    # with the on-the-hour barrage of cron jobs.
+    scheduler.add_job(
+        _archive_tips_to_supabase,
+        trigger=CronTrigger(minute=7, timezone='Europe/Lisbon'),
+        id='tips_archive_hourly',
+        replace_existing=True,
+        misfire_grace_time=600,
+        coalesce=True,
+        max_instances=1,
+    )
+    # Job 6 — Proactive WC2026 fixtures cache refresh every 3h.
+    # The knockout bracket "fills in" as the group stage progresses
+    # (placeholders like W99 / L101 become real team names within
+    # minutes of the deciding group-stage match ending). Without this
+    # job partners would see stale brackets for up to 6h after a
+    # bracket flip; with this job, worst case ~3h. Cheap (3-4 Sofascore
+    # calls per refresh, no DB writes). Safe to run year-round —
+    # outside the tournament it's just a no-op refresh of the same data.
+    def _refresh_wc2026_cache():
+        try:
+            _fetch_wc2026_all_fixtures(force=True)
+        except Exception as e:
+            log.warning(f"WC2026 cache refresh failed: {e}")
+    scheduler.add_job(
+        _refresh_wc2026_cache,
+        trigger=CronTrigger(hour='*/3', timezone='Europe/Lisbon'),
+        id='wc2026_fixtures_refresh',
+        replace_existing=True,
+        misfire_grace_time=900,
+        coalesce=True,
+        max_instances=1,
+    )
+    # Job 7 — In-app Sofascore watchdog. Probes Sofascore from inside the
+    # running machine every 5 min. After 3 consecutive failures (= ~15 min
+    # confirmed block) AND 30-min cooldown elapsed, fires _failover_execute
+    # which forks our volume to the next region in FAILOVER_REGION_POOL,
+    # clones our machine there, waits for it to be healthy, and destroys
+    # us. Replaces the external GitHub Actions watchdog (whose */30 cron
+    # was being throttled to ~2h on the free tier — see the 2026-05-22
+    # bom→lhr incident logged in failover_audit).
+    #
+    # Why only on the first worker? gunicorn runs 2 workers, each with its
+    # own APScheduler. Without a DB lock both would fire the failover
+    # simultaneously. We solve it cheaply: gate by FLY_MACHINE_ID +
+    # `_failover_probe_job` itself uses `_FAILOVER_LOCK` so even if both
+    # fire the lock prevents double-execution. Result: at most 1 probe
+    # per machine per 5 min (2 with 2 workers, but both share state via
+    # the lock so duplicates only cost a few HTTP calls — harmless).
+    scheduler.add_job(
+        _failover_probe_job,
+        trigger=CronTrigger(minute='*/5', timezone='Europe/Lisbon'),
+        id='sofascore_watchdog',
+        replace_existing=True,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1,
+    )
     scheduler.start()
-    log.info("Scheduler started: daily summary 23:55 + admin stats 09:00 + daily preview 12:00 (Lisbon, 1h grace, DB-locked)")
+    log.info("Scheduler started: daily summary 23:55 + admin stats 09:00 + daily preview 12:00 + X resolution */5min (Lisbon, 1h grace, DB-locked)")
     return scheduler
 
 
@@ -15964,6 +21046,10 @@ if __name__ == "__main__":
         print("=" * 60)
         _init_client()
         _init_db()
+        # Same bootstrap restore as the gunicorn path — keeps dev/CLI
+        # behaviour symmetric with prod.
+        threading.Thread(target=_restore_tips_from_supabase, daemon=True,
+                          name="tips-restore-bootstrap").start()
         _scheduler = _init_scheduler()
         threading.Thread(target=_background_loop, daemon=True).start()
         print(f"  Client: {_client_type}")
@@ -15976,6 +21062,15 @@ else:
     # Running under gunicorn — __main__ block is skipped, so initialize here
     _load_aliases()
     _init_db()
+    # Auto-restore from Supabase IF the local tips table came up empty
+    # (typically: fresh Fly volume after machine recycle / region change).
+    # No-op if local has data already. Runs in a thread so it never
+    # blocks startup — restore can take 5-10s for a full pull.
+    threading.Thread(
+        target=_restore_tips_from_supabase,
+        daemon=True,
+        name="tips-restore-bootstrap",
+    ).start()
     _scheduler = _init_scheduler()
     threading.Thread(target=_init_client, daemon=True).start()
     threading.Thread(target=_background_loop, daemon=True).start()
